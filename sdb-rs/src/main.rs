@@ -12,7 +12,12 @@ fn main() {
     let options = Options::parse();
     let inferior_process_id: Pid = {
         if let Some(pid) = options.pid {
-            Pid::from_raw(pid)
+            let inferior_pid = Pid::from_raw(pid);
+            libsdb::attach_to_process(inferior_pid).unwrap_or_else(|e| {
+                eprintln!("Failed to attach to process: {}", e);
+                std::process::exit(1);
+            });
+            inferior_pid
         } else if let Some(executable_path) = &options.executable {
             match libsdb::launch_and_setup_inferior_process(executable_path, &options.program_args)
             {
@@ -28,11 +33,6 @@ fn main() {
             );
         }
     };
-
-    libsdb::attach_to_process(inferior_process_id).unwrap_or_else(|e| {
-        eprintln!("Failed to attach to process: {}", e);
-        std::process::exit(1);
-    });
 
     let result = tui::Application::new(options, inferior_process_id).main_loop();
     if result.is_err() {
