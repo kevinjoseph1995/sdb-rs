@@ -10,18 +10,18 @@ pub struct Application {
     _command_line_options: Options,
     history_file: PathBuf,
     loop_running: bool,
-    inferior_process_id: libsdb::Pid,
+    inferior_process: libsdb::Process,
 }
 
 impl Application {
-    pub fn new(options: Options, inferior_process_id: libsdb::Pid) -> Self {
+    pub fn new(options: Options, inferior_process: libsdb::Process) -> Self {
         Self {
             _command_line_options: options,
             history_file: std::env::home_dir()
                 .unwrap()
                 .join(".cache")
                 .join("sdb_history"),
-            inferior_process_id,
+            inferior_process,
             loop_running: true,
         }
     }
@@ -32,7 +32,7 @@ impl Application {
                 self.loop_running = false;
             }
             "run" | "r" | "continue" | "c" => {
-                libsdb::resume_process(self.inferior_process_id).unwrap_or_else(|e| {
+                self.inferior_process.resume_process().unwrap_or_else(|e| {
                     println!("Failed to resume process: {}", e);
                 });
             }

@@ -4,29 +4,17 @@ mod tui;
 ///////////////////////////
 use clap::Parser;
 ///////////////////////////
-use libsdb::Pid;
+use libsdb::{Pid, Process};
 use options::Options;
 ///////////////////////////
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::parse();
-    let inferior_process_id: Pid = {
+    let inferior_process: Process = {
         if let Some(pid) = options.pid {
-            let inferior_pid = Pid::from_raw(pid);
-            libsdb::attach_to_process(inferior_pid).unwrap_or_else(|e| {
-                eprintln!("Failed to attach to process: {}", e);
-                std::process::exit(1);
-            });
-            inferior_pid
+            Process::attach(Pid::from_raw(pid))?
         } else if let Some(executable_path) = &options.executable {
-            match libsdb::launch_and_setup_inferior_process(executable_path, &options.program_args)
-            {
-                Ok(child_pid) => child_pid,
-                Err(e) => {
-                    eprintln!("Failed to launch inferior process: {}", e);
-                    std::process::exit(1);
-                }
-            }
+            Process::launch_and_setup_inferior_process(executable_path, &options.program_args)?
         } else {
             unreachable!(
                 "This should never happen because of the required_unless_present attribute"
@@ -34,9 +22,10 @@ fn main() {
         }
     };
 
-    let result = tui::Application::new(options, inferior_process_id).main_loop();
+    let result = tui::Application::new(options, inferior_process).main_loop();
     if result.is_err() {
         eprintln!("Error in main loop: {}", result.unwrap_err());
         std::process::exit(1);
     }
+    Ok(())
 }
