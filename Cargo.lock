@@ -311,6 +311,7 @@ dependencies = [
 name = "sdb-rs"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "clap",
  "libsdb",
  "rustyline",

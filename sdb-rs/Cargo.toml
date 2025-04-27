@@ -8,6 +8,7 @@ name = "sdb"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1.0.98"
 clap = { version = "4.5.36", features = ["derive"] }
 libsdb = { path = "../libsdb" }
 rustyline = { version = "15.0.0", features = ["with-file-history"] }

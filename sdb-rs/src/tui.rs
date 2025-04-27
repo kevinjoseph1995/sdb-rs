@@ -1,4 +1,6 @@
 /////////////////////////////////
+use anyhow::{Context, Result};
+use libsdb::process::Process;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 use std::path::PathBuf;
@@ -10,34 +12,49 @@ pub struct Application {
     _command_line_options: Options,
     history_file: PathBuf,
     loop_running: bool,
-    inferior_process: libsdb::Process,
+    inferior_process: Process,
 }
 
 impl Application {
-    pub fn new(options: Options, inferior_process: libsdb::Process) -> Self {
+    pub fn new(options: Options, inferior_process: Process) -> Self {
         Self {
             _command_line_options: options,
-            history_file: std::env::home_dir()
-                .unwrap()
-                .join(".cache")
-                .join("sdb_history"),
+            history_file: {
+                match std::env::home_dir() {
+                    Some(home_dir) => home_dir.join(".cache").join("sdb_history"),
+                    None => PathBuf::from(".").join("sdb_history"),
+                }
+            },
             inferior_process,
             loop_running: true,
         }
     }
 
-    fn handle_command(&mut self, command: String) {
+    fn handle_command(&mut self, command: String) -> Result<()> {
         match command.as_str() {
             "exit" | "quit" | "q" => {
                 self.loop_running = false;
+                Ok(())
             }
             "run" | "r" | "continue" | "c" => {
                 self.inferior_process.resume_process().unwrap_or_else(|e| {
+                    // Not a hard error, just print and continue
                     println!("Failed to resume process: {}", e);
                 });
+                Ok(())
+            }
+            "dump_child_output" | "dco" => {
+                self.inferior_process
+                    .print_child_output()
+                    .unwrap_or_else(|e| {
+                        // Not a hard error, just print and continue
+                        println!("Failed to print child output: {}", e);
+                    });
+                Ok(())
             }
             _ => {
                 println!("Command not recognized: {}", command);
+                Ok(())
             }
         }
     }
@@ -54,11 +71,10 @@ impl Application {
             match readline {
                 Ok(line) => {
                     rl.add_history_entry(line.as_str())?;
-                    self.handle_command(line.clone());
+                    self.handle_command(line.clone())?;
                 }
                 Err(ReadlineError::Interrupted) => {
-                    println!("CTRL-C");
-                    break;
+                    self.inferior_process.stop_process()?;
                 }
                 Err(ReadlineError::Eof) => {
                     println!("CTRL-D");

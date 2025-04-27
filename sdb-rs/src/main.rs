@@ -4,7 +4,7 @@ mod tui;
 ///////////////////////////
 use clap::Parser;
 ///////////////////////////
-use libsdb::{Pid, Process};
+use libsdb::{Pid, process::Process};
 use options::Options;
 ///////////////////////////
 
@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(pid) = options.pid {
             Process::attach(Pid::from_raw(pid))?
         } else if let Some(executable_path) = &options.executable {
-            Process::launch_and_setup_inferior_process(executable_path, &options.program_args)?
+            Process::launch(executable_path, &options.program_args)?
         } else {
             unreachable!(
                 "This should never happen because of the required_unless_present attribute"
