@@ -1,5 +1,5 @@
 /////////////////////////////////
-use anyhow::{Context, Result};
+use anyhow::Result;
 use libsdb::process::Process;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
@@ -20,9 +20,9 @@ impl Application {
         Self {
             _command_line_options: options,
             history_file: {
-                match std::env::home_dir() {
-                    Some(home_dir) => home_dir.join(".cache").join("sdb_history"),
-                    None => PathBuf::from(".").join("sdb_history"),
+                match dirs::cache_dir() {
+                    Some(cache_dir) => cache_dir.join(".sdb_history"),
+                    None => PathBuf::from(".").join(".sdb_history"),
                 }
             },
             inferior_process,
