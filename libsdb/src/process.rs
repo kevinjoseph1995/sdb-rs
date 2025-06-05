@@ -1,4 +1,8 @@
 use anyhow::{Context, Result, anyhow};
+use core::panic;
+use extended::Extended;
+use libc::size_t;
+use libc::user;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
 use nix::sys::signal::Signal;
@@ -13,6 +17,10 @@ use std::ffi::CString;
 use std::path::PathBuf;
 
 use crate::pipe_channel;
+use crate::register_info;
+use crate::register_info::RegisterFormat;
+use crate::register_info::RegisterInfo;
+use crate::register_info::RegisterType;
 
 type Pid = nix::unistd::Pid;
 
@@ -30,6 +38,27 @@ enum StopReason {
     Terminated(Signal),
 }
 
+impl std::fmt::Display for StopReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StopReason::Exited(status) => write!(f, "Exited with status: {}", status),
+            StopReason::Stopped(signal) => write!(f, "Stopped by signal: {:?}", signal),
+            StopReason::Terminated(signal) => write!(f, "Terminated by signal: {:?}", signal),
+        }
+    }
+}
+
+impl From<WaitStatus> for StopReason {
+    fn from(value: WaitStatus) -> Self {
+        match value {
+            WaitStatus::Stopped(_, signal) => StopReason::Stopped(signal),
+            WaitStatus::Exited(_, exit_status) => StopReason::Exited(exit_status),
+            WaitStatus::Signaled(_, signal, _) => StopReason::Terminated(signal),
+            _ => panic!("Unexpected wait status: {:?}", value),
+        }
+    }
+}
+
 #[derive(PartialEq, Debug)]
 pub enum ProcessState {
     Running,        // Running
@@ -41,57 +70,190 @@ pub enum ProcessState {
     Unknown(char),
 }
 
+impl From<char> for ProcessState {
+    fn from(value: char) -> Self {
+        match value {
+            'R' => ProcessState::Running,
+            'S' => ProcessState::Sleeping,
+            'D' => ProcessState::Waiting,
+            'Z' => ProcessState::Zombie,
+            'T' => ProcessState::Stopped,
+            't' => ProcessState::TracingStopped,
+            ch => ProcessState::Unknown(ch),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RegisterValue {
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    LongDouble([u8; 16]), // Assuming we can fit a long double in 16 bytes
+    Byte64([u8; 8]),
+    Byte128([u8; 16]),
+}
+
+/// Helper: copy `src` into the first `src.len()` bytes of a zero-filled [u8; 16].
+fn pad_16(src: &[u8]) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    buf[..src.len()].copy_from_slice(src);
+    buf
+}
+
+/// Helper macro: avoids writing `.to_le_bytes()` + `pad_16` 14 times.
+macro_rules! widen {
+    ($v:expr) => {{
+        #[allow(clippy::useless_conversion)]
+        pad_16(&($v).to_le_bytes())
+    }};
+}
+
+impl RegisterValue {
+    fn get_payload_size_in_bytes(&self) -> usize {
+        match self {
+            RegisterValue::U8(_) | RegisterValue::I8(_) => 1,
+            RegisterValue::U16(_) | RegisterValue::I16(_) => 2,
+            RegisterValue::U32(_) | RegisterValue::I32(_) => 4,
+            RegisterValue::U64(_) | RegisterValue::I64(_) => 8,
+            RegisterValue::F32(_) => 4,
+            RegisterValue::F64(_) => 8,
+            RegisterValue::LongDouble(_) => 16,
+            RegisterValue::Byte64(_) => 8,
+            RegisterValue::Byte128(_) => 16,
+        }
+    }
+    /// Turn any `RegisterValue` into a fixed 128-bit (16-byte) little-endian blob.
+    pub fn widen_to_fixed_buffer(&self, info: &RegisterInfo) -> [u8; 16] {
+        use RegisterFormat::*;
+        // Note: All the to_le_bytes are because this is a little-endian architecture.
+        match (self, info.reg_format, info.size) {
+            // ────────────── floating-point widening ──────────────
+            (RegisterValue::F32(v), DoubleFloat, ..) => widen!(*v as f64),
+            (RegisterValue::F32(v), LongDouble, ..) => pad_16(&Extended::from(*v).to_le_bytes()),
+            (RegisterValue::F64(v), LongDouble, ..) => pad_16(&Extended::from(*v).to_le_bytes()),
+
+            // ────────────── integer widening ──────────────
+            (RegisterValue::I8(v), UnsignedInt, 2) => widen!(*v as i16),
+            (RegisterValue::I8(v), UnsignedInt, 4) => widen!(*v as i32),
+            (RegisterValue::I8(v), UnsignedInt, 8) => widen!(*v as i64),
+            (RegisterValue::I16(v), UnsignedInt, 4) => widen!(*v as i32),
+            (RegisterValue::I16(v), UnsignedInt, 8) => widen!(*v as i64),
+            (RegisterValue::I32(v), UnsignedInt, 8) => widen!(*v as i64),
+
+            // ────────────── everything else ──────────────
+            (RegisterValue::LongDouble(bytes), ..) => bytes.clone(),
+            (RegisterValue::Byte64(bytes), ..) => pad_16(bytes),
+            (RegisterValue::Byte128(bytes), ..) => pad_16(bytes),
+
+            // Numeric values that *don’t* need special widening
+            (RegisterValue::U8(v), ..) => widen!(v),
+            (RegisterValue::U16(v), ..) => widen!(v),
+            (RegisterValue::U32(v), ..) => widen!(v),
+            (RegisterValue::U64(v), ..) => widen!(v),
+            (RegisterValue::I8(v), ..) => widen!(v),
+            (RegisterValue::I16(v), ..) => widen!(v),
+            (RegisterValue::I32(v), ..) => widen!(v),
+            (RegisterValue::I64(v), ..) => widen!(v),
+            (RegisterValue::F32(v), ..) => widen!(v),
+            (RegisterValue::F64(v), ..) => widen!(v),
+        }
+    }
+}
+
+struct Registers {
+    data: user,
+}
+
+impl Registers {
+    fn new() -> Self {
+        Registers {
+            // Safety: This is safe because we are initializing the `user` struct to zero.
+            // The `user` struct is used to hold the registers and is expected to be zeroed out before use.
+            data: { unsafe { std::mem::zeroed::<libc::user>() } },
+        }
+    }
+
+    fn set_register_value(
+        &mut self,
+        register_id: register_info::RegisterId,
+        value: RegisterValue,
+    ) -> Result<()> {
+        let register_info = register_info::get_register_info(register_id)
+            .ok_or_else(|| anyhow!("Failed to get register info for {:?}", register_id))?;
+
+        let payload_size = value.get_payload_size_in_bytes();
+        if payload_size <= register_info.size {
+            let value_widened = value.widen_to_fixed_buffer(&register_info);
+            let structure_bytes = register_info::as_mutable_bytes_of_struct::<user>(&mut self.data);
+            value_widened[0..register_info.size]
+                .iter()
+                .enumerate()
+                .for_each(|(i, &byte)| {
+                    structure_bytes[register_info.offset as usize + i] = byte;
+                });
+        } else {
+            panic!(
+                "Register value size {} exceeds register info size {}",
+                payload_size, register_info.size
+            );
+        }
+        Ok(())
+    }
+
+    /// Load a register’s value from `self.data` and wrap it in the right enum variant.
+    fn get_register_value(&self, id: register_info::RegisterId) -> Result<RegisterValue> {
+        let info = register_info::get_register_info(id)
+            .ok_or_else(|| anyhow!("unknown register {:?}", id))?;
+        let off = info.offset as usize;
+
+        // ↓ one-liner to avoid writing the same call 9×
+        macro_rules! load {
+            ($ty:ty) => {
+                register_info::coerce_bytes_of_struct_to_type_at_offset::<user, $ty>(
+                    &self.data, off,
+                )
+            };
+        }
+
+        use RegisterFormat::*;
+
+        Ok(match (info.reg_format, info.size) {
+            // ───── unsigned integers ─────
+            (UnsignedInt, 1) => RegisterValue::U8(load!(u8)?),
+            (UnsignedInt, 2) => RegisterValue::U16(load!(u16)?),
+            (UnsignedInt, 4) => RegisterValue::U32(load!(u32)?),
+            (UnsignedInt, 8) => RegisterValue::U64(load!(u64)?),
+
+            // ───── floating-point ─────
+            (DoubleFloat, 4) => RegisterValue::F32(load!(f32)?),
+            (DoubleFloat, 8) => RegisterValue::F64(load!(f64)?),
+            (LongDouble, 16) => RegisterValue::LongDouble(load!([u8; 16])?),
+
+            // ───── vectors ─────
+            (Vector, 8) => RegisterValue::Byte64(load!([u8; 8])?),
+            (Vector, 16) => RegisterValue::Byte128(load!([u8; 16])?),
+
+            // ───── anything else ─────
+            (fmt, sz) => anyhow::bail!("unsupported register: {:?} ({} bytes)", fmt, sz),
+        })
+    }
+}
+
 pub struct Process {
     pub pid: Pid,
     terminate_on_end: bool,
     state: ProcessHandleState,
     read_port: Option<pipe_channel::ReadPort>,
     is_attached: bool,
-}
-
-/// Sets up the child process for debugging. This function is called in the child process after a fork.
-/// It enables tracing for the child process and loads the executable into it. It also passes the arguments to the executable.
-fn setup_child_process(
-    executable_path: &PathBuf,
-    args: Option<String>,
-    attach_for_debugging: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let executable_path_cstring = CString::new(executable_path.to_str().unwrap())?;
-    let mut args_cstrings: Vec<CString> = vec![executable_path_cstring.clone()];
-    if let Some(args) = args {
-        args_cstrings.extend(
-            args.split_ascii_whitespace()
-                .map(|arg| CString::new(arg).unwrap()) // Convert each argument to CString
-                .collect::<Vec<_>>(),
-        );
-    }
-    if attach_for_debugging {
-        traceme().context("Failed to enable tracing in child process")?;
-    }
-    execvp(&executable_path_cstring, &args_cstrings).context("Failed to launch executable")?;
-    Ok(())
-}
-
-pub fn process_with_pid_exists(pid: Pid) -> bool {
-    match nix::sys::signal::kill(pid, None) {
-        Ok(_) => true,                          // Process exists
-        Err(nix::errno::Errno::ESRCH) => false, // No such process(https://man7.org/linux/man-pages/man3/errno.3.html)
-        Err(e) => panic!("Failed to check if process exists: {}", e),
-    }
-}
-
-pub fn get_process_state(pid: Pid) -> Result<ProcessState> {
-    let proc_path = format!("/proc/{}/stat", pid);
-    let contents = std::fs::read_to_string(proc_path).context("Failed to read /proc file")?;
-    let last_parenthesis = contents
-        .rfind(')')
-        .ok_or_else(|| anyhow!("Failed to find last parenthesis in /proc file"))?;
-    let index_of_state_char = last_parenthesis + 2; // The state character is right after the last parenthesis
-    let state_char = contents
-        .chars()
-        .nth(index_of_state_char)
-        .ok_or_else(|| anyhow!("Failed to find state character in /proc file"))?;
-    Ok(ProcessState::from(state_char))
+    registers: Registers,
 }
 
 impl Process {
@@ -104,6 +266,7 @@ impl Process {
             state: ProcessHandleState::Stopped,
             read_port: None,
             is_attached: true,
+            registers: Registers::new(),
         };
         let stop_reason = child_process_handle.wait_on_signal(None)?;
         assert_eq!(stop_reason, StopReason::Stopped(Signal::SIGSTOP));
@@ -128,6 +291,7 @@ impl Process {
                     state: ProcessHandleState::Stopped,
                     read_port: None,
                     is_attached: debug_process_being_launched,
+                    registers: Registers::new(),
                 };
                 if debug_process_being_launched {
                     match child_process_handle.wait_on_signal(None)? {
@@ -187,6 +351,10 @@ impl Process {
             StopReason::Stopped(_) => self.state = ProcessHandleState::Stopped,
             StopReason::Terminated(_) => self.state = ProcessHandleState::Terminated,
         }
+        if self.is_attached && self.state == ProcessHandleState::Stopped {
+            self.read_all_registers()
+                .context("Failed to read registers after waiting for process")?;
+        }
         Ok(stop_reason)
     }
 
@@ -218,6 +386,62 @@ impl Process {
         }
         Ok(())
     }
+
+    pub fn read_all_registers(&mut self) -> Result<()> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to read registers"
+        );
+        self.registers.data.regs = nix::sys::ptrace::getregs(self.pid)
+            .context("Failed to read general purpose  registers")?;
+        self.registers.data.i387 =
+            nix::sys::ptrace::getregset::<nix::sys::ptrace::regset::NT_PRFPREG>(self.pid)
+                .context("Failed to read floating point registers")?;
+        for debug_register_index in 0..8usize {
+            let offset = register_info::get_register_info(register_info::RegisterId::dr(
+                debug_register_index as u32,
+            ))
+            .ok_or(anyhow!(
+                "Failed to get debug register info for index {}",
+                debug_register_index
+            ))?
+            .offset;
+            self.registers.data.u_debugreg[debug_register_index] =
+                nix::sys::ptrace::read_user(self.pid, offset as *mut std::ffi::c_void).context(
+                    format!("Failed to read debug register {}", debug_register_index),
+                )? as u64;
+        }
+        Ok(())
+    }
+
+    fn poke_user_data(&self, offset: usize, value: u64) -> Result<()> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to poke user data"
+        );
+        nix::sys::ptrace::write_user(self.pid, offset as *mut std::ffi::c_void, value as i64)
+            .context("Failed to poke user data")?;
+        Ok(())
+    }
+
+    fn write_fprs(&self, fprs: &libc::user_fpregs_struct) -> Result<()> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to write floating point registers"
+        );
+        nix::sys::ptrace::setregset::<nix::sys::ptrace::regset::NT_PRFPREG>(self.pid, fprs.clone())
+            .context("Failed to write floating point registers")?;
+        Ok(())
+    }
+
+    fn write_gprs(&self, gprs: &libc::user_regs_struct) {
+        assert!(
+            self.is_attached,
+            "Process must be attached to write floating point registers"
+        );
+        nix::sys::ptrace::setregs(self.pid, gprs.clone())
+            .expect("Failed to write general purpose registers");
+    }
 }
 
 impl Drop for Process {
@@ -244,39 +468,49 @@ impl Drop for Process {
     }
 }
 
-impl From<WaitStatus> for StopReason {
-    fn from(value: WaitStatus) -> Self {
-        match value {
-            WaitStatus::Stopped(_, signal) => StopReason::Stopped(signal),
-            WaitStatus::Exited(_, exit_status) => StopReason::Exited(exit_status),
-            WaitStatus::Signaled(_, signal, _) => StopReason::Terminated(signal),
-            _ => panic!("Unexpected wait status: {:?}", value),
-        }
+/// Sets up the child process for debugging. This function is called in the child process after a fork.
+/// It enables tracing for the child process and loads the executable into it. It also passes the arguments to the executable.
+fn setup_child_process(
+    executable_path: &PathBuf,
+    args: Option<String>,
+    attach_for_debugging: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let executable_path_cstring = CString::new(executable_path.to_str().unwrap())?;
+    let mut args_cstrings: Vec<CString> = vec![executable_path_cstring.clone()];
+    if let Some(args) = args {
+        args_cstrings.extend(
+            args.split_ascii_whitespace()
+                .map(|arg| CString::new(arg).unwrap()) // Convert each argument to CString
+                .collect::<Vec<_>>(),
+        );
+    }
+    if attach_for_debugging {
+        traceme().context("Failed to enable tracing in child process")?;
+    }
+    execvp(&executable_path_cstring, &args_cstrings).context("Failed to launch executable")?;
+    Ok(())
+}
+
+pub fn process_with_pid_exists(pid: Pid) -> bool {
+    match nix::sys::signal::kill(pid, None) {
+        Ok(_) => true,                          // Process exists
+        Err(nix::errno::Errno::ESRCH) => false, // No such process(https://man7.org/linux/man-pages/man3/errno.3.html)
+        Err(e) => panic!("Failed to check if process exists: {}", e),
     }
 }
 
-impl std::fmt::Display for StopReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StopReason::Exited(status) => write!(f, "Exited with status: {}", status),
-            StopReason::Stopped(signal) => write!(f, "Stopped by signal: {:?}", signal),
-            StopReason::Terminated(signal) => write!(f, "Terminated by signal: {:?}", signal),
-        }
-    }
-}
-
-impl From<char> for ProcessState {
-    fn from(value: char) -> Self {
-        match value {
-            'R' => ProcessState::Running,
-            'S' => ProcessState::Sleeping,
-            'D' => ProcessState::Waiting,
-            'Z' => ProcessState::Zombie,
-            'T' => ProcessState::Stopped,
-            't' => ProcessState::TracingStopped,
-            ch => ProcessState::Unknown(ch),
-        }
-    }
+pub fn get_process_state(pid: Pid) -> Result<ProcessState> {
+    let proc_path = format!("/proc/{}/stat", pid);
+    let contents = std::fs::read_to_string(proc_path).context("Failed to read /proc file")?;
+    let last_parenthesis = contents
+        .rfind(')')
+        .ok_or_else(|| anyhow!("Failed to find last parenthesis in /proc file"))?;
+    let index_of_state_char = last_parenthesis + 2; // The state character is right after the last parenthesis
+    let state_char = contents
+        .chars()
+        .nth(index_of_state_char)
+        .ok_or_else(|| anyhow!("Failed to find state character in /proc file"))?;
+    Ok(ProcessState::from(state_char))
 }
 
 #[cfg(test)]
