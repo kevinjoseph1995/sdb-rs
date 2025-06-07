@@ -480,6 +480,16 @@ pub fn as_mutable_bytes_of_struct<'a, StructType>(structure: &'a mut StructType)
     }
 }
 
+pub fn as_bytes_of_struct<'a, StructType>(structure: &'a StructType) -> &'a [u8] {
+    // SAFETY: We assume that the caller ensures that the structure is valid and properly aligned.
+    unsafe {
+        std::slice::from_raw_parts(
+            structure as *const StructType as *const u8,
+            std::mem::size_of::<StructType>(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::mem::{offset_of, zeroed};

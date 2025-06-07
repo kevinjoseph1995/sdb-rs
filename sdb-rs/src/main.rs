@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if let Some(pid) = options.pid {
             Process::attach(Pid::from_raw(pid))?
         } else if let Some(executable_path) = &options.executable {
-            Process::launch(executable_path, options.program_args.clone(), true)?
+            Process::launch(executable_path, options.program_args.clone(), true, None)?
         } else {
             unreachable!(
                 "This should never happen because of the required_unless_present attribute"

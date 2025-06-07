@@ -1,7 +1,6 @@
 use anyhow::{Context, Result, anyhow};
 use core::panic;
 use extended::Extended;
-use libc::size_t;
 use libc::user;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
@@ -11,6 +10,7 @@ use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitpid;
 use nix::unistd::ForkResult;
+use nix::unistd::dup2_stdout;
 use nix::unistd::execvp;
 use nix::unistd::fork;
 use std::ffi::CString;
@@ -32,7 +32,7 @@ enum ProcessHandleState {
     Terminated,
 }
 #[derive(PartialEq, Debug)]
-enum StopReason {
+pub enum StopReason {
     Exited(i32 /*Exit stautus */),
     Stopped(Signal),
     Terminated(Signal),
@@ -85,7 +85,7 @@ impl From<char> for ProcessState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum RegisterValue {
+pub enum RegisterValue {
     U8(u8),
     U16(u16),
     U32(u32),
@@ -104,7 +104,9 @@ enum RegisterValue {
 /// Helper: copy `src` into the first `src.len()` bytes of a zero-filled [u8; 16].
 fn pad_16(src: &[u8]) -> [u8; 16] {
     let mut buf = [0u8; 16];
-    buf[..src.len()].copy_from_slice(src);
+    for (i, byte) in src.iter().enumerate() {
+        buf[i] = *byte;
+    }
     buf
 }
 
@@ -183,12 +185,9 @@ impl Registers {
 
     fn set_register_value(
         &mut self,
-        register_id: register_info::RegisterId,
+        register_info: &'static RegisterInfo,
         value: RegisterValue,
     ) -> Result<()> {
-        let register_info = register_info::get_register_info(register_id)
-            .ok_or_else(|| anyhow!("Failed to get register info for {:?}", register_id))?;
-
         let payload_size = value.get_payload_size_in_bytes();
         if payload_size <= register_info.size {
             let value_widened = value.widen_to_fixed_buffer(&register_info);
@@ -280,6 +279,7 @@ impl Process {
         executable_path: &PathBuf,
         args: Option<String>,
         debug_process_being_launched: bool,
+        stdout_replacement: Option<std::os::fd::OwnedFd>,
     ) -> Result<Self> {
         let (read_port, write_port) = pipe_channel::create_pipe_channel(true)?;
         match unsafe { fork() }? {
@@ -325,6 +325,10 @@ impl Process {
             }
             ForkResult::Child => {
                 drop(read_port);
+                if let Some(stdout_replacement) = stdout_replacement {
+                    // Redirect stdout to the provided file descriptor
+                    dup2_stdout(stdout_replacement)?;
+                }
                 let result =
                     setup_child_process(executable_path, args, debug_process_being_launched);
                 if let Err(e) = result {
@@ -343,7 +347,7 @@ impl Process {
     }
 
     /// Waits for the process to stop or exit. This function blocks until the process undergoes a state change.
-    fn wait_on_signal(&mut self, options: Option<WaitPidFlag>) -> Result<StopReason> {
+    pub fn wait_on_signal(&mut self, options: Option<WaitPidFlag>) -> Result<StopReason> {
         let stop_reason =
             StopReason::from(waitpid(self.pid, options).context("Failed to wait for process")?);
         match &stop_reason {
@@ -383,6 +387,34 @@ impl Process {
         if let Some(read_port) = &self.read_port {
             let output = read_port.read()?;
             print!("{}", String::from_utf8_lossy(&output));
+        }
+        Ok(())
+    }
+
+    pub fn write_register_value(
+        &mut self,
+        register_id: register_info::RegisterId,
+        value: RegisterValue,
+    ) -> Result<()> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to write registers"
+        );
+        let register_info = register_info::get_register_info(register_id)
+            .ok_or_else(|| anyhow!("Failed to get register info for {:?}", register_id))?;
+        self.registers.set_register_value(register_info, value)?;
+        if register_info.reg_type == RegisterType::FloatingPoint {
+            // Floating point registers are written as a whole struct.
+            self.write_fprs(&self.registers.data.i387)
+                .context("Failed to write floating point registers")?;
+        } else {
+            // For general purpose registers, we write them one by one.
+            let aligned_offset = register_info.offset & !0b111;
+            let value: u64 = register_info::coerce_bytes_of_struct_to_type_at_offset::<user, u64>(
+                &self.registers.data,
+                aligned_offset,
+            )?;
+            self.poke_user_data(aligned_offset, value)?;
         }
         Ok(())
     }
@@ -515,19 +547,21 @@ pub fn get_process_state(pid: Pid) -> Result<ProcessState> {
 
 #[cfg(test)]
 mod tests {
+    use crate::pipe_channel::{ChannelPort, create_pipe_channel};
+
     use super::*;
 
     #[test]
     fn test_process_launching() {
         let executable_path = PathBuf::from("ls");
         let args = Some("-l".to_string());
-        let process_handle = Process::launch(&executable_path, args, true);
+        let process_handle = Process::launch(&executable_path, args, true, None);
         assert!(process_handle.is_ok());
     }
     #[test]
     fn test_process_launching_missing_executable() {
         let executable_path = PathBuf::from("executable_that_does_not_exist");
-        let process_handle = Process::launch(&executable_path, None, true);
+        let process_handle = Process::launch(&executable_path, None, true, None);
         assert!(process_handle.is_err(), "{}", process_handle.err().unwrap());
     }
 
@@ -535,7 +569,7 @@ mod tests {
     fn test_process_exists() {
         let pid: Pid = {
             let executable_path = PathBuf::from("yes");
-            let process_handle = Process::launch(&executable_path, None, true);
+            let process_handle = Process::launch(&executable_path, None, true, None);
             let process_handle = process_handle.expect("Process failed to launch");
             assert!(process_handle.exists());
             process_handle.pid
@@ -550,6 +584,7 @@ mod tests {
             &PathBuf::from("yes"),
             None,
             false, /*Note that we're not going to trace this process that's being launched */
+            None,
         )
         .expect("Process failed to launch");
         let attached_process = Process::attach(target_process.pid).expect("Failed to attach");
@@ -568,8 +603,8 @@ mod tests {
 
     #[test]
     fn test_process_resume() {
-        let mut target_process =
-            Process::launch(&PathBuf::from("yes"), None, true).expect("Process failed to launch");
+        let mut target_process = Process::launch(&PathBuf::from("yes"), None, true, None)
+            .expect("Process failed to launch");
         assert!(
             get_process_state(target_process.pid).expect("Failed to get process state")
                 == ProcessState::TracingStopped
@@ -584,8 +619,8 @@ mod tests {
     }
     #[test]
     fn test_process_resume_not_attached() {
-        let target_process =
-            Process::launch(&PathBuf::from("yes"), None, false).expect("Process failed to launch");
+        let target_process = Process::launch(&PathBuf::from("yes"), None, false, None)
+            .expect("Process failed to launch");
         assert!(
             get_process_state(target_process.pid).expect("Failed to get process state")
                 == ProcessState::Running
@@ -603,6 +638,131 @@ mod tests {
         assert_eq!(
             get_process_state(attached_handle.pid).unwrap(),
             ProcessState::Running
+        );
+    }
+
+    #[test]
+    fn test_register_write() {
+        let (read_port, write_port) =
+            create_pipe_channel(true).expect("Failed to create pipe channel");
+        let mut target_process = Process::launch(
+            &PathBuf::from(env!("CARGO_BIN_FILE_REG_WRITE")),
+            None,
+            true,
+            Some(write_port.into_internal_fd()),
+        )
+        .expect("Process failed to launch");
+        assert!(
+            get_process_state(target_process.pid).expect("Failed to get process state")
+                == ProcessState::TracingStopped
+        );
+        target_process
+            .resume_process()
+            .expect("1: Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("2: Failed to wait for process");
+
+        target_process
+            .write_register_value(
+                register_info::RegisterId::rsi,
+                RegisterValue::U64(0xdeadbeef),
+            )
+            .expect("Failed to write rsi register value");
+        target_process
+            .resume_process()
+            .expect("3: Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("4: Failed to wait for process");
+
+        let rsi_value = read_port.read().expect("Failed to read from pipe");
+        let rsi_value_str = String::from_utf8(rsi_value).expect("Failed to convert to string");
+        assert_eq!(
+            rsi_value_str.trim(),
+            "0xdeadbeef",
+            "Expected rsi value to be 0xdeadbeef, got: {}",
+            rsi_value_str
+        );
+
+        target_process
+            .write_register_value(
+                register_info::RegisterId::mm(0),
+                RegisterValue::U64(0xba5eba11),
+            )
+            .expect("Failed to write mm0 register value");
+        target_process
+            .resume_process()
+            .expect("3: Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("4: Failed to wait for process");
+
+        let mm0_value = read_port.read().expect("Failed to read from pipe");
+        let mm0_value_str = String::from_utf8(mm0_value).expect("Failed to convert to string");
+        assert_eq!(
+            mm0_value_str.trim(),
+            "0xba5eba11",
+            "Expected mm0 value to be 0xba5eba11, got: {}",
+            mm0_value_str
+        );
+
+        target_process
+            .write_register_value(register_info::RegisterId::xmm(0), RegisterValue::F64(42.24))
+            .expect("Failed to write mm0 register value");
+        target_process
+            .resume_process()
+            .expect("3: Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("4: Failed to wait for process");
+        let xmm0_value = read_port.read().expect("Failed to read from pipe");
+        let xmm0_value_str = String::from_utf8(xmm0_value).expect("Failed to convert to string");
+        assert_eq!(
+            xmm0_value_str.trim(),
+            "42.24",
+            "Expected xmm0 value to be 42.24, got: {}",
+            xmm0_value_str
+        );
+
+        target_process
+            .write_register_value(
+                register_info::RegisterId::st(0),
+                RegisterValue::LongDouble({
+                    let mut long_double_value = [0u8; 16];
+                    for (i, byte) in Extended::from(3.14).to_le_bytes().iter().enumerate() {
+                        long_double_value[i] = *byte;
+                    }
+                    long_double_value
+                }),
+            )
+            .expect("Failed to write st0 register value");
+
+        target_process
+            .write_register_value(
+                register_info::RegisterId::fsw,
+                RegisterValue::U16(0b0011100000000000),
+            )
+            .expect("Failed to write st0 register value");
+        target_process
+            .write_register_value(
+                register_info::RegisterId::ftw,
+                RegisterValue::U16(0b0011111111111111),
+            )
+            .expect("Failed to write st0 register value");
+        target_process
+            .resume_process()
+            .expect("3: Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("4: Failed to wait for process");
+        let st0_value = read_port.read().expect("Failed to read from pipe");
+        let st0_value_str = String::from_utf8(st0_value).expect("Failed to convert to string");
+        assert_eq!(
+            st0_value_str.trim(),
+            "3.14",
+            "Expected st0 value to be 3.14, got: {}",
+            st0_value_str
         );
     }
 }

@@ -1,4 +1,4 @@
-mod pipe_channel;
+pub mod pipe_channel;
 pub mod process;
 pub mod register_info;
 

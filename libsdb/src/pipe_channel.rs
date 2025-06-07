@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 
 use nix::fcntl::OFlag;
 
@@ -9,6 +9,21 @@ pub struct ReadPort {
 
 pub struct WritePort {
     fd: OwnedFd,
+}
+
+pub trait ChannelPort {
+    fn into_internal_fd(self) -> OwnedFd;
+}
+
+impl ChannelPort for ReadPort {
+    fn into_internal_fd(self) -> OwnedFd {
+        return self.fd;
+    }
+}
+impl ChannelPort for WritePort {
+    fn into_internal_fd(self) -> OwnedFd {
+        return self.fd;
+    }
 }
 
 pub fn create_pipe_channel(close_on_exec: bool) -> Result<(ReadPort, WritePort)> {
@@ -25,7 +40,7 @@ pub fn create_pipe_channel(close_on_exec: bool) -> Result<(ReadPort, WritePort)>
 impl ReadPort {
     pub fn read_into_buffer(&self, buf: &mut [u8]) -> Result<usize> {
         let bytes_read =
-            nix::unistd::read(self.fd.as_raw_fd(), buf).context("Failed to read from pipe")?;
+            nix::unistd::read(self.fd.as_fd(), buf).context("Failed to read from pipe")?;
         Ok(bytes_read)
     }
 
