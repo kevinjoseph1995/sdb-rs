@@ -1,0 +1,12 @@
+[package]
+name = "reg_read"
+version = "0.1.0"
+edition = "2024"
+build   = "build.rs"
+
+[[bin]]
+name = "reg_read"
+path = "src/dummy.rs"
+
+[build-dependencies]
+cc = "1.0"

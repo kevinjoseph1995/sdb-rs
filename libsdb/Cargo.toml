@@ -11,3 +11,4 @@ nix = { version = "0.30.1", features = ["ptrace", "signal", "fs"] }
 
 [dev-dependencies]
 reg_write = { path = "../tools/reg_write", artifact = "bin" }
+reg_read = { path = "../tools/reg_read", artifact = "bin" }

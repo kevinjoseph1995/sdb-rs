@@ -170,7 +170,7 @@ impl RegisterValue {
     }
 }
 
-struct Registers {
+pub struct Registers {
     data: user,
 }
 
@@ -208,7 +208,7 @@ impl Registers {
     }
 
     /// Load a register’s value from `self.data` and wrap it in the right enum variant.
-    fn get_register_value(&self, id: register_info::RegisterId) -> Result<RegisterValue> {
+    pub fn get_register_value(&self, id: register_info::RegisterId) -> Result<RegisterValue> {
         let info = register_info::get_register_info(id)
             .ok_or_else(|| anyhow!("unknown register {:?}", id))?;
         let off = info.offset as usize;
@@ -344,6 +344,10 @@ impl Process {
 
     pub fn exists(&self) -> bool {
         process_with_pid_exists(self.pid)
+    }
+
+    pub fn get_registers(&self) -> &Registers {
+        return &self.registers;
     }
 
     /// Waits for the process to stop or exit. This function blocks until the process undergoes a state change.
@@ -671,10 +675,10 @@ mod tests {
             .expect("Failed to write rsi register value");
         target_process
             .resume_process()
-            .expect("3: Failed to resume process");
+            .expect("Failed to resume process");
         target_process
             .wait_on_signal(None)
-            .expect("4: Failed to wait for process");
+            .expect("Failed to wait for process");
 
         let rsi_value = read_port.read().expect("Failed to read from pipe");
         let rsi_value_str = String::from_utf8(rsi_value).expect("Failed to convert to string");
@@ -693,10 +697,10 @@ mod tests {
             .expect("Failed to write mm0 register value");
         target_process
             .resume_process()
-            .expect("3: Failed to resume process");
+            .expect("Failed to resume process");
         target_process
             .wait_on_signal(None)
-            .expect("4: Failed to wait for process");
+            .expect("Failed to wait for process");
 
         let mm0_value = read_port.read().expect("Failed to read from pipe");
         let mm0_value_str = String::from_utf8(mm0_value).expect("Failed to convert to string");
@@ -712,10 +716,10 @@ mod tests {
             .expect("Failed to write mm0 register value");
         target_process
             .resume_process()
-            .expect("3: Failed to resume process");
+            .expect("Failed to resume process");
         target_process
             .wait_on_signal(None)
-            .expect("4: Failed to wait for process");
+            .expect("Failed to wait for process");
         let xmm0_value = read_port.read().expect("Failed to read from pipe");
         let xmm0_value_str = String::from_utf8(xmm0_value).expect("Failed to convert to string");
         assert_eq!(
@@ -752,10 +756,10 @@ mod tests {
             .expect("Failed to write st0 register value");
         target_process
             .resume_process()
-            .expect("3: Failed to resume process");
+            .expect("Failed to resume process");
         target_process
             .wait_on_signal(None)
-            .expect("4: Failed to wait for process");
+            .expect("Failed to wait for process");
         let st0_value = read_port.read().expect("Failed to read from pipe");
         let st0_value_str = String::from_utf8(st0_value).expect("Failed to convert to string");
         assert_eq!(
@@ -764,5 +768,106 @@ mod tests {
             "Expected st0 value to be 3.14, got: {}",
             st0_value_str
         );
+    }
+
+    #[test]
+    fn test_register_read() {
+        let (read_port, write_port) =
+            create_pipe_channel(true).expect("Failed to create pipe channel");
+        let mut target_process = Process::launch(
+            &PathBuf::from(env!("CARGO_BIN_FILE_REG_READ")),
+            None,
+            true,
+            Some(write_port.into_internal_fd()),
+        )
+        .expect("Process failed to launch");
+        assert!(
+            get_process_state(target_process.pid).expect("Failed to get process state")
+                == ProcessState::TracingStopped
+        );
+
+        target_process
+            .resume_process()
+            .expect("Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("Failed to wait for process");
+
+        let value = target_process
+            .get_registers()
+            .get_register_value(register_info::RegisterId::r13)
+            .expect("Failed to read r13 register value");
+        assert!(matches!(value, RegisterValue::U64(0xcafecafe)));
+
+        target_process
+            .resume_process()
+            .expect("Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("Failed to wait for process");
+
+        let value = target_process
+            .get_registers()
+            .get_register_value(register_info::RegisterId::r13b)
+            .expect("Failed to read r13b register value");
+        assert!(matches!(value, RegisterValue::U8(42)));
+
+        target_process
+            .resume_process()
+            .expect("Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("Failed to wait for process");
+
+        let value = target_process
+            .get_registers()
+            .get_register_value(register_info::RegisterId::mm(0))
+            .expect("Failed to read mm0 register value");
+        let expected_bytes: [u8; 8] = 0xba5eba11u64.to_le_bytes();
+        assert!(matches!(value, RegisterValue::Byte64(expected_bytes)));
+
+        target_process
+            .resume_process()
+            .expect("Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("Failed to wait for process");
+
+        let value = target_process
+            .get_registers()
+            .get_register_value(register_info::RegisterId::xmm(0))
+            .expect("Failed to read xmm0 register value");
+        let expected_bytes: [u8; 8] = 64.125f64.to_le_bytes();
+        let expected_bytes_widened: [u8; 16] = {
+            let mut bytes = [0u8; 16];
+            bytes[0..8].copy_from_slice(&expected_bytes);
+            bytes
+        };
+        assert!(matches!(
+            value,
+            RegisterValue::Byte128(expected_bytes_widened)
+        ));
+
+        target_process
+            .resume_process()
+            .expect("Failed to resume process");
+        target_process
+            .wait_on_signal(None)
+            .expect("Failed to wait for process");
+
+        let value = target_process
+            .get_registers()
+            .get_register_value(register_info::RegisterId::st(0))
+            .expect("Failed to read st0 register value");
+        let expected_bytes: [u8; 10] = Extended::from(64.125f64).to_le_bytes();
+        let expected_bytes_widened: [u8; 16] = {
+            let mut bytes = [0u8; 16];
+            bytes[0..10].copy_from_slice(&expected_bytes);
+            bytes
+        };
+        assert!(matches!(
+            value,
+            RegisterValue::LongDouble(expected_bytes_widened)
+        ));
     }
 }
