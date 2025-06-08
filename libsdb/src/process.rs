@@ -1,21 +1,22 @@
-use anyhow::{Context, Result, anyhow};
+use std::ffi::CString;
+use std::path::PathBuf;
+/////////////////////////////////////////
+use anyhow::{anyhow, Context, Result};
 use core::panic;
 use extended::Extended;
 use libc::user;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
-use nix::sys::signal::Signal;
 use nix::sys::signal::kill;
+use nix::sys::signal::Signal;
+use nix::sys::wait::waitpid;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
-use nix::sys::wait::waitpid;
-use nix::unistd::ForkResult;
 use nix::unistd::dup2_stdout;
 use nix::unistd::execvp;
 use nix::unistd::fork;
-use std::ffi::CString;
-use std::path::PathBuf;
-
+use nix::unistd::ForkResult;
+/////////////////////////////////////////
 use crate::pipe_channel;
 use crate::register_info;
 use crate::register_info::RegisterFormat;
@@ -551,7 +552,7 @@ pub fn get_process_state(pid: Pid) -> Result<ProcessState> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pipe_channel::{ChannelPort, create_pipe_channel};
+    use crate::pipe_channel::{create_pipe_channel, ChannelPort};
 
     use super::*;
 

@@ -1,7 +1,9 @@
+/////////////////////////////////////////
 use std::mem::zeroed;
-
-use anyhow::{Result, anyhow};
+/////////////////////////////////////////
+use anyhow::{anyhow, Result};
 use nix::libc::size_t;
+/////////////////////////////////////////
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RegisterType {

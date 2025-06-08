@@ -61,10 +61,9 @@ impl Application {
 
     pub fn main_loop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let mut rl = DefaultEditor::new()?;
-        if rl.load_history(&self.history_file).is_err() {
-            println!("No previous history.");
+        if rl.load_history(&self.history_file).is_ok() {
+            println!("Loading history from: {}", self.history_file.display());
         }
-        println!("{}", self.history_file.display());
 
         while self.loop_running {
             let readline = rl.readline("(sdb) ");
