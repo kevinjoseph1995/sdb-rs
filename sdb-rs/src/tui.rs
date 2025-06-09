@@ -1,24 +1,54 @@
-/////////////////////////////////
 use anyhow::Result;
 use libsdb::process::Process;
-use rustyline::DefaultEditor;
-use rustyline::error::ReadlineError;
+use rustyline::{
+    Context, Helper, completion::Completer, highlight::Highlighter, hint::Hinter,
+    history::DefaultHistory, validate::Validator,
+};
 use std::path::PathBuf;
-/////////////////////////////////
-use crate::options::Options;
-/////////////////////////////////
+
+use crate::command::{self, Command, get_command_by_alias};
 
 pub struct Application {
-    _command_line_options: Options,
     history_file: PathBuf,
     loop_running: bool,
     inferior_process: Process,
 }
 
+struct CustomHelper {
+    // Custom helper fields can be added here
+}
+
+impl Validator for CustomHelper {}
+
+impl Highlighter for CustomHelper {}
+
+impl Hinter for CustomHelper {
+    type Hint = String;
+}
+
+impl Completer for CustomHelper {
+    type Candidate = String;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        let _ = (line, pos, ctx);
+        let candidates: Vec<Self::Candidate> = command::get_candidates_for_given_prefix(line)
+            .into_iter()
+            .map(|c| c.to_string())
+            .collect();
+        Ok((0, candidates))
+    }
+}
+
+impl Helper for CustomHelper {}
+
 impl Application {
-    pub fn new(options: Options, inferior_process: Process) -> Self {
+    pub fn new(inferior_process: Process) -> Self {
         Self {
-            _command_line_options: options,
             history_file: {
                 match dirs::cache_dir() {
                     Some(cache_dir) => cache_dir.join(".sdb_history"),
@@ -30,20 +60,22 @@ impl Application {
         }
     }
 
-    fn handle_command(&mut self, command: String) -> Result<()> {
-        match command.as_str() {
-            "exit" | "quit" | "q" => {
+    fn handle_command(&mut self, command: &Command) -> Result<()> {
+        match command.category {
+            command::CommandCategory::Exit => {
+                println!("Exiting the debugger.");
                 self.loop_running = false;
                 Ok(())
             }
-            "run" | "r" | "continue" | "c" => {
+            command::CommandCategory::Run | command::CommandCategory::Continue => {
                 self.inferior_process.resume_process().unwrap_or_else(|e| {
                     // Not a hard error, just print and continue
                     println!("Failed to resume process: {}", e);
                 });
                 Ok(())
             }
-            "dump_child_output" | "dco" => {
+
+            command::CommandCategory::DumpChildOutput => {
                 self.inferior_process
                     .print_child_output()
                     .unwrap_or_else(|e| {
@@ -52,40 +84,42 @@ impl Application {
                     });
                 Ok(())
             }
-            _ => {
-                println!("Command not recognized: {}", command);
-                Ok(())
-            }
         }
     }
 
-    pub fn main_loop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut rl = DefaultEditor::new()?;
+    pub fn main_loop(&mut self) -> Result<()> {
+        let mut rl = rustyline::Editor::<CustomHelper, DefaultHistory>::new()?;
+        rl.set_helper(Some(CustomHelper {}));
         if rl.load_history(&self.history_file).is_ok() {
-            println!("Loading history from: {}", self.history_file.display());
+            println!("History loaded from: {}", self.history_file.display());
+        } else {
+            println!("No history file found, starting fresh.");
         }
-
         while self.loop_running {
             let readline = rl.readline("(sdb) ");
             match readline {
                 Ok(line) => {
                     rl.add_history_entry(line.as_str())?;
-                    self.handle_command(line.clone())?;
+                    if let Some(command) = get_command_by_alias(line.trim()) {
+                        self.handle_command(command)?;
+                    } else {
+                        println!("Command not recognized: {}", line.trim());
+                    }
                 }
-                Err(ReadlineError::Interrupted) => {
+                Err(rustyline::error::ReadlineError::Interrupted) => {
                     self.inferior_process.stop_process()?;
                 }
-                Err(ReadlineError::Eof) => {
-                    println!("CTRL-D");
-                    break;
+                Err(rustyline::error::ReadlineError::Eof) => {
+                    println!("Ctrl-D pressed, exiting...");
+                    self.loop_running = false;
                 }
                 Err(err) => {
-                    eprintln!("Error: {:?}", err);
-                    break;
+                    eprintln!("Error reading line: {}", err);
+                    self.loop_running = false;
                 }
             }
         }
-        rl.save_history(&self.history_file)?;
-        Ok(())
+
+        anyhow::Ok(())
     }
 }

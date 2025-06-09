@@ -1,4 +1,5 @@
 ///////////////////////////
+mod command;
 mod options;
 mod tui;
 ///////////////////////////
@@ -22,7 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let result = tui::Application::new(options, inferior_process).main_loop();
+    let result = tui::Application::new(inferior_process).main_loop();
     if result.is_err() {
         eprintln!("Error in main loop: {}", result.unwrap_err());
         std::process::exit(1);
