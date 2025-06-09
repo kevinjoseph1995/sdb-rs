@@ -3,40 +3,39 @@ use std::fmt::Display;
 use lazy_static::lazy_static;
 use ptrie::Trie;
 
-pub enum CommandCategory {
-    Exit,
-    Run,
-    Continue,
-    DumpChildOutput,
-}
 pub struct Command {
     pub category: CommandCategory,
     pub description: &'static str,
     pub aliases: &'static [&'static str],
 }
 
-pub const COMMANDS: &'static [Command] = &[
-    Command {
-        category: CommandCategory::Exit,
-        description: "Exit the debugger.",
-        aliases: &["exit", "quit", "q"],
-    },
-    Command {
-        category: CommandCategory::Run,
-        description: "Run the inferior process.",
-        aliases: &["run", "r"],
-    },
-    Command {
-        category: CommandCategory::Continue,
-        description: "Continue the execution of the inferior process.",
-        aliases: &["continue", "c"],
-    },
-    Command {
-        category: CommandCategory::DumpChildOutput,
-        description: "Dump the output of the child process.",
-        aliases: &["dump_child_output", "dco"],
-    },
-];
+macro_rules! define_commands {
+    ($(($cat:ident, $desc:expr, [$($alias:expr),*])),*) => {
+        #[derive(Debug)]
+        pub enum CommandCategory {
+            $($cat,)*
+        }
+
+        pub const COMMANDS: &[Command] = &[
+            $(Command {
+                category: CommandCategory::$cat,
+                description: $desc,
+                aliases: &[$($alias),*],
+            },)*
+        ];
+    };
+}
+
+define_commands!(
+    (Exit, "Exit the debugger.", ["exit", "quit", "q"]),
+    (Run, "Run the inferior process.", ["run", "r"]),
+    (Continue, "Continue execution.", ["continue", "c"]),
+    (
+        DumpChildOutput,
+        "Dump child output.",
+        ["dump_child_output", "dco"]
+    )
+);
 
 lazy_static! {
     static ref COMMAND_TRIE: Trie<char, &'static Command> = {

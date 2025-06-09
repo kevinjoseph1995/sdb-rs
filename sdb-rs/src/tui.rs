@@ -14,6 +14,11 @@ pub struct Application {
     inferior_process: Process,
 }
 
+struct CommandWithArgs {
+    command: &'static Command,
+    args: Vec<String>,
+}
+
 struct CustomHelper {
     // Custom helper fields can be added here
 }
@@ -74,7 +79,6 @@ impl Application {
                 });
                 Ok(())
             }
-
             command::CommandCategory::DumpChildOutput => {
                 self.inferior_process
                     .print_child_output()
