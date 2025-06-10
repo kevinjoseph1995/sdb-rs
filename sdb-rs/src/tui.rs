@@ -6,17 +6,12 @@ use rustyline::{
 };
 use std::path::PathBuf;
 
-use crate::command::{self, Command, get_command_by_alias};
+use crate::command::{self, Command, SubCommand, get_command_from_string};
 
 pub struct Application {
     history_file: PathBuf,
     loop_running: bool,
     inferior_process: Process,
-}
-
-struct CommandWithArgs {
-    command: &'static Command,
-    args: Vec<String>,
 }
 
 struct CustomHelper {
@@ -41,11 +36,58 @@ impl Completer for CustomHelper {
         ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
         let _ = (line, pos, ctx);
-        let candidates: Vec<Self::Candidate> = command::get_candidates_for_given_prefix(line)
-            .into_iter()
-            .map(|c| c.to_string())
-            .collect();
-        Ok((0, candidates))
+        let line_components: Vec<&str> = line.trim().split_whitespace().collect();
+        if line_components.is_empty() {
+            return Ok((0, vec![]));
+        } else if line_components.len() == 1 {
+            let candidates: Vec<Self::Candidate> =
+                command::get_candidates_for_given_prefix(line_components[0])
+                    .into_iter()
+                    .map(|c| c.to_string())
+                    .collect();
+            return Ok((0, candidates));
+        } else {
+            let command = match command::get_command_from_string(line_components[0]) {
+                Some(command) => command,
+                None => {
+                    // If the command is not recognized, return an empty list of candidates
+                    return Ok((0, vec![]));
+                }
+            };
+            let args = &line_components[1..];
+            /*
+            Given the following defintion of a sub-command:
+
+            pub struct SubCommand {
+                pub sub_commands: &'static [SubCommand],
+                ...
+            }
+
+            We need to handle the completion of sub-commands. We need to match every arg against the recursive sub-commands and return the candidates for the last arg.
+             */
+            let mut sub_commands = &command.metadata.sub_commands;
+            for arg in args[..args.len() - 1].iter() {
+                if let Some(sub_command) = sub_commands.iter().find(|&sc| sc.aliases.contains(&arg))
+                {
+                    // If we found a matching sub-command, we continue to the next argument
+                    // and update the sub_commands to the sub_commands of the found sub_command
+                    sub_commands = &sub_command.sub_commands;
+                } else {
+                    break;
+                }
+            }
+            let candidates: Vec<String> = sub_commands
+                .iter()
+                .map(|s| s.aliases)
+                .flatten()
+                .filter(|alias| alias.starts_with(line_components.last().unwrap_or(&"")))
+                .map(|alias| alias.to_string())
+                .collect();
+            return Ok((
+                pos - line_components.last().unwrap_or(&"").len(),
+                candidates,
+            ));
+        }
     }
 }
 
@@ -65,8 +107,35 @@ impl Application {
         }
     }
 
-    fn handle_command(&mut self, command: &Command) -> Result<()> {
-        match command.category {
+    fn handle_register_command(&mut self, command: Command) -> Result<()> {
+        assert_eq!(
+            command.metadata.category,
+            command::CommandCategory::Register
+        );
+        todo!()
+    }
+
+    fn handle_help_command(&mut self, command: Command) -> Result<()> {
+        assert_eq!(command.metadata.category, command::CommandCategory::Help);
+        if command.args.is_empty() {
+            // Show usage of all commands
+            println!("Available commands:");
+            for cmd in command::COMMANDS {
+                println!("  {}: {}", cmd.aliases[0], cmd.description);
+            }
+        } else {
+            // Show usage of a specific command
+            if let Some(description) = command::get_full_command_description(&command.args) {
+                println!("{}", description);
+            } else {
+                println!("Command '{}' not found.", command.args[0]);
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_command(&mut self, command: Command) -> Result<()> {
+        match command.metadata.category {
             command::CommandCategory::Exit => {
                 println!("Exiting the debugger.");
                 self.loop_running = false;
@@ -88,6 +157,8 @@ impl Application {
                     });
                 Ok(())
             }
+            command::CommandCategory::Help => self.handle_help_command(command),
+            command::CommandCategory::Register => self.handle_register_command(command),
         }
     }
 
@@ -104,7 +175,7 @@ impl Application {
             match readline {
                 Ok(line) => {
                     rl.add_history_entry(line.as_str())?;
-                    if let Some(command) = get_command_by_alias(line.trim()) {
+                    if let Some(command) = get_command_from_string(&line) {
                         self.handle_command(command)?;
                     } else {
                         println!("Command not recognized: {}", line.trim());
