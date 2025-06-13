@@ -2,7 +2,6 @@
 mod command;
 mod options;
 mod tui;
-mod command_new;
 ///////////////////////////
 use clap::Parser;
 ///////////////////////////

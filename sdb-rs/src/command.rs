@@ -1,196 +1,429 @@
-use lazy_static::lazy_static;
-use ptrie::Trie;
+use anyhow::{Ok, Result};
 
-#[derive(Debug, PartialEq)]
-pub struct SubCommand {
-    pub name: &'static str,
-    pub description: &'static str,
-    pub aliases: &'static [&'static str],
-    pub sub_commands: &'static [SubCommand],
-}
-
+#[derive(Debug, Clone)]
 pub struct CommandMetadata {
-    pub category: CommandCategory,
-    pub description: &'static str,
+    pub name: &'static str,
     pub aliases: &'static [&'static str],
-    pub sub_commands: &'static [SubCommand],
+    pub description: &'static str,
+    pub subcommands: &'static [CommandMetadata],
+    pub category: Option<CommandCategory>,
 }
 
-macro_rules! define_commands {
-    ($(($cat:ident, $desc:expr, [$($alias:expr),*], [$($sub_cmd:expr),*])),*) => {
-        #[derive(Debug, PartialEq, Hash)]
-        pub enum CommandCategory {
-            $($cat,)*
-        }
-
-        pub const COMMANDS: &[CommandMetadata] = &[
-            $(CommandMetadata {
-                category: CommandCategory::$cat,
-                description: $desc,
-                aliases: &[$($alias),*],
-                sub_commands: &[$($sub_cmd),*],
-            },)*
-        ];
-    };
-}
-
-macro_rules! subcommand {
-    ($name:expr, $desc:expr, [$($alias:expr),*], [$($sub_cmd:expr),*]) => {
-        SubCommand {
-            name: $name,
+macro_rules! cmd {
+    ([$first_alias:expr $(, $alias:expr)*], $desc:expr, [$($sub:tt)*], $category:expr) => {
+        CommandMetadata {
+            name: $first_alias,
+            aliases: &[$first_alias $(, $alias)*],
             description: $desc,
-            aliases: &[$($alias),*],
-            sub_commands: &[$($sub_cmd),*],
+            subcommands: &[$($sub)*],
+            category: $category,
         }
     };
 }
 
-define_commands!(
-    (
-        Exit,
-        "Exit the debugger. Usage: `exit | quit | q`",
-        ["exit", "quit", "q"],
-        []
-    ),
-    (
-        Run,
-        "Run the inferior process. Usage: `run | r`",
-        ["run", "r"],
-        []
-    ),
-    (
-        Continue,
-        "Continue execution. Usage: `continue | c`",
-        ["continue", "c"],
-        []
-    ),
-    (
-        DumpChildOutput,
-        "Dump child output. Usage: `dump_child_output | dco`",
-        ["dump_child_output", "dco"],
-        []
-    ),
-    (
-        Help,
-        "Show help information. Usage: `help | h`",
-        ["help", "h"],
-        []
-    ),
-    (
-        Register,
-        "Read or write registers.",
-        ["register", "reg"],
+macro_rules! opt {
+    ([$first_alias:expr $(, $alias:expr)*], $desc:expr, $max_args:expr) => {
+        CommandOption {
+            name: $first_alias,
+            aliases: &[$first_alias $(, $alias)*],
+            description: $desc,
+            max_args: $max_args,
+        }
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CommandCategory {
+    Exit,
+    Run,
+    Continue,
+    Register(RegisterCommandCategory),
+    DumpChildOutput,
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RegisterCommandCategory {
+    Read,
+    Write,
+}
+
+use CommandCategory::*;
+use RegisterCommandCategory::*;
+
+const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
+    cmd!(["r", "run"], "Run the program", [], Some(Run)),
+    cmd!(["c", "continue"], "Continue execution", [], Some(Continue)),
+    cmd!(["q", "quit", "exit"], "Exit the debugger", [], Some(Exit)),
+    cmd!(
+        ["reg", "register"],
+        "Register operations",
         [
-            subcommand!(
-                "read",
-                "Read a register value. Usage: `register read <reg_name> [all]`",
-                ["read", "r"],
-                []
+            cmd!(["r", "read"], "Read registers", [], Some(Register(Read))),
+            cmd!(
+                ["w", "write"],
+                "Write to registers",
+                [],
+                Some(Register(Write))
             ),
-            subcommand!(
-                "write",
-                "Write a value to a register. Usage: `register write <reg_name> <value>`",
-                ["write", "w"],
-                []
-            )
-        ]
-    )
-);
+        ],
+        None
+    ),
+    cmd!(
+        ["dco", "dump_child_output"],
+        "Dump child process output",
+        [],
+        Some(DumpChildOutput)
+    ),
+];
 
-lazy_static! {
-    static ref COMMAND_TRIE: Trie<char, &'static CommandMetadata> = {
-        let mut trie = Trie::new();
-        for command in COMMANDS {
-            for alias in command.aliases {
-                trie.insert(alias.chars(), command);
-            }
-        }
-        trie
-    };
-    static ref COMMAND_STRING_TRIE: Trie<char, &'static str> = {
-        let mut trie = Trie::new();
-        for command in COMMANDS {
-            for alias in command.aliases {
-                trie.insert(alias.chars(), *alias);
-            }
-        }
-        trie
-    };
-}
+const HELP_COMMAND_METADATA: CommandMetadata = CommandMetadata {
+    name: "help",
+    aliases: &["h", "help"],
+    description: "Show help information for commands",
+    subcommands: &COMMAND_METADATA_LIST,
+    category: Some(Help),
+};
 
+#[derive(Debug, Clone)]
 pub struct Command {
     pub metadata: &'static CommandMetadata,
     pub args: Vec<String>,
 }
 
-/// Parses a command string and returns a `Command` struct if the command is valid.
-/// For example, if the command string is "register read all", it will return a `Command` with the metadata for the "register" command and the args `["read", "all"]`.
-pub fn get_command_from_string(command_string: &str) -> Option<Command> {
-    let mut iter = command_string.split_whitespace();
-    let alias = iter.next()?;
-    let metadata = COMMAND_TRIE.get(alias.chars()).map(|&metadata| metadata)?;
-    let args: Vec<String> = iter.map(String::from).collect();
-    Some(Command { metadata, args })
-}
-
-/// Returns a list of command aliases that match the given prefix.
-pub fn get_candidates_for_given_prefix(prefix: &str) -> Vec<&'static str> {
-    COMMAND_STRING_TRIE
-        .find_postfixes(prefix.chars())
-        .into_iter()
-        .map(|s| *s)
-        .collect()
-}
-
-/// Returns a full command description including sub-commands if available.
-/// If the command is not found, it returns None.
-/// If the command has sub-commands, it appends their descriptions as well.
-pub fn get_full_command_description(command_components: &Vec<String>) -> Option<String> {
-    if command_components.is_empty() {
-        return None;
-    }
-    let alias = command_components[0].as_str();
-    let metadata = COMMAND_TRIE.get(alias.chars())?;
-    let mut description = metadata.description.to_string();
-    if command_components.len() == 1 {
-        // Append available sub-commands if there are any
-        if !metadata.sub_commands.is_empty() {
-            description.push_str("\nAvailable sub-commands:");
-            for sub_command in metadata.sub_commands {
-                description.push_str(&format!(
-                    "\n  {}: {}",
-                    sub_command.name, sub_command.description
-                ));
-            }
-        }
-    }
-    if command_components.len() > 1 {
-        // If there are sub-commands, we need to find the sub-command and append its description
-        let subcommand_strings = &command_components[1..];
-        let mut sub_commands = &metadata.sub_commands;
-        let mut index: usize = 0;
+impl Command {
+    /// Traverse the command tree to find the command metadata
+    /// and return the remaining arguments.
+    fn traverse_command_tree(input: &str) -> Result<(&'static CommandMetadata, Vec<String>)> {
+        let mut token_iterator = input
+            .trim_start()
+            .split_whitespace()
+            .map(|str| str.trim())
+            .peekable();
+        let mut current_command_level = COMMAND_METADATA_LIST;
         loop {
-            if index >= subcommand_strings.len() || sub_commands.is_empty() {
-                // If we have exhausted the sub-commands or there are no sub-commands, we break
-                break;
-            }
-            let subcommand_candidate = subcommand_strings[index].as_str();
-            let matched_sub_command = sub_commands
-                .iter()
-                .find(|cmd| cmd.aliases.contains(&subcommand_candidate));
-            if let Some(cmd) = matched_sub_command {
-                description.push_str(&format!(
-                    "\n{}{}: {}",
-                    " ".repeat(index + 1),
-                    cmd.name,
-                    cmd.description
+            let token = match token_iterator.next() {
+                Some(token) => token,
+                None => return Err(anyhow::anyhow!("No command provided")),
+            };
+            let command = match current_command_level.iter().find_map(|cmd| {
+                if cmd.aliases.contains(&token) {
+                    Some(cmd)
+                } else {
+                    None
+                }
+            }) {
+                Some(cmd) => cmd,
+                None => return Err(anyhow::anyhow!("Unknown command: {}", token)),
+            };
+            if command.subcommands.is_empty() || token_iterator.peek().is_none() {
+                return Ok((
+                    command,
+                    token_iterator.map(String::from).collect::<Vec<String>>(),
                 ));
-                sub_commands = &cmd.sub_commands;
-                index += 1;
             } else {
-                return None;
+                // Traverse the command tree hierarchy
+                current_command_level = command.subcommands;
             }
         }
     }
-    return Some(description);
+
+    /// Parse the command input and return a Command struct.
+    /// Example:
+    /// ```
+    /// let command = Command::parse("reg r rax").unwrap();
+    /// assert_eq!(command.metadata.name, "read");
+    /// assert_eq!(command.args, vec!["rax"]);
+    pub fn parse(input: &str) -> Result<Self> {
+        let (first_token, rest) = match input.find(|c: char| c.is_whitespace()) {
+            Some(index) => {
+                let first_token = &input[..index];
+                let rest = &input[index..];
+                (first_token, rest)
+            }
+            None => (input, ""),
+        };
+        if first_token == "help" || first_token == "h" {
+            return Ok(Command {
+                metadata: &HELP_COMMAND_METADATA,
+                args: rest.trim().split_whitespace().map(String::from).collect(),
+            });
+        }
+        let (command_metadata, args) = Self::traverse_command_tree(input)?;
+        if !command_metadata.subcommands.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Incomplete command: expected subcommand for '{}'",
+                command_metadata.name
+            ));
+        }
+        Ok(Command {
+            metadata: command_metadata,
+            args,
+        })
+    }
+}
+
+fn handle_completions_for_commands(
+    mut partial_command_string: &str,
+    commands: &[CommandMetadata],
+) -> Vec<&'static str> {
+    partial_command_string = partial_command_string.trim_start();
+    if partial_command_string.is_empty() {
+        return commands
+            .iter()
+            .map(|cmd| cmd.aliases)
+            .flatten()
+            .cloned()
+            .collect();
+    }
+    let (first_token, rest) = match partial_command_string.find(|c: char| c.is_whitespace()) {
+        Some(index) => {
+            let first_token = &partial_command_string[..index];
+            let rest = &partial_command_string[index..];
+            (first_token, rest)
+        }
+        None => (partial_command_string, ""),
+    };
+    // Check if we have a matching command
+    if let Some(command) = commands
+        .iter()
+        .find(|cmd| cmd.aliases.contains(&first_token))
+    {
+        if rest.is_empty() {
+            return command.aliases.to_vec();
+        } else {
+            // If we have a matching command, check its subcommands
+            return handle_completions_for_commands(rest, command.subcommands);
+        }
+    }
+    // Check if we have a prefix match
+    let mut completions = Vec::new();
+    for command in commands {
+        for alias in command.aliases {
+            if alias.starts_with(first_token) {
+                completions.push(*alias);
+            }
+        }
+    }
+    completions
+}
+
+pub fn get_completions(partial_command_string: &str) -> Vec<&'static str> {
+    let (first_token, rest) = match partial_command_string.find(|c: char| c.is_whitespace()) {
+        Some(index) => {
+            let first_token = &partial_command_string[..index];
+            let rest = &partial_command_string[index..];
+            (first_token, rest)
+        }
+        None => (partial_command_string, ""),
+    };
+
+    if HELP_COMMAND_METADATA.aliases.contains(&first_token) {
+        return handle_completions_for_commands(rest, COMMAND_METADATA_LIST);
+    } else {
+        return handle_completions_for_commands(partial_command_string, COMMAND_METADATA_LIST);
+    }
+}
+
+pub fn get_description_for_help(help_command: &Command) -> Result<String> {
+    assert!(help_command.metadata.category == Some(Help));
+    if help_command.args.is_empty() {
+        let mut description = String::from("Available commands:");
+        for command in COMMAND_METADATA_LIST {
+            description.push_str(&format!("\n  {}: {}", command.name, command.description));
+        }
+        return Ok(description);
+    }
+    let (metadata, _) = Command::traverse_command_tree(&help_command.args.join(" "))?;
+    let mut description = format!("{}: {}", metadata.name, metadata.description);
+    if !metadata.subcommands.is_empty() {
+        description.push_str("\nAvailable sub-commands:");
+        for sub_command in metadata.subcommands {
+            description.push_str(&format!(
+                "\n  {}: {}",
+                sub_command.name, sub_command.description
+            ));
+        }
+    }
+    return Ok(description);
+}
+
+mod tests {
+
+    use super::*;
+
+    fn validate_level(cmd: &[CommandMetadata]) {
+        let mut aliases = std::collections::HashSet::new();
+        for command in cmd {
+            for alias in command.aliases {
+                assert!(aliases.insert(*alias), "Duplicate alias found: {}", alias);
+            }
+            validate_level(command.subcommands);
+        }
+    }
+
+    #[test]
+    fn test_unique_aliases_at_same_level() {
+        assert!(
+            COMMAND_METADATA_LIST
+                .iter()
+                .map(|cmd| cmd.aliases)
+                .flatten()
+                .filter(|alias| **alias == "help" || **alias == "h")
+                .count()
+                == 0
+        );
+        validate_level(COMMAND_METADATA_LIST);
+    }
+
+    #[test]
+    fn test_command_parsing() {
+        assert_eq!(
+            Command::parse("reg r")
+                .expect("Unable to parse command")
+                .metadata
+                .category,
+            Some(Register(Read))
+        );
+        assert_eq!(
+            Command::parse("reg w")
+                .expect("Unable to parse command")
+                .metadata
+                .category,
+            Some(Register(Write))
+        );
+        assert_eq!(
+            Command::parse("run")
+                .expect("Unable to parse command")
+                .metadata
+                .category,
+            Some(Run)
+        );
+        assert_eq!(
+            Command::parse("continue")
+                .expect("Unable to parse command")
+                .metadata
+                .category,
+            Some(Continue)
+        );
+        assert_eq!(
+            Command::parse("q")
+                .expect("Unable to parse command")
+                .metadata
+                .category,
+            Some(Exit)
+        );
+        assert_eq!(
+            Command::parse("dco")
+                .expect("Unable to parse command")
+                .metadata
+                .category,
+            Some(DumpChildOutput)
+        );
+
+        assert_eq!(
+            Command::parse("reg r rax")
+                .expect("Unable to parse command")
+                .args,
+            vec!["rax"]
+        );
+
+        assert_eq!(
+            Command::parse("reg w rax 123")
+                .expect("Unable to parse command")
+                .args,
+            vec!["rax", "123"]
+        );
+
+        assert_eq!(
+            Command::parse("help")
+                .expect("Unable to parse command")
+                .metadata
+                .category,
+            Some(Help)
+        );
+        assert_eq!(
+            Command::parse("help reg")
+                .expect("Unable to parse command")
+                .metadata
+                .name,
+            "help"
+        );
+        assert_eq!(
+            Command::parse("help reg")
+                .expect("Unable to parse command")
+                .args,
+            vec!["reg"]
+        );
+    }
+
+    #[test]
+    fn test_get_completions() {
+        {
+            let completions = get_completions("");
+            assert!(completions.contains(&"run"));
+            assert!(completions.contains(&"continue"));
+            assert!(completions.contains(&"exit"));
+            assert!(completions.contains(&"dump_child_output"));
+            assert!(completions.contains(&"register"));
+            assert!(!completions.contains(&"help")); // This is expected
+        }
+        {
+            let completions = get_completions("help");
+            assert!(completions.contains(&"run"));
+            assert!(completions.contains(&"continue"));
+            assert!(completions.contains(&"exit"));
+            assert!(completions.contains(&"dump_child_output"));
+            assert!(completions.contains(&"register"));
+            assert!(!completions.contains(&"help")); // This is expected
+        }
+        {
+            let completions = get_completions("re");
+            assert!(completions.contains(&"reg"));
+            assert!(completions.contains(&"register"));
+        }
+        {
+            let completions = get_completions("reg");
+            assert!(completions.contains(&"reg"));
+            assert!(completions.contains(&"register"));
+        }
+        {
+            let completions = get_completions("reg ");
+            assert!(completions.contains(&"r"));
+            assert!(completions.contains(&"read"));
+            assert!(completions.contains(&"w"));
+            assert!(completions.contains(&"write"));
+        }
+
+        {
+            let completions = get_completions("help reg ");
+            assert!(completions.contains(&"r"));
+            assert!(completions.contains(&"read"));
+            assert!(completions.contains(&"w"));
+            assert!(completions.contains(&"write"));
+        }
+    }
+
+    #[test]
+    fn test_get_description_for_help() {
+        {
+            let help_command = Command::parse("help ").expect("Unable to parse command");
+            let description =
+                get_description_for_help(&help_command).expect("Unable to get description");
+            assert!(description.contains("Available commands:"));
+        }
+        {
+            let help_command = Command::parse("help reg").expect("Unable to parse command");
+            let description =
+                get_description_for_help(&help_command).expect("Unable to get description");
+            assert!(description.contains("Available sub-commands:"));
+        }
+        {
+            let help_command = Command::parse("help reg w").expect("Unable to parse command");
+            let description =
+                get_description_for_help(&help_command).expect("Unable to get description");
+            assert!(!description.contains("Available commands:"));
+            assert!(!description.contains("Available sub-commands:"));
+        }
+    }
 }

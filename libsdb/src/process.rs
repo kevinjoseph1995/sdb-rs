@@ -269,7 +269,6 @@ impl Process {
             registers: Registers::new(),
         };
         let stop_reason = child_process_handle.wait_on_signal(None)?;
-        assert_eq!(stop_reason, StopReason::Stopped(Signal::SIGSTOP));
         Ok(child_process_handle)
     }
 
