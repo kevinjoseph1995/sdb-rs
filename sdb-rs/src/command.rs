@@ -21,17 +21,6 @@ macro_rules! cmd {
     };
 }
 
-macro_rules! opt {
-    ([$first_alias:expr $(, $alias:expr)*], $desc:expr, $max_args:expr) => {
-        CommandOption {
-            name: $first_alias,
-            aliases: &[$first_alias $(, $alias)*],
-            description: $desc,
-            max_args: $max_args,
-        }
-    };
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CommandCategory {
     Exit,
