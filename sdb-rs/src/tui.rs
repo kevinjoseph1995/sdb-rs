@@ -6,7 +6,7 @@ use rustyline::{
 };
 use std::path::PathBuf;
 
-use crate::command::{self, Command, RegisterCommandCategory};
+use crate::command::{self, Command, register_command::RegisterCommandCategory};
 
 pub struct Application {
     history_file: PathBuf,
@@ -64,10 +64,6 @@ impl Application {
         }
     }
 
-    fn handle_register_command(&mut self, command: Command) -> Result<()> {
-        todo!()
-    }
-
     fn handle_help_command(&mut self, command: Command) -> Result<()> {
         let description = command::get_description_for_help(&command)?;
         println!("{}", description);
@@ -102,7 +98,9 @@ impl Application {
                 Ok(())
             }
             command::CommandCategory::Help => self.handle_help_command(command),
-            command::CommandCategory::Register(_) => self.handle_register_command(command),
+            command::CommandCategory::Register(cmd) => {
+                cmd.handle_command(command.metadata, command.args, &mut self.inferior_process)
+            }
         }
     }
 
@@ -120,7 +118,9 @@ impl Application {
                 Ok(line) => {
                     rl.add_history_entry(line.as_str())?;
                     if let Ok(command) = Command::parse(&line) {
-                        self.handle_command(command)?;
+                        if let Err(err) = self.handle_command(command) {
+                            eprintln!("Error handling command: {}", err);
+                        }
                     } else {
                         println!("Command not recognized: {}", line.trim());
                     }

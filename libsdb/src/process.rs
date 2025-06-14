@@ -1,21 +1,22 @@
 use std::ffi::CString;
+use std::fmt::Display;
 use std::path::PathBuf;
 /////////////////////////////////////////
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use core::panic;
 use extended::Extended;
 use libc::user;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
-use nix::sys::signal::kill;
 use nix::sys::signal::Signal;
-use nix::sys::wait::waitpid;
+use nix::sys::signal::kill;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
+use nix::sys::wait::waitpid;
+use nix::unistd::ForkResult;
 use nix::unistd::dup2_stdout;
 use nix::unistd::execvp;
 use nix::unistd::fork;
-use nix::unistd::ForkResult;
 /////////////////////////////////////////
 use crate::pipe_channel;
 use crate::register_info;
@@ -167,6 +168,35 @@ impl RegisterValue {
             (RegisterValue::I64(v), ..) => widen!(v),
             (RegisterValue::F32(v), ..) => widen!(v),
             (RegisterValue::F64(v), ..) => widen!(v),
+        }
+    }
+}
+
+impl Display for RegisterValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegisterValue::U8(v) => write!(f, "{}", v),
+            RegisterValue::U16(v) => write!(f, "{}", v),
+            RegisterValue::U32(v) => write!(f, "{}", v),
+            RegisterValue::U64(v) => write!(f, "0x{:x}", v),
+            RegisterValue::I8(v) => write!(f, "{}", v),
+            RegisterValue::I16(v) => write!(f, "{}", v),
+            RegisterValue::I32(v) => write!(f, "{}", v),
+            RegisterValue::I64(v) => write!(f, "{}", v),
+            RegisterValue::F32(v) => write!(f, "{}", v),
+            RegisterValue::F64(v) => write!(f, "{}", v),
+            RegisterValue::LongDouble(bytes) => {
+                let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                write!(f, "0x{}", hex_string)
+            }
+            RegisterValue::Byte64(bytes) => {
+                let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                write!(f, "[{}]", hex_string)
+            }
+            RegisterValue::Byte128(bytes) => {
+                let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                write!(f, "[{}]", hex_string)
+            }
         }
     }
 }
@@ -551,7 +581,7 @@ pub fn get_process_state(pid: Pid) -> Result<ProcessState> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pipe_channel::{create_pipe_channel, ChannelPort};
+    use crate::pipe_channel::{ChannelPort, create_pipe_channel};
 
     use super::*;
 

@@ -1,4 +1,7 @@
+pub mod register_command;
+
 use anyhow::{Ok, Result};
+use register_command::RegisterCommandCategory;
 
 #[derive(Debug, Clone)]
 pub struct CommandMetadata {
@@ -31,12 +34,6 @@ pub enum CommandCategory {
     Help,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum RegisterCommandCategory {
-    Read,
-    Write,
-}
-
 use CommandCategory::*;
 use RegisterCommandCategory::*;
 
@@ -48,7 +45,12 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         ["reg", "register"],
         "Register operations",
         [
-            cmd!(["r", "read"], "Read registers", [], Some(Register(Read))),
+            cmd!(
+                ["r", "read"],
+                "Read registers. Usage: 'register read all' or 'register read <register_name>'",
+                [],
+                Some(Register(Read))
+            ),
             cmd!(
                 ["w", "write"],
                 "Write to registers",

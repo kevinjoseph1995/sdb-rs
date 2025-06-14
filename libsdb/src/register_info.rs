@@ -1,7 +1,7 @@
 /////////////////////////////////////////
 use std::mem::zeroed;
 /////////////////////////////////////////
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use nix::libc::size_t;
 /////////////////////////////////////////
 
@@ -293,7 +293,7 @@ macro_rules! define_dr {
     };
 }
 
-pub const REGISTER_TABLE: &[RegisterInfo] = &[
+pub const REGISTER_INFO_TABLE: &[RegisterInfo] = &[
     ////////////////////////////// 64-bit registers //////////////////////////////
     define_gpr_64!(rax, 0),
     define_gpr_64!(rdx, 1),
@@ -435,18 +435,20 @@ pub const REGISTER_TABLE: &[RegisterInfo] = &[
     define_dr!(7),
 ];
 
-const _: () = assert!(REGISTER_TABLE.len() == 125);
+const _: () = assert!(REGISTER_INFO_TABLE.len() == 125);
 
 pub fn get_register_info(id: RegisterId) -> Option<&'static RegisterInfo> {
-    REGISTER_TABLE.iter().find(|&reg| reg.id == id)
+    REGISTER_INFO_TABLE.iter().find(|&reg| reg.id == id)
 }
 
 pub fn get_register_info_by_name(name: &str) -> Option<&'static RegisterInfo> {
-    REGISTER_TABLE.iter().find(|&reg| reg.name == name)
+    REGISTER_INFO_TABLE.iter().find(|&reg| reg.name == name)
 }
 
 pub fn get_register_info_by_dwarf_id(dwarf_id: i32) -> Option<&'static RegisterInfo> {
-    REGISTER_TABLE.iter().find(|&reg| reg.dwarf_id == dwarf_id)
+    REGISTER_INFO_TABLE
+        .iter()
+        .find(|&reg| reg.dwarf_id == dwarf_id)
 }
 
 pub fn coerce_bytes_of_struct_to_type_at_offset<StructType, DestinationType>(
