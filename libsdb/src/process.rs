@@ -1,10 +1,8 @@
 use std::ffi::CString;
-use std::fmt::Display;
 use std::path::PathBuf;
 /////////////////////////////////////////
 use anyhow::{Context, Result, anyhow};
 use core::panic;
-use extended::Extended;
 use libc::user;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
@@ -23,6 +21,7 @@ use crate::register_info;
 use crate::register_info::RegisterFormat;
 use crate::register_info::RegisterInfo;
 use crate::register_info::RegisterType;
+use crate::register_info::RegisterValue;
 
 type Pid = nix::unistd::Pid;
 
@@ -82,121 +81,6 @@ impl From<char> for ProcessState {
             'T' => ProcessState::Stopped,
             't' => ProcessState::TracingStopped,
             ch => ProcessState::Unknown(ch),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum RegisterValue {
-    U8(u8),
-    U16(u16),
-    U32(u32),
-    U64(u64),
-    I8(i8),
-    I16(i16),
-    I32(i32),
-    I64(i64),
-    F32(f32),
-    F64(f64),
-    LongDouble([u8; 16]), // Assuming we can fit a long double in 16 bytes
-    Byte64([u8; 8]),
-    Byte128([u8; 16]),
-}
-
-/// Helper: copy `src` into the first `src.len()` bytes of a zero-filled [u8; 16].
-fn pad_16(src: &[u8]) -> [u8; 16] {
-    let mut buf = [0u8; 16];
-    for (i, byte) in src.iter().enumerate() {
-        buf[i] = *byte;
-    }
-    buf
-}
-
-/// Helper macro: avoids writing `.to_le_bytes()` + `pad_16` 14 times.
-macro_rules! widen {
-    ($v:expr) => {{
-        #[allow(clippy::useless_conversion)]
-        pad_16(&($v).to_le_bytes())
-    }};
-}
-
-impl RegisterValue {
-    fn get_payload_size_in_bytes(&self) -> usize {
-        match self {
-            RegisterValue::U8(_) | RegisterValue::I8(_) => 1,
-            RegisterValue::U16(_) | RegisterValue::I16(_) => 2,
-            RegisterValue::U32(_) | RegisterValue::I32(_) => 4,
-            RegisterValue::U64(_) | RegisterValue::I64(_) => 8,
-            RegisterValue::F32(_) => 4,
-            RegisterValue::F64(_) => 8,
-            RegisterValue::LongDouble(_) => 16,
-            RegisterValue::Byte64(_) => 8,
-            RegisterValue::Byte128(_) => 16,
-        }
-    }
-    /// Turn any `RegisterValue` into a fixed 128-bit (16-byte) little-endian blob.
-    pub fn widen_to_fixed_buffer(&self, info: &RegisterInfo) -> [u8; 16] {
-        use RegisterFormat::*;
-        // Note: All the to_le_bytes are because this is a little-endian architecture.
-        match (self, info.reg_format, info.size) {
-            // ────────────── floating-point widening ──────────────
-            (RegisterValue::F32(v), DoubleFloat, ..) => widen!(*v as f64),
-            (RegisterValue::F32(v), LongDouble, ..) => pad_16(&Extended::from(*v).to_le_bytes()),
-            (RegisterValue::F64(v), LongDouble, ..) => pad_16(&Extended::from(*v).to_le_bytes()),
-
-            // ────────────── integer widening ──────────────
-            (RegisterValue::I8(v), UnsignedInt, 2) => widen!(*v as i16),
-            (RegisterValue::I8(v), UnsignedInt, 4) => widen!(*v as i32),
-            (RegisterValue::I8(v), UnsignedInt, 8) => widen!(*v as i64),
-            (RegisterValue::I16(v), UnsignedInt, 4) => widen!(*v as i32),
-            (RegisterValue::I16(v), UnsignedInt, 8) => widen!(*v as i64),
-            (RegisterValue::I32(v), UnsignedInt, 8) => widen!(*v as i64),
-
-            // ────────────── everything else ──────────────
-            (RegisterValue::LongDouble(bytes), ..) => bytes.clone(),
-            (RegisterValue::Byte64(bytes), ..) => pad_16(bytes),
-            (RegisterValue::Byte128(bytes), ..) => pad_16(bytes),
-
-            // Numeric values that *don’t* need special widening
-            (RegisterValue::U8(v), ..) => widen!(v),
-            (RegisterValue::U16(v), ..) => widen!(v),
-            (RegisterValue::U32(v), ..) => widen!(v),
-            (RegisterValue::U64(v), ..) => widen!(v),
-            (RegisterValue::I8(v), ..) => widen!(v),
-            (RegisterValue::I16(v), ..) => widen!(v),
-            (RegisterValue::I32(v), ..) => widen!(v),
-            (RegisterValue::I64(v), ..) => widen!(v),
-            (RegisterValue::F32(v), ..) => widen!(v),
-            (RegisterValue::F64(v), ..) => widen!(v),
-        }
-    }
-}
-
-impl Display for RegisterValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            RegisterValue::U8(v) => write!(f, "{}", v),
-            RegisterValue::U16(v) => write!(f, "{}", v),
-            RegisterValue::U32(v) => write!(f, "{}", v),
-            RegisterValue::U64(v) => write!(f, "0x{:x}", v),
-            RegisterValue::I8(v) => write!(f, "{}", v),
-            RegisterValue::I16(v) => write!(f, "{}", v),
-            RegisterValue::I32(v) => write!(f, "{}", v),
-            RegisterValue::I64(v) => write!(f, "{}", v),
-            RegisterValue::F32(v) => write!(f, "{}", v),
-            RegisterValue::F64(v) => write!(f, "{}", v),
-            RegisterValue::LongDouble(bytes) => {
-                let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                write!(f, "0x{}", hex_string)
-            }
-            RegisterValue::Byte64(bytes) => {
-                let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                write!(f, "[{}]", hex_string)
-            }
-            RegisterValue::Byte128(bytes) => {
-                let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                write!(f, "[{}]", hex_string)
-            }
         }
     }
 }
@@ -298,7 +182,7 @@ impl Process {
             is_attached: true,
             registers: Registers::new(),
         };
-        let stop_reason = child_process_handle.wait_on_signal(None)?;
+        let _stop_reason = child_process_handle.wait_on_signal(None)?;
         Ok(child_process_handle)
     }
 
@@ -500,6 +384,8 @@ impl Process {
         Ok(())
     }
 
+    // Maybe unused
+    #[allow(dead_code)]
     fn write_gprs(&self, gprs: &libc::user_regs_struct) {
         assert!(
             self.is_attached,
@@ -584,6 +470,7 @@ mod tests {
     use crate::pipe_channel::{ChannelPort, create_pipe_channel};
 
     use super::*;
+    use extended::Extended;
 
     #[test]
     fn test_process_launching() {
@@ -802,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_register_read() {
-        let (read_port, write_port) =
+        let (_read_port, write_port) =
             create_pipe_channel(true).expect("Failed to create pipe channel");
         let mut target_process = Process::launch(
             &PathBuf::from(env!("CARGO_BIN_FILE_REG_READ")),
@@ -853,8 +740,8 @@ mod tests {
             .get_registers()
             .get_register_value(register_info::RegisterId::mm(0))
             .expect("Failed to read mm0 register value");
-        let expected_bytes: [u8; 8] = 0xba5eba11u64.to_le_bytes();
-        assert!(matches!(value, RegisterValue::Byte64(expected_bytes)));
+        let _expected_bytes: [u8; 8] = 0xba5eba11u64.to_le_bytes();
+        assert!(matches!(value, RegisterValue::Byte64(_expected_bytes)));
 
         target_process
             .resume_process()
@@ -868,14 +755,14 @@ mod tests {
             .get_register_value(register_info::RegisterId::xmm(0))
             .expect("Failed to read xmm0 register value");
         let expected_bytes: [u8; 8] = 64.125f64.to_le_bytes();
-        let expected_bytes_widened: [u8; 16] = {
+        let _expected_bytes_widened: [u8; 16] = {
             let mut bytes = [0u8; 16];
             bytes[0..8].copy_from_slice(&expected_bytes);
             bytes
         };
         assert!(matches!(
             value,
-            RegisterValue::Byte128(expected_bytes_widened)
+            RegisterValue::Byte128(_expected_bytes_widened)
         ));
 
         target_process
@@ -890,14 +777,14 @@ mod tests {
             .get_register_value(register_info::RegisterId::st(0))
             .expect("Failed to read st0 register value");
         let expected_bytes: [u8; 10] = Extended::from(64.125f64).to_le_bytes();
-        let expected_bytes_widened: [u8; 16] = {
+        let _expected_bytes_widened: [u8; 16] = {
             let mut bytes = [0u8; 16];
             bytes[0..10].copy_from_slice(&expected_bytes);
             bytes
         };
         assert!(matches!(
             value,
-            RegisterValue::LongDouble(expected_bytes_widened)
+            RegisterValue::LongDouble(_expected_bytes_widened)
         ));
     }
 }

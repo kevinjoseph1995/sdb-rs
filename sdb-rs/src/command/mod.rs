@@ -239,8 +239,8 @@ pub fn get_description_for_help(help_command: &Command) -> Result<String> {
     return Ok(description);
 }
 
+#[cfg(test)]
 mod tests {
-
     use super::*;
 
     fn validate_level(cmd: &[CommandMetadata]) {

@@ -6,7 +6,7 @@ use rustyline::{
 };
 use std::path::PathBuf;
 
-use crate::command::{self, Command, register_command::RegisterCommandCategory};
+use crate::command::{Command, CommandCategory, get_completions, get_description_for_help};
 
 pub struct Application {
     history_file: PathBuf,
@@ -35,7 +35,7 @@ impl Completer for CustomHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let candidates = command::get_completions(line)
+        let candidates = get_completions(line)
             .iter()
             .map(|s| s.to_string())
             .collect();
@@ -65,7 +65,7 @@ impl Application {
     }
 
     fn handle_help_command(&mut self, command: Command) -> Result<()> {
-        let description = command::get_description_for_help(&command)?;
+        let description = get_description_for_help(&command)?;
         println!("{}", description);
         Ok(())
     }
@@ -76,19 +76,19 @@ impl Application {
             .category
             .expect("Command category should always be present");
         match category {
-            command::CommandCategory::Exit => {
+            CommandCategory::Exit => {
                 println!("Exiting the debugger.");
                 self.loop_running = false;
                 Ok(())
             }
-            command::CommandCategory::Run | command::CommandCategory::Continue => {
+            CommandCategory::Run | CommandCategory::Continue => {
                 self.inferior_process.resume_process().unwrap_or_else(|e| {
                     // Not a hard error, just print and continue
                     println!("Failed to resume process: {}", e);
                 });
                 Ok(())
             }
-            command::CommandCategory::DumpChildOutput => {
+            CommandCategory::DumpChildOutput => {
                 self.inferior_process
                     .print_child_output()
                     .unwrap_or_else(|e| {
@@ -97,8 +97,8 @@ impl Application {
                     });
                 Ok(())
             }
-            command::CommandCategory::Help => self.handle_help_command(command),
-            command::CommandCategory::Register(cmd) => {
+            CommandCategory::Help => self.handle_help_command(command),
+            CommandCategory::Register(cmd) => {
                 cmd.handle_command(command.metadata, command.args, &mut self.inferior_process)
             }
         }

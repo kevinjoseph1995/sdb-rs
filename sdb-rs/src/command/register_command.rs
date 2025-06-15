@@ -1,6 +1,6 @@
 use libsdb::{
     process::Process,
-    register_info::{REGISTER_INFO_TABLE, get_register_info_by_name},
+    register_info::{REGISTER_INFO_TABLE, RegisterValue, get_register_info_by_name},
 };
 
 use crate::command::CommandMetadata;
@@ -61,7 +61,24 @@ impl RegisterCommandCategory {
         args: Vec<String>,
         process: &mut Process,
     ) -> Result<()> {
-        todo!()
+        if args.len() != 2 {
+            return Err(anyhow::anyhow!(
+                "Invalid command usage {}",
+                metadata.description
+            ));
+        }
+        let register_name = &args[0];
+        let register_info = match get_register_info_by_name(register_name) {
+            Some(info) => info,
+            None => {
+                return Err(anyhow::anyhow!(
+                    "Register '{}' not found in the register table",
+                    register_name
+                ));
+            }
+        };
+        let register_value = RegisterValue::parse(&args[1], register_info)?;
+        process.write_register_value(register_info.id, register_value)
     }
 
     pub fn handle_command(

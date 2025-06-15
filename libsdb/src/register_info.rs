@@ -1,7 +1,8 @@
 /////////////////////////////////////////
-use std::mem::zeroed;
+use std::{fmt::Display, mem::zeroed};
 /////////////////////////////////////////
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
+use extended::Extended;
 use nix::libc::size_t;
 /////////////////////////////////////////
 
@@ -494,6 +495,299 @@ pub fn as_bytes_of_struct<'a, StructType>(structure: &'a StructType) -> &'a [u8]
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RegisterValue {
+    U8(u8),
+    U16(u16),
+    U32(u32),
+    U64(u64),
+    I8(i8),
+    I16(i16),
+    I32(i32),
+    I64(i64),
+    F32(f32),
+    F64(f64),
+    LongDouble([u8; 16]), // Assuming we can fit a long double in 16 bytes
+    Byte64([u8; 8]),
+    Byte128([u8; 16]),
+}
+
+/// Helper: copy `src` into the first `src.len()` bytes of a zero-filled [u8; 16].
+fn pad_16(src: &[u8]) -> [u8; 16] {
+    let mut buf = [0u8; 16];
+    for (i, byte) in src.iter().enumerate() {
+        buf[i] = *byte;
+    }
+    buf
+}
+
+/// Helper macro: avoids writing `.to_le_bytes()` + `pad_16` 14 times.
+macro_rules! widen {
+    ($v:expr) => {{
+        #[allow(clippy::useless_conversion)]
+        pad_16(&($v).to_le_bytes())
+    }};
+}
+
+impl RegisterValue {
+    pub fn parse(mut input: &str, reg_info: &RegisterInfo) -> Result<Self> {
+        // This function should parse a string input and return a RegisterValue.
+        // The input can be a number, a hex string, or a floating point number.
+        match reg_info.reg_format {
+            RegisterFormat::UnsignedInt => {
+                if input.starts_with("0x") || input.starts_with("0X") {
+                    match reg_info.size {
+                        1 => {
+                            // Treat as unsigned 8-bit integer
+                            return Ok(RegisterValue::U8(
+                                u8::from_str_radix(&input[2..], 16)
+                                    .context("Failed to parse hex string")?,
+                            ));
+                        }
+                        2 => {
+                            // Treat as unsigned 16-bit integer
+                            return Ok(RegisterValue::U16(
+                                u16::from_str_radix(&input[2..], 16)
+                                    .context("Failed to parse hex string")?,
+                            ));
+                        }
+                        4 => {
+                            // Treat as unsigned 32-bit integer
+                            return Ok(RegisterValue::U32(
+                                u32::from_str_radix(&input[2..], 16)
+                                    .context("Failed to parse hex string")?,
+                            ));
+                        }
+                        8 => {
+                            // Treat as unsigned 64-bit integer
+                            return Ok(RegisterValue::U64(
+                                u64::from_str_radix(&input[2..], 16)
+                                    .context("Failed to parse hex string")?,
+                            ));
+                        }
+                        _ => anyhow::bail!(
+                            "Unsupported size for unsigned integer: {}",
+                            reg_info.size
+                        ),
+                    }
+                } else if input.starts_with("-0x") || input.starts_with("-0X") {
+                    // Treat as signed integer
+                    let unsigned_value = u64::from_str_radix(&input[3..], 16)
+                        .context("Failed to parse hex string")?;
+                    if unsigned_value > i64::MAX as u64 {
+                        anyhow::bail!("Value out of range for signed integer");
+                    }
+                    let signed_value = -(unsigned_value as i64);
+                    match reg_info.size {
+                        1 => {
+                            // Treat as signed 8-bit integer
+                            return Ok(RegisterValue::I8(signed_value as i8));
+                        }
+                        2 => {
+                            // Treat as signed 16-bit integer
+                            return Ok(RegisterValue::I16(signed_value as i16));
+                        }
+                        4 => {
+                            // Treat as signed 32-bit integer
+                            return Ok(RegisterValue::I32(signed_value as i32));
+                        }
+                        8 => {
+                            // Treat as signed 64-bit integer
+                            return Ok(RegisterValue::I64(signed_value));
+                        }
+                        _ => {
+                            anyhow::bail!("Unsupported size for signed integer: {}", reg_info.size)
+                        }
+                    }
+                } else {
+                    // Treat as decimal integer
+                    if input.starts_with('-') {
+                        // Signed integer
+                        let signed_value: i64 = input
+                            .parse()
+                            .context("Failed to parse signed integer string")?;
+                        match reg_info.size {
+                            1 => return Ok(RegisterValue::I8(signed_value as i8)),
+                            2 => return Ok(RegisterValue::I16(signed_value as i16)),
+                            4 => return Ok(RegisterValue::I32(signed_value as i32)),
+                            8 => return Ok(RegisterValue::I64(signed_value)),
+                            _ => anyhow::bail!(
+                                "Unsupported size for signed integer: {}",
+                                reg_info.size
+                            ),
+                        }
+                    } else {
+                        // Unsigned integer
+                        let unsigned_value: u64 = input
+                            .parse()
+                            .context("Failed to parse unsigned integer string")?;
+                        match reg_info.size {
+                            1 => return Ok(RegisterValue::U8(unsigned_value as u8)),
+                            2 => return Ok(RegisterValue::U16(unsigned_value as u16)),
+                            4 => return Ok(RegisterValue::U32(unsigned_value as u32)),
+                            8 => return Ok(RegisterValue::U64(unsigned_value)),
+                            _ => anyhow::bail!(
+                                "Unsupported size for unsigned integer: {}",
+                                reg_info.size
+                            ),
+                        }
+                    }
+                }
+            }
+            RegisterFormat::DoubleFloat => {
+                // Floating point numbers
+                match reg_info.size {
+                    4 => {
+                        // Treat as 32-bit float
+                        return Ok(RegisterValue::F32(
+                            input
+                                .parse::<f32>()
+                                .context("Failed to parse float string")?,
+                        ));
+                    }
+                    8 => {
+                        // Treat as 64-bit double
+                        return Ok(RegisterValue::F64(
+                            input
+                                .parse::<f64>()
+                                .context("Failed to parse double string")?,
+                        ));
+                    }
+                    _ => anyhow::bail!(
+                        "Unsupported size for floating point number: {}",
+                        reg_info.size
+                    ),
+                }
+            }
+            RegisterFormat::LongDouble => {
+                // Long double numbers
+                let fp64_value = input
+                    .parse::<f64>()
+                    .context("Failed to parse long double string")?;
+                let extended_value = Extended::from(fp64_value);
+                return Ok(RegisterValue::LongDouble({
+                    let mut bytes = [0u8; 16];
+                    bytes[0..10].copy_from_slice(&extended_value.to_le_bytes());
+                    bytes
+                }));
+            }
+            RegisterFormat::Vector => {
+                if !input.starts_with("0x") && !input.starts_with("0X") {
+                    anyhow::bail!("Vector registers must be specified in hex format");
+                }
+                // Vector registers (byte arrays)
+                input = &input[2..]; // Remove "0x" prefix
+                match reg_info.size {
+                    8 => {
+                        // Treat as 64-bit vector
+                        let mut bytes = [0u8; 8];
+                        if input.len() != 16 {
+                            anyhow::bail!("Invalid length for 64-bit vector: {}", input.len());
+                        }
+                        for (i, byte) in input.as_bytes().chunks(2).enumerate() {
+                            bytes[i] = u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16)
+                                .context("Failed to parse hex string")?;
+                        }
+                        return Ok(RegisterValue::Byte64(bytes));
+                    }
+                    16 => {
+                        // Treat as 128-bit vector
+                        let mut bytes = [0u8; 16];
+                        if input.len() != 32 {
+                            anyhow::bail!("Invalid length for 128-bit vector: {}", input.len());
+                        }
+                        for (i, byte) in input.as_bytes().chunks(2).enumerate() {
+                            bytes[i] = u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16)
+                                .context("Failed to parse hex string")?;
+                        }
+                        return Ok(RegisterValue::Byte128(bytes));
+                    }
+                    _ => anyhow::bail!("Unsupported size for vector register: {}", reg_info.size),
+                }
+            }
+        }
+    }
+
+    pub fn get_payload_size_in_bytes(&self) -> usize {
+        match self {
+            RegisterValue::U8(_) | RegisterValue::I8(_) => 1,
+            RegisterValue::U16(_) | RegisterValue::I16(_) => 2,
+            RegisterValue::U32(_) | RegisterValue::I32(_) => 4,
+            RegisterValue::U64(_) | RegisterValue::I64(_) => 8,
+            RegisterValue::F32(_) => 4,
+            RegisterValue::F64(_) => 8,
+            RegisterValue::LongDouble(_) => 16,
+            RegisterValue::Byte64(_) => 8,
+            RegisterValue::Byte128(_) => 16,
+        }
+    }
+    /// Turn any `RegisterValue` into a fixed 128-bit (16-byte) little-endian blob.
+    pub fn widen_to_fixed_buffer(&self, info: &RegisterInfo) -> [u8; 16] {
+        use RegisterFormat::*;
+        // Note: All the to_le_bytes are because this is a little-endian architecture.
+        match (self, info.reg_format, info.size) {
+            // ────────────── floating-point widening ──────────────
+            (RegisterValue::F32(v), DoubleFloat, ..) => widen!(*v as f64),
+            (RegisterValue::F32(v), LongDouble, ..) => pad_16(&Extended::from(*v).to_le_bytes()),
+            (RegisterValue::F64(v), LongDouble, ..) => pad_16(&Extended::from(*v).to_le_bytes()),
+
+            // ────────────── integer widening ──────────────
+            (RegisterValue::I8(v), UnsignedInt, 2) => widen!(*v as i16),
+            (RegisterValue::I8(v), UnsignedInt, 4) => widen!(*v as i32),
+            (RegisterValue::I8(v), UnsignedInt, 8) => widen!(*v as i64),
+            (RegisterValue::I16(v), UnsignedInt, 4) => widen!(*v as i32),
+            (RegisterValue::I16(v), UnsignedInt, 8) => widen!(*v as i64),
+            (RegisterValue::I32(v), UnsignedInt, 8) => widen!(*v as i64),
+
+            // ────────────── everything else ──────────────
+            (RegisterValue::LongDouble(bytes), ..) => bytes.clone(),
+            (RegisterValue::Byte64(bytes), ..) => pad_16(bytes),
+            (RegisterValue::Byte128(bytes), ..) => pad_16(bytes),
+
+            // Numeric values that *don’t* need special widening
+            (RegisterValue::U8(v), ..) => widen!(v),
+            (RegisterValue::U16(v), ..) => widen!(v),
+            (RegisterValue::U32(v), ..) => widen!(v),
+            (RegisterValue::U64(v), ..) => widen!(v),
+            (RegisterValue::I8(v), ..) => widen!(v),
+            (RegisterValue::I16(v), ..) => widen!(v),
+            (RegisterValue::I32(v), ..) => widen!(v),
+            (RegisterValue::I64(v), ..) => widen!(v),
+            (RegisterValue::F32(v), ..) => widen!(v),
+            (RegisterValue::F64(v), ..) => widen!(v),
+        }
+    }
+}
+
+impl Display for RegisterValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RegisterValue::U8(v) => write!(f, "{}", v),
+            RegisterValue::U16(v) => write!(f, "{}", v),
+            RegisterValue::U32(v) => write!(f, "{}", v),
+            RegisterValue::U64(v) => write!(f, "0x{:x}", v),
+            RegisterValue::I8(v) => write!(f, "{}", v),
+            RegisterValue::I16(v) => write!(f, "{}", v),
+            RegisterValue::I32(v) => write!(f, "{}", v),
+            RegisterValue::I64(v) => write!(f, "{}", v),
+            RegisterValue::F32(v) => write!(f, "{}", v),
+            RegisterValue::F64(v) => write!(f, "{}", v),
+            RegisterValue::LongDouble(bytes) => {
+                let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                write!(f, "0x{}", hex_string)
+            }
+            RegisterValue::Byte64(bytes) => {
+                let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                write!(f, "[{}]", hex_string)
+            }
+            RegisterValue::Byte128(bytes) => {
+                let hex_string: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
+                write!(f, "[{}]", hex_string)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::mem::{offset_of, zeroed};
@@ -577,4 +871,80 @@ mod tests {
 
     // Test the dr_offset macro for the x86_64 architecture.
     const _: () = assert!(dr_offset!(0) == offset_of!(libc::user, u_debugreg));
+
+    #[test]
+    fn test_register_value_parsing() {
+        {
+            let register_info =
+                get_register_info(RegisterId::r13).expect("Failed to get register info for r13");
+            let value = RegisterValue::parse("0xdeadbeef", &register_info)
+                .expect("Failed to parse register value");
+            assert!(matches!(value, RegisterValue::U64(0xdeadbeef)));
+        }
+        {
+            let register_info =
+                get_register_info(RegisterId::r13).expect("Failed to get register info for r13");
+            let value = RegisterValue::parse("-0xdeadbeef", &register_info)
+                .expect("Failed to parse register value");
+            assert!(matches!(value, RegisterValue::I64(-0xdeadbeef)));
+        }
+        {
+            let register_info =
+                get_register_info(RegisterId::r13).expect("Failed to get register info for r13");
+            let value = RegisterValue::parse("-0xdeadbeef", &register_info)
+                .expect("Failed to parse register value");
+            assert!(matches!(value, RegisterValue::I64(-0xdeadbeef)));
+        }
+        {
+            let register_info =
+                get_register_info(RegisterId::r13).expect("Failed to get register info for r13");
+            assert!(RegisterValue::parse("-9223372036854775809", &register_info).is_err());
+        }
+        {
+            let register_info =
+                get_register_info(RegisterId::r13b).expect("Failed to get register info for r13b");
+            let value = RegisterValue::parse("255", &register_info)
+                .expect("Failed to parse register value");
+            assert!(matches!(value, RegisterValue::U8(255)));
+        }
+        {
+            let register_info =
+                get_register_info(RegisterId::st(0)).expect("Failed to get register info for st0");
+            const CONSTANT: f64 = 0.5f64;
+            let value = RegisterValue::parse(CONSTANT.to_string().as_str(), &register_info)
+                .expect("Failed to parse register value");
+            let _expected_bytes: [u8; 16] = {
+                let mut bytes = [0u8; 16];
+                bytes[0..10].copy_from_slice(&Extended::from(CONSTANT).to_le_bytes());
+                bytes
+            };
+            assert!(matches!(value, RegisterValue::LongDouble(_expected_bytes)));
+        }
+        {
+            let register_info =
+                get_register_info(RegisterId::mm(0)).expect("Failed to get register info for mm0");
+            let value = RegisterValue::parse("0xffffffffffffff00", &register_info)
+                .expect("Failed to parse register value");
+            let _expected_bytes: [u8; 8] = 0xffffff00u64.to_le_bytes();
+            assert!(matches!(value, RegisterValue::Byte64(_expected_bytes)));
+        }
+        {
+            let register_info = get_register_info(RegisterId::xmm(0))
+                .expect("Failed to get register info for xmm0");
+            let value = RegisterValue::parse(
+                format!("0x{}", "ab".repeat(16).as_str()).as_str(),
+                &register_info,
+            )
+            .expect("Failed to parse register value");
+            let _expected_bytes: [u8; 16] = {
+                let mut bytes = [0u8; 16];
+                for (i, byte) in "ab".repeat(16).as_bytes().chunks(2).enumerate() {
+                    bytes[i] = u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16)
+                        .expect("Failed to parse byte");
+                }
+                bytes
+            };
+            assert!(matches!(value, RegisterValue::Byte128(_expected_bytes)));
+        }
+    }
 }
