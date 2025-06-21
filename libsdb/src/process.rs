@@ -548,6 +548,7 @@ mod tests {
         );
 
         let mut attached_handle = Process::attach(target_process.pid).expect("Failed to attach");
+        std::thread::sleep(std::time::Duration::from_millis(500));
         assert_eq!(attached_handle.pid, target_process.pid);
         assert_eq!(
             get_process_state(attached_handle.pid).unwrap(),
