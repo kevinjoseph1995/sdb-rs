@@ -101,6 +101,9 @@ impl Application {
             CommandCategory::Register(cmd) => {
                 cmd.handle_command(command.metadata, command.args, &mut self.inferior_process)
             }
+            CommandCategory::Breakpoint(cmd) => {
+                cmd.handle_command(&command.metadata, command.args, &mut self.inferior_process)
+            }
         }
     }
 

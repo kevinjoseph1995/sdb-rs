@@ -220,6 +220,10 @@ impl<T: StopPoint> StopPointCollection<T> {
     pub fn is_empty(&self) -> bool {
         self.stop_points.is_empty()
     }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, T> {
+        self.stop_points.iter()
+    }
 }
 
 #[cfg(test)]

@@ -1,6 +1,8 @@
+pub mod breakpoint_command;
 pub mod register_command;
 
 use anyhow::{Ok, Result};
+use breakpoint_command::BreakpointCommandCategory;
 use register_command::RegisterCommandCategory;
 
 #[derive(Debug, Clone)]
@@ -31,9 +33,11 @@ pub enum CommandCategory {
     Continue,
     Register(RegisterCommandCategory),
     DumpChildOutput,
+    Breakpoint(BreakpointCommandCategory),
     Help,
 }
 
+use BreakpointCommandCategory::*;
 use CommandCategory::*;
 use RegisterCommandCategory::*;
 
@@ -65,6 +69,37 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         "Dump child process output",
         [],
         Some(DumpChildOutput)
+    ),
+    cmd!(
+        ["b", "breakpoint"],
+        "Breakpoint operations",
+        [
+            cmd!(
+                ["l", "list"],
+                "List all breakpoints. Usage: 'breakpoint list'",
+                [],
+                Some(Breakpoint(List))
+            ),
+            cmd!(
+                ["i", "info"],
+                "Get information about a specific breakpoint. Usage: 'breakpoint info <breakpoint_id>'",
+                [],
+                Some(Breakpoint(Info))
+            ),
+            cmd!(
+                ["s", "set"],
+                "Set a new breakpoint. Usage: 'breakpoint set <address>'",
+                [],
+                Some(Breakpoint(Set))
+            ),
+            cmd!(
+                ["rm", "remove"],
+                "Remove a breakpoint. Usage: 'breakpoint remove <breakpoint_id>'",
+                [],
+                Some(Breakpoint(Remove))
+            ),
+        ],
+        None
     ),
 ];
 

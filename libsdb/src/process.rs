@@ -171,7 +171,7 @@ pub struct Process {
     read_port: Option<pipe_channel::ReadPort>,
     is_attached: bool,
     registers: Registers,
-    breakpoint_sites: StopPointCollection<BreakpointSite>,
+    pub breakpoint_sites: StopPointCollection<BreakpointSite>,
 }
 
 impl Process {
@@ -587,6 +587,8 @@ mod tests {
         );
     }
 
+    // Re-enable this test when artifact dependencies are made stable
+    #[cfg(feature = "reg_write")]
     #[test]
     fn test_register_write() {
         let (read_port, write_port) =
@@ -712,6 +714,8 @@ mod tests {
         );
     }
 
+    // Re-enable this test when artifact dependencies are made stable
+    #[cfg(feature = "reg_read")]
     #[test]
     fn test_register_read() {
         let (_read_port, write_port) =
