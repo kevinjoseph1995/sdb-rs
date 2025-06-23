@@ -16,6 +16,9 @@ use nix::unistd::dup2_stdout;
 use nix::unistd::execvp;
 use nix::unistd::fork;
 /////////////////////////////////////////
+use crate::breakpoint::BreakpointSite;
+use crate::breakpoint::StopPointCollection;
+use crate::breakpoint::VirtAddress;
 use crate::pipe_channel;
 use crate::register_info;
 use crate::register_info::RegisterFormat;
@@ -168,6 +171,7 @@ pub struct Process {
     read_port: Option<pipe_channel::ReadPort>,
     is_attached: bool,
     registers: Registers,
+    breakpoint_sites: StopPointCollection<BreakpointSite>,
 }
 
 impl Process {
@@ -181,6 +185,7 @@ impl Process {
             read_port: None,
             is_attached: true,
             registers: Registers::new(),
+            breakpoint_sites: StopPointCollection::<BreakpointSite>::new(),
         };
         let _stop_reason = child_process_handle.wait_on_signal(None)?;
         Ok(child_process_handle)
@@ -206,6 +211,7 @@ impl Process {
                     read_port: None,
                     is_attached: debug_process_being_launched,
                     registers: Registers::new(),
+                    breakpoint_sites: StopPointCollection::<BreakpointSite>::new(),
                 };
                 if debug_process_being_launched {
                     match child_process_handle.wait_on_signal(None)? {
@@ -394,6 +400,21 @@ impl Process {
         nix::sys::ptrace::setregs(self.pid, gprs.clone())
             .expect("Failed to write general purpose registers");
     }
+
+    pub fn create_breakpoint_site<'a>(
+        &'a mut self,
+        address: VirtAddress,
+    ) -> Result<&'a BreakpointSite> {
+        if self.breakpoint_sites.contains_address(address) {
+            return Err(anyhow!(
+                "Breakpoint site already exists at address: {}",
+                address
+            ));
+        }
+        self.breakpoint_sites
+            .push_and_return_ref(BreakpointSite::new(address))
+            .ok_or_else(|| anyhow!("Failed to create breakpoint site at address: {}", address))
+    }
 }
 
 impl Drop for Process {
@@ -467,7 +488,10 @@ pub fn get_process_state(pid: Pid) -> Result<ProcessState> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pipe_channel::{ChannelPort, create_pipe_channel};
+    use crate::{
+        breakpoint::StopPoint,
+        pipe_channel::{ChannelPort, create_pipe_channel},
+    };
 
     use super::*;
     use extended::Extended;
@@ -548,7 +572,7 @@ mod tests {
         );
 
         let mut attached_handle = Process::attach(target_process.pid).expect("Failed to attach");
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::sleep(std::time::Duration::from_millis(100));
         assert_eq!(attached_handle.pid, target_process.pid);
         assert_eq!(
             get_process_state(attached_handle.pid).unwrap(),
@@ -787,5 +811,37 @@ mod tests {
             value,
             RegisterValue::LongDouble(_expected_bytes_widened)
         ));
+    }
+
+    #[test]
+    fn test_create_breakpoint_site() {
+        let mut target_process = Process::launch(&PathBuf::from("yes"), None, true, None)
+            .expect("Process failed to launch");
+        {
+            assert_eq!(
+                target_process
+                    .create_breakpoint_site(VirtAddress::new(0x1000))
+                    .expect("Failed to create breakpoint site at 0x1000")
+                    .get_virtual_address(),
+                VirtAddress::new(0x1000)
+            );
+        }
+        assert_eq!(
+            target_process
+                .create_breakpoint_site(VirtAddress::new(0x2000))
+                .expect("Failed to create breakpoint site at 0x2000")
+                .get_id()
+                + 1,
+            target_process
+                .create_breakpoint_site(VirtAddress::new(0x3000))
+                .expect("Failed to create breakpoint site at 0x3000")
+                .get_id()
+        );
+        assert!(
+            target_process
+                .create_breakpoint_site(VirtAddress::new(0x1000))
+                .is_err(), // Should fail because breakpoint already exists at 0x1000
+            "Expected to fail creating breakpoint site at 0x1000 again"
+        );
     }
 }
