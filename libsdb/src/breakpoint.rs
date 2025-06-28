@@ -1,6 +1,7 @@
 use crate::process::Process;
 use anyhow::{Context, Result};
 use libc::c_long;
+use nix::unistd::Pid;
 use std::fmt::Display;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,6 +27,18 @@ impl Display for VirtAddress {
     }
 }
 
+impl From<usize> for VirtAddress {
+    fn from(address: usize) -> Self {
+        VirtAddress::new(address)
+    }
+}
+
+impl Into<usize> for VirtAddress {
+    fn into(self) -> usize {
+        self.address
+    }
+}
+
 pub type StopPointId = i32;
 
 pub struct BreakpointSite {
@@ -33,6 +46,7 @@ pub struct BreakpointSite {
     is_enabled: bool,
     virtual_address: VirtAddress,
     saved_data: Option<u8>,
+    pid: Pid,
 }
 
 impl BreakpointSite {
@@ -44,12 +58,13 @@ impl BreakpointSite {
         next_id
     }
 
-    pub fn new(virtual_address: VirtAddress) -> Self {
+    pub fn new(virtual_address: VirtAddress, pid: Pid) -> Self {
         BreakpointSite {
             id: BreakpointSite::get_next_id(),
             is_enabled: false,
             virtual_address,
             saved_data: None,
+            pid,
         }
     }
 }
@@ -57,9 +72,9 @@ impl BreakpointSite {
 pub trait StopPoint {
     fn get_id(&self) -> StopPointId;
 
-    fn enable(&mut self, process_handle: &Process) -> Result<()>;
+    fn enable(&mut self) -> Result<()>;
 
-    fn disable(&mut self, process_handle: &Process) -> Result<()>;
+    fn disable(&mut self) -> Result<()>;
 
     fn is_enabled(&self) -> bool;
 
@@ -71,20 +86,19 @@ pub trait StopPoint {
 }
 
 impl StopPoint for BreakpointSite {
-    fn enable(&mut self, process_handle: &Process) -> Result<()> {
+    fn enable(&mut self) -> Result<()> {
         if self.is_enabled {
             return Ok(());
         }
         // Read a word from the process memory at the breakpoint address
-        let data =
-            nix::sys::ptrace::read(process_handle.pid, self.virtual_address.address as *mut _)
-                .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
+        let data = nix::sys::ptrace::read(self.pid, self.virtual_address.address as *mut _)
+            .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
         self.saved_data = Some((data as u64 & 0xFFu64) as u8);
         const INT3: u8 = 0xCC; // Breakpoint instruction
         let data_with_int3: u64 = (data as u64 & !0xFFu64) | INT3 as u64;
         // Write the breakpoint instruction to the process memory
         nix::sys::ptrace::write(
-            process_handle.pid,
+            self.pid,
             self.virtual_address.address as *mut _,
             data_with_int3 as c_long,
         )
@@ -93,18 +107,17 @@ impl StopPoint for BreakpointSite {
         Ok(())
     }
 
-    fn disable(&mut self, process_handle: &Process) -> Result<()> {
+    fn disable(&mut self) -> Result<()> {
         if !self.is_enabled {
             return Ok(());
         }
-        let data =
-            nix::sys::ptrace::read(process_handle.pid, self.virtual_address.address as *mut _)
-                .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
+        let data = nix::sys::ptrace::read(self.pid, self.virtual_address.address as *mut _)
+            .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
         let restored_word = (data as u64 & !0xFFu64)
             | self.saved_data.expect("saved_data should be present") as u64;
         // Write the original instruction back to the process memory
         nix::sys::ptrace::write(
-            process_handle.pid,
+            self.pid,
             self.virtual_address.address as *mut _,
             restored_word as c_long,
         )
@@ -193,23 +206,31 @@ impl<T: StopPoint> StopPointCollection<T> {
             .find(|sp| sp.is_at_address(address))
     }
 
-    pub fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Option<T> {
+    pub fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Result<()> {
         if let Some(pos) = self.stop_points.iter().position(|sp| sp.get_id() == id) {
-            Some(self.stop_points.remove(pos))
+            let _ = self.stop_points.remove(pos);
+            Ok(())
         } else {
-            None
+            Err(anyhow::Error::msg(format!(
+                "Stop point with ID {} not found",
+                id
+            )))
         }
     }
 
-    pub fn remove_stop_point_by_address(&mut self, address: VirtAddress) -> Option<T> {
+    pub fn remove_stop_point_by_address(&mut self, address: VirtAddress) -> Result<()> {
         if let Some(pos) = self
             .stop_points
             .iter()
             .position(|sp| sp.is_at_address(address))
         {
-            Some(self.stop_points.remove(pos))
+            let _ = self.stop_points.remove(pos);
+            Ok(())
         } else {
-            None
+            Err(anyhow::Error::msg(format!(
+                "Stop point with address {} not found",
+                address
+            )))
         }
     }
 

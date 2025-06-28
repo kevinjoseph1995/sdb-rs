@@ -98,6 +98,18 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 [],
                 Some(Breakpoint(Remove))
             ),
+            cmd!(
+                ["e", "enable"],
+                "Enable a breakpoint. Usage: 'breakpoint enable <breakpoint_id>'",
+                [],
+                Some(Breakpoint(Enable))
+            ),
+            cmd!(
+                ["d", "disable"],
+                "Disable a breakpoint. Usage: 'breakpoint disable <breakpoint_id>'",
+                [],
+                Some(Breakpoint(Disable))
+            ),
         ],
         None
     ),

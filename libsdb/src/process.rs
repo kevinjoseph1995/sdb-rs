@@ -404,7 +404,7 @@ impl Process {
     pub fn create_breakpoint_site<'a>(
         &'a mut self,
         address: VirtAddress,
-    ) -> Result<&'a BreakpointSite> {
+    ) -> Result<&'a mut BreakpointSite> {
         if self.breakpoint_sites.contains_address(address) {
             return Err(anyhow!(
                 "Breakpoint site already exists at address: {}",
@@ -412,7 +412,7 @@ impl Process {
             ));
         }
         self.breakpoint_sites
-            .push_and_return_ref(BreakpointSite::new(address))
+            .push_and_return_mut_ref(BreakpointSite::new(address, self.pid))
             .ok_or_else(|| anyhow!("Failed to create breakpoint site at address: {}", address))
     }
 }

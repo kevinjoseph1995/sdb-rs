@@ -10,6 +10,8 @@ pub enum BreakpointCommandCategory {
     List,
     Info,
     Set,
+    Enable,
+    Disable,
     Remove,
 }
 
@@ -67,11 +69,91 @@ impl BreakpointCommandCategory {
                 Ok(())
             }
             BreakpointCommandCategory::Set => {
-                println!("TODO: SET A BREAKPOINT");
+                if args.is_empty() {
+                    return Err(anyhow::Error::msg(format!(
+                        "No address provided for breakpoint. {}",
+                        metadata.description
+                    )));
+                }
+                if !(args[0].starts_with("0x") || args[0].starts_with("0X")) {
+                    return Err(anyhow::Error::msg(format!(
+                        "Invalid address format: {}. Hex-address should start with 0x/0X.",
+                        args[0]
+                    )));
+                }
+                let address_str = &args[0][2..];
+                let address = usize::from_str_radix(address_str, 16).map_err(|err| {
+                    anyhow::Error::msg(format!(
+                        "{}: Invalid address format: {}. Hex-address should be a valid hex number.",
+                        err, args[0]
+                    ))
+                })?;
+                let breakpoint =
+                    process.create_breakpoint_site(breakpoint::VirtAddress::from(address))?;
+                breakpoint.enable()?;
+                println!(
+                    "Breakpoint set at address: {}, ID: {}",
+                    breakpoint.get_virtual_address(),
+                    breakpoint.get_id()
+                );
                 Ok(())
             }
             BreakpointCommandCategory::Remove => {
-                println!("TODO: REMOVE A BREAKPOINT");
+                if args.is_empty() {
+                    return Err(anyhow::Error::msg(format!(
+                        "Please specify a breakpoint ID. {}",
+                        metadata.description
+                    )));
+                }
+                let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
+                if !process.breakpoint_sites.contains_id(breakpoint_id) {
+                    return Err(anyhow::Error::msg(format!(
+                        "Breakpoint with ID {} not found.",
+                        breakpoint_id
+                    )));
+                }
+                process
+                    .breakpoint_sites
+                    .remove_stop_point_by_id(breakpoint_id)?;
+                println!("Breakpoint removed: ID {}", breakpoint_id);
+                Ok(())
+            }
+            BreakpointCommandCategory::Enable => {
+                if args.is_empty() {
+                    return Err(anyhow::Error::msg(format!(
+                        "Please specify a breakpoint ID to enable. {}",
+                        metadata.description
+                    )));
+                }
+                let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
+                let breakpoint = process
+                    .breakpoint_sites
+                    .get_stop_point_by_id_mut(breakpoint_id)
+                    .ok_or(anyhow::Error::msg(format!(
+                        "Breakpoint with ID {} not found.",
+                        breakpoint_id
+                    )))?;
+                breakpoint.enable()?;
+                println!("Breakpoint enabled: ID {}", breakpoint_id);
+                Ok(())
+            }
+            BreakpointCommandCategory::Disable => {
+                if args.is_empty() {
+                    return Err(anyhow::Error::msg(format!(
+                        "Please specify a breakpoint ID to disable. {}",
+                        metadata.description
+                    )));
+                }
+                let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
+                let breakpoint = process
+                    .breakpoint_sites
+                    .get_stop_point_by_id_mut(breakpoint_id)
+                    .ok_or(anyhow::Error::msg(format!(
+                        "Breakpoint with ID {} not found.",
+                        breakpoint_id
+                    )))?;
+                breakpoint.disable()?;
+                println!("Breakpoint disabled: ID {}", breakpoint_id);
                 Ok(())
             }
         }
