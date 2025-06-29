@@ -1,4 +1,4 @@
 [workspace]
 resolver = "2"
-members = ["libsdb", "sdb-rs", "tools/test_program", "tools/reg_write", "tools/reg_read"]
+members = ["libsdb", "sdb-rs", "tools/reg_write", "tools/reg_read"]
 default-members = ["sdb-rs"]
