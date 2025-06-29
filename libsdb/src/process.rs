@@ -488,6 +488,7 @@ pub fn get_process_state(pid: Pid) -> Result<ProcessState> {
 
 #[cfg(test)]
 mod tests {
+
     use crate::{
         breakpoint::StopPoint,
         pipe_channel::{ChannelPort, create_pipe_channel},
@@ -495,6 +496,7 @@ mod tests {
 
     use super::*;
     use extended::Extended;
+    use test_binary::build_test_binary;
 
     #[test]
     fn test_process_launching() {
@@ -588,13 +590,15 @@ mod tests {
     }
 
     // Re-enable this test when artifact dependencies are made stable
-    #[cfg(feature = "reg_write")]
     #[test]
     fn test_register_write() {
         let (read_port, write_port) =
             create_pipe_channel(true).expect("Failed to create pipe channel");
         let mut target_process = Process::launch(
-            &PathBuf::from(env!("CARGO_BIN_FILE_REG_WRITE")),
+            &PathBuf::from(
+                build_test_binary("reg_write", &PathBuf::from_iter(["..", "tools"]))
+                    .expect("Failed to build test binary"),
+            ),
             None,
             true,
             Some(write_port.into_internal_fd()),
@@ -715,13 +719,15 @@ mod tests {
     }
 
     // Re-enable this test when artifact dependencies are made stable
-    #[cfg(feature = "reg_read")]
     #[test]
     fn test_register_read() {
         let (_read_port, write_port) =
             create_pipe_channel(true).expect("Failed to create pipe channel");
         let mut target_process = Process::launch(
-            &PathBuf::from(env!("CARGO_BIN_FILE_REG_READ")),
+            &PathBuf::from(
+                build_test_binary("reg_read", &PathBuf::from_iter(["..", "tools"]))
+                    .expect("Failed to build test binary"),
+            ),
             None,
             true,
             Some(write_port.into_internal_fd()),
