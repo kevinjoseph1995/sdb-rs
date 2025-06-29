@@ -1,5 +1,6 @@
 use anyhow::Result;
 use libsdb::process::Process;
+use nix::sys::wait::WaitStatus;
 use rustyline::{
     Config, Context, Helper, completion::Completer, highlight::Highlighter, hint::Hinter,
     history::DefaultHistory, validate::Validator,
@@ -70,16 +71,25 @@ impl Application {
         Ok(())
     }
 
-    fn handle_stop_reason(&self, stop_reason: libsdb::process::StopReason) -> Result<()> {
-        match stop_reason {
-            libsdb::process::StopReason::Exited(exit_status) => {
+    fn handle_stop_reason(&self, waitstatus: WaitStatus) -> Result<()> {
+        match waitstatus {
+            WaitStatus::Exited(_, exit_status) => {
                 println!("Process exited with status: {}", exit_status);
             }
-            libsdb::process::StopReason::Stopped(signal) => {
+            WaitStatus::Stopped(_, signal) => {
                 println!("Process stopped by signal: {}", signal);
             }
-            libsdb::process::StopReason::Terminated(signal) => {
+            WaitStatus::Signaled(_, signal, _) => {
                 println!("Process terminated by signal: {}", signal);
+            }
+            WaitStatus::Continued(_pid) => {
+                println!("Process continued.");
+            }
+            WaitStatus::StillAlive => {
+                println!("Process is still alive.");
+            }
+            _ => {
+                println!("Unhandled wait status: {:?}", waitstatus);
             }
         }
         Ok(())

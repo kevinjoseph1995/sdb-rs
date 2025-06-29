@@ -9,7 +9,6 @@ use nix::errno::Errno;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
 use nix::sys::signal::Signal;
-use nix::sys::signal::Signal::SIGCONT;
 use nix::sys::signal::kill;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
@@ -37,33 +36,6 @@ enum ProcessHandleState {
     Stopped,
     Exited,
     Terminated,
-}
-#[derive(PartialEq, Debug)]
-pub enum StopReason {
-    Exited(i32 /*Exit stautus */),
-    Stopped(Signal),
-    Terminated(Signal),
-}
-
-impl std::fmt::Display for StopReason {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            StopReason::Exited(status) => write!(f, "Exited with status: {}", status),
-            StopReason::Stopped(signal) => write!(f, "Stopped by signal: {:?}", signal),
-            StopReason::Terminated(signal) => write!(f, "Terminated by signal: {:?}", signal),
-        }
-    }
-}
-
-impl From<WaitStatus> for StopReason {
-    fn from(value: WaitStatus) -> Self {
-        match value {
-            WaitStatus::Stopped(_, signal) => StopReason::Stopped(signal),
-            WaitStatus::Exited(_, exit_status) => StopReason::Exited(exit_status),
-            WaitStatus::Signaled(_, signal, _) => StopReason::Terminated(signal),
-            _ => panic!("Unexpected wait status: {:?}", value),
-        }
-    }
 }
 
 #[derive(PartialEq, Debug)]
@@ -219,7 +191,7 @@ impl Process {
                 println!("Launching process with PID: {}", child_process_handle.pid);
                 if debug_process_being_launched {
                     match child_process_handle.wait_on_signal(None)? {
-                        StopReason::Exited(exit_code) => {
+                        WaitStatus::Exited(_, exit_code) => {
                             let mut error_message =
                                 format!("Child process exited with exit code: {} . ", exit_code);
                             if let Ok(message) = read_port.read() {
@@ -230,7 +202,7 @@ impl Process {
                             child_process_handle.state = ProcessHandleState::Exited;
                             return Err(anyhow!("{}", error_message));
                         }
-                        StopReason::Terminated(signal) => {
+                        WaitStatus::Signaled(_, signal, _) => {
                             let mut error_message: String =
                                 format!("Child process terminated by signal: {} . ", signal);
                             if let Ok(message) = read_port.read() {
@@ -241,7 +213,13 @@ impl Process {
                             child_process_handle.state = ProcessHandleState::Terminated;
                             return Err(anyhow!("{}", error_message));
                         }
-                        StopReason::Stopped(_signal) => {}
+                        WaitStatus::Stopped(_, _) => {
+                            child_process_handle.state = ProcessHandleState::Stopped;
+                        }
+                        WaitStatus::Continued(_) => {
+                            child_process_handle.state = ProcessHandleState::Running;
+                        }
+                        _ => {}
                     }
                 }
                 child_process_handle.read_port = Some(read_port);
@@ -275,24 +253,34 @@ impl Process {
     }
 
     /// Waits for the process to stop or exit. This function blocks until the process undergoes a state change.
-    pub fn wait_on_signal(&mut self, options: Option<WaitPidFlag>) -> Result<StopReason> {
-        let stop_reason =
-            StopReason::from(waitpid(self.pid, options).context("Failed to wait for process")?);
-        match &stop_reason {
-            StopReason::Exited(_) => self.state = ProcessHandleState::Exited,
-            StopReason::Stopped(_) => self.state = ProcessHandleState::Stopped,
-            StopReason::Terminated(_) => self.state = ProcessHandleState::Terminated,
+    pub fn wait_on_signal(&mut self, options: Option<WaitPidFlag>) -> Result<WaitStatus> {
+        let waitstatus: WaitStatus =
+            waitpid(self.pid, options).context("Failed to wait for process")?;
+        match &waitstatus {
+            WaitStatus::Exited(_, _) => {
+                self.state = ProcessHandleState::Exited;
+            }
+            WaitStatus::Signaled(_pid, _signal, _) => {
+                self.state = ProcessHandleState::Terminated;
+            }
+            WaitStatus::Stopped(_pid, _signal) => {
+                self.state = ProcessHandleState::Stopped;
+            }
+            WaitStatus::Continued(_) => {
+                self.state = ProcessHandleState::Running;
+            }
+            _ => {}
         }
         if self.is_attached && self.state == ProcessHandleState::Stopped {
             self.read_all_registers()
                 .context("Failed to read registers after waiting for process")?;
         }
-        Ok(stop_reason)
+        Ok(waitstatus)
     }
 
     /// Resumes the execution of the process being debugged.
     pub fn resume_process(&mut self) -> Result<()> {
-        if let Err(e) = nix::sys::ptrace::cont(self.pid, SIGCONT) {
+        if let Err(e) = nix::sys::ptrace::cont(self.pid, None) {
             eprintln!("Failed to resume process: {}", e);
             return Err(e.into());
         }
@@ -452,6 +440,19 @@ fn setup_child_process(
     args: Option<String>,
     attach_for_debugging: bool,
 ) -> Result<()> {
+    // Change the process group of the inferior process to its own group.
+    // This is necessary for the process to be able to receive signals.
+    // Forked processes run in the same process group as their parent, so when sdb gets a SIGINT, the inferior gets a SIGINT.
+    unsafe {
+        if libc::setpgid(0, 0) == -1 {
+            let err = anyhow!(
+                "Failed to set process group ID in child process: {}",
+                nix::errno::Errno::last().desc()
+            );
+            Errno::clear();
+            return Err(err);
+        }
+    };
     // Disable address space layout randomization (ASLR) for the child process
     unsafe {
         let status = personality(libc::ADDR_NO_RANDOMIZE as u64);
