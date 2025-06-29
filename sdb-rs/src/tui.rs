@@ -1,7 +1,7 @@
 use anyhow::Result;
 use libsdb::process::Process;
 use rustyline::{
-    Context, Helper, completion::Completer, highlight::Highlighter, hint::Hinter,
+    Config, Context, Helper, completion::Completer, highlight::Highlighter, hint::Hinter,
     history::DefaultHistory, validate::Validator,
 };
 use std::path::PathBuf;
@@ -70,6 +70,21 @@ impl Application {
         Ok(())
     }
 
+    fn handle_stop_reason(&self, stop_reason: libsdb::process::StopReason) -> Result<()> {
+        match stop_reason {
+            libsdb::process::StopReason::Exited(exit_status) => {
+                println!("Process exited with status: {}", exit_status);
+            }
+            libsdb::process::StopReason::Stopped(signal) => {
+                println!("Process stopped by signal: {}", signal);
+            }
+            libsdb::process::StopReason::Terminated(signal) => {
+                println!("Process terminated by signal: {}", signal);
+            }
+        }
+        Ok(())
+    }
+
     fn handle_command(&mut self, command: Command) -> Result<()> {
         let category = command
             .metadata
@@ -86,6 +101,8 @@ impl Application {
                     // Not a hard error, just print and continue
                     println!("Failed to resume process: {}", e);
                 });
+                let stop_reason = self.inferior_process.wait_on_signal(None)?;
+                self.handle_stop_reason(stop_reason)?;
                 Ok(())
             }
             CommandCategory::DumpChildOutput => {
@@ -108,7 +125,9 @@ impl Application {
     }
 
     pub fn main_loop(&mut self) -> Result<()> {
-        let mut rl = rustyline::Editor::<CustomHelper, DefaultHistory>::new()?;
+        let mut rl = rustyline::Editor::<CustomHelper, DefaultHistory>::with_config(
+            Config::builder().build(),
+        )?;
         rl.set_helper(Some(CustomHelper {}));
         if rl.load_history(&self.history_file).is_ok() {
             println!("History loaded from: {}", self.history_file.display());

@@ -22,6 +22,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     };
+    {
+        // Set up Ctrl-C handler to send SIGINT to the inferior process
+        let pid = inferior_process.pid;
+        ctrlc::try_set_handler(move || {
+            nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT)
+                .expect("Failed to send SIGINT to the process");
+            println!("\nCtrl-C received, stopping the process...");
+        })
+        .expect("Error setting Ctrl-C handler");
+    }
 
     let result = tui::Application::new(inferior_process).main_loop();
     if result.is_err() {

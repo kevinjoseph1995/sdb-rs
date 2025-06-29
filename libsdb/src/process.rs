@@ -9,6 +9,7 @@ use nix::errno::Errno;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
 use nix::sys::signal::Signal;
+use nix::sys::signal::Signal::SIGCONT;
 use nix::sys::signal::kill;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
@@ -291,7 +292,7 @@ impl Process {
 
     /// Resumes the execution of the process being debugged.
     pub fn resume_process(&mut self) -> Result<()> {
-        if let Err(e) = nix::sys::ptrace::cont(self.pid, None) {
+        if let Err(e) = nix::sys::ptrace::cont(self.pid, SIGCONT) {
             eprintln!("Failed to resume process: {}", e);
             return Err(e.into());
         }

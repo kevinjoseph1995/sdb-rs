@@ -1,2 +1,3 @@
 [package]
 name = "hello_sdb"
+edition = "2024"
