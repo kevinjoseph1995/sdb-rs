@@ -3,7 +3,9 @@ use std::path::PathBuf;
 /////////////////////////////////////////
 use anyhow::{Context, Result, anyhow};
 use core::panic;
+use libc::personality;
 use libc::user;
+use nix::errno::Errno;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
 use nix::sys::signal::Signal;
@@ -213,6 +215,7 @@ impl Process {
                     registers: Registers::new(),
                     breakpoint_sites: StopPointCollection::<BreakpointSite>::new(),
                 };
+                println!("Launching process with PID: {}", child_process_handle.pid);
                 if debug_process_being_launched {
                     match child_process_handle.wait_on_signal(None)? {
                         StopReason::Exited(exit_code) => {
@@ -447,7 +450,20 @@ fn setup_child_process(
     executable_path: &PathBuf,
     args: Option<String>,
     attach_for_debugging: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<()> {
+    // Disable address space layout randomization (ASLR) for the child process
+    unsafe {
+        let status = personality(libc::ADDR_NO_RANDOMIZE as u64);
+        if status == -1 {
+            let err = anyhow!(
+                "Failed to disable ASLR in child process: {}",
+                nix::errno::Errno::last().desc()
+            );
+            Errno::clear();
+            return Err(err);
+        }
+    };
+
     let executable_path_cstring = CString::new(executable_path.to_str().unwrap())?;
     let mut args_cstrings: Vec<CString> = vec![executable_path_cstring.clone()];
     if let Some(args) = args {
