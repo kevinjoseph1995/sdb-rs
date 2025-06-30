@@ -1,11 +1,13 @@
 use std::ffi::CString;
 use std::path::PathBuf;
 /////////////////////////////////////////
+use crate::breakpoint::StopPoint;
 use anyhow::{Context, Result, anyhow};
 use core::panic;
 use libc::personality;
 use libc::user;
 use nix::errno::Errno;
+use nix::sys::ptrace;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
 use nix::sys::signal::Signal;
@@ -248,6 +250,39 @@ impl Process {
         process_with_pid_exists(self.pid)
     }
 
+    /// Sets the program counter (PC) register to the specified address.
+    fn set_pc(&mut self, address: VirtAddress) -> Result<()> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to set program counter (PC) register"
+        );
+        let address: usize = address.into();
+        self.write_register_value(
+            register_info::RegisterId::rip,
+            RegisterValue::U64(address as u64),
+        )
+        .context("Failed to set program counter (PC) register")?;
+        Ok(())
+    }
+
+    pub fn get_pc(&self) -> Result<VirtAddress> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to get program counter (PC) register"
+        );
+        let pc_value = self
+            .registers
+            .get_register_value(register_info::RegisterId::rip)
+            .context("Failed to get program counter (PC) register")?;
+        match pc_value {
+            RegisterValue::U64(pc) => Ok(VirtAddress::from(pc as usize)),
+            _ => Err(anyhow!(
+                "Unexpected register value type for PC: {:?}",
+                pc_value
+            )),
+        }
+    }
+
     pub fn get_registers(&self) -> &Registers {
         return &self.registers;
     }
@@ -275,11 +310,36 @@ impl Process {
             self.read_all_registers()
                 .context("Failed to read registers after waiting for process")?;
         }
+        if let WaitStatus::Stopped(_, Signal::SIGTRAP) = waitstatus {
+            // When the process stops due to a SIGTRAP, it is likely due to a breakpoint or single-step.
+            let instruction_begin = self.get_pc()?.subtract(1);
+            if self
+                .breakpoint_sites
+                .is_enabled_at_address(instruction_begin)
+            {
+                // If the breakpoint is enabled at the instruction address, we need to set the PC to the instruction address.
+                self.set_pc(instruction_begin)?;
+            }
+        }
         Ok(waitstatus)
     }
 
     /// Resumes the execution of the process being debugged.
     pub fn resume_process(&mut self) -> Result<()> {
+        let pc = self
+            .get_pc()
+            .context("Failed to get program counter (PC) register")?;
+        if self.breakpoint_sites.is_enabled_at_address(pc) {
+            let breakpoint_site = self
+                .breakpoint_sites
+                .get_stop_point_by_address_mut(pc)
+                .ok_or_else(|| anyhow!("Breakpoint site not found at address: {}", pc))?;
+            breakpoint_site.disable()?;
+            ptrace::step(self.pid, None).context("Failed to step process")?; // Step over the int3 instruction.
+            waitpid(self.pid, None).context("Failed to wait for process after stepping")?;
+            breakpoint_site.enable()?;
+        }
+
         if let Err(e) = nix::sys::ptrace::cont(self.pid, None) {
             eprintln!("Failed to resume process: {}", e);
             return Err(e.into());

@@ -12,6 +12,18 @@ impl VirtAddress {
     pub fn new(address: usize) -> Self {
         VirtAddress { address }
     }
+
+    pub fn subtract(self, offset: usize) -> Self {
+        VirtAddress {
+            address: self.address - offset,
+        }
+    }
+
+    pub fn add(self, offset: usize) -> Self {
+        VirtAddress {
+            address: self.address + offset,
+        }
+    }
 }
 
 impl PartialOrd for VirtAddress {

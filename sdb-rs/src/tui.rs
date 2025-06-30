@@ -1,4 +1,5 @@
 use anyhow::Result;
+use ctrlc::Signal;
 use libsdb::process::Process;
 use nix::sys::wait::WaitStatus;
 use rustyline::{
@@ -75,6 +76,12 @@ impl Application {
         match waitstatus {
             WaitStatus::Exited(_, exit_status) => {
                 println!("Process exited with status: {}", exit_status);
+            }
+            WaitStatus::Stopped(_, Signal::SIGTRAP) => {
+                println!(
+                    "Hit breakpoint at address: {}",
+                    self.inferior_process.get_pc()?
+                );
             }
             WaitStatus::Stopped(_, signal) => {
                 println!("Process stopped by signal: {}", signal);
