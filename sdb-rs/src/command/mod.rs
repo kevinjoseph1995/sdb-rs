@@ -1,9 +1,11 @@
-pub mod breakpoint_command;
-pub mod register_command;
-
+/////////////////////////////////////////
 use anyhow::{Ok, Result};
+/////////////////////////////////////////
 use breakpoint_command::BreakpointCommandCategory;
 use register_command::RegisterCommandCategory;
+/////////////////////////////////////////
+pub mod breakpoint_command;
+pub mod register_command;
 
 #[derive(Debug, Clone)]
 pub struct CommandMetadata {

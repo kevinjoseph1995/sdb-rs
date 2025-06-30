@@ -1,10 +1,12 @@
+/////////////////////////////////////////
+use anyhow::{Ok, Result};
+/////////////////////////////////////////
+use crate::command::CommandMetadata;
 use libsdb::{
     process::Process,
     register_info::{REGISTER_INFO_TABLE, RegisterValue, get_register_info_by_name},
 };
-
-use crate::command::CommandMetadata;
-use anyhow::{Ok, Result};
+/////////////////////////////////////////
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RegisterCommandCategory {

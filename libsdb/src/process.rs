@@ -1,7 +1,7 @@
+/////////////////////////////////////////
 use std::ffi::CString;
 use std::path::PathBuf;
 /////////////////////////////////////////
-use crate::breakpoint::StopPoint;
 use anyhow::{Context, Result, anyhow};
 use core::panic;
 use libc::personality;
@@ -21,6 +21,7 @@ use nix::unistd::execvp;
 use nix::unistd::fork;
 /////////////////////////////////////////
 use crate::breakpoint::BreakpointSite;
+use crate::breakpoint::StopPoint;
 use crate::breakpoint::StopPointCollection;
 use crate::breakpoint::VirtAddress;
 use crate::pipe_channel;

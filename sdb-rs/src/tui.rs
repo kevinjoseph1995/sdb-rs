@@ -1,14 +1,17 @@
+/////////////////////////////////////////
+use std::path::PathBuf;
+/////////////////////////////////////////
 use anyhow::Result;
 use ctrlc::Signal;
-use libsdb::process::Process;
 use nix::sys::wait::WaitStatus;
 use rustyline::{
     Config, Context, Helper, completion::Completer, highlight::Highlighter, hint::Hinter,
     history::DefaultHistory, validate::Validator,
 };
-use std::path::PathBuf;
-
+/////////////////////////////////////////
 use crate::command::{Command, CommandCategory, get_completions, get_description_for_help};
+use libsdb::process::Process;
+/////////////////////////////////////////
 
 pub struct Application {
     history_file: PathBuf,
@@ -26,6 +29,11 @@ impl Highlighter for CustomHelper {}
 
 impl Hinter for CustomHelper {
     type Hint = String;
+    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<Self::Hint> {
+        let _ = (line, pos, ctx);
+        // TODO: Implement custom hint logic
+        None
+    }
 }
 
 impl Completer for CustomHelper {
