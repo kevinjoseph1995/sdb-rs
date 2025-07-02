@@ -39,6 +39,7 @@ pub enum CommandCategory {
     DumpChildOutput,
     Breakpoint(BreakpointCommandCategory),
     Help,
+    Step
 }
 
 use BreakpointCommandCategory::*;
@@ -126,6 +127,13 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
             ),
         ],
         None,
+        None
+    ),
+    cmd!(
+        ["step", "s"],
+        "Step over a single instruction",
+        [],
+        Some(Step),
         None
     ),
 ];

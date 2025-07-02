@@ -161,7 +161,7 @@ impl StopPoint for BreakpointSite {
 }
 
 pub struct StopPointCollection<T: StopPoint> {
-    stop_points: Vec<T>,
+    pub stop_points: Vec<T>,
 }
 
 impl<T: StopPoint> StopPointCollection<T> {
@@ -217,6 +217,12 @@ impl<T: StopPoint> StopPointCollection<T> {
         self.stop_points
             .iter_mut()
             .find(|sp| sp.is_at_address(address))
+    }
+
+    pub fn get_stop_point_index_by_address(&mut self, address: VirtAddress) -> Option<usize> {
+        self.stop_points
+            .iter_mut()
+            .position(|sp| sp.is_at_address(address))
     }
 
     pub fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Result<()> {

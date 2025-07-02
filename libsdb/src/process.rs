@@ -349,6 +349,32 @@ impl Process {
         Ok(())
     }
 
+    pub fn single_step(&mut self) -> Result<WaitStatus> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to single step"
+        );
+
+        let mut breakpoint_to_reenable: Option<usize> = None;
+        let program_counter = self.get_pc()?;
+        if let Some(breakpoint_site_index) = self.breakpoint_sites.get_stop_point_index_by_address(program_counter) {
+            let breakpoint = &mut self.breakpoint_sites.stop_points[breakpoint_site_index];
+            if breakpoint.is_enabled(){
+                // If the breakpoint is enabled at the instruction address, we need to disable it before single stepping.
+                breakpoint.disable()?;
+                breakpoint_to_reenable = Some(breakpoint_site_index);
+            }
+        }
+        nix::sys::ptrace::step(self.pid, None).context("Failed to step process")?;
+        let reason = self.wait_on_signal(None)?;
+        // Re-enable the breakpoint if it was enabled before the single step.
+        if let Some(breakpoint_site_index) = breakpoint_to_reenable {
+            let breakpoint = &mut self.breakpoint_sites.stop_points[breakpoint_site_index];
+            breakpoint.enable()?;
+        }
+        Ok(reason)
+    }
+
     pub fn stop_process(&mut self) -> Result<()> {
         if self.state == ProcessHandleState::Running {
             kill(self.pid, Signal::SIGSTOP).context("Failed to stop process")?;
