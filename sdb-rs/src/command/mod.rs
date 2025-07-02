@@ -14,16 +14,18 @@ pub struct CommandMetadata {
     pub description: &'static str,
     pub subcommands: &'static [CommandMetadata],
     pub category: Option<CommandCategory>,
+    pub hint: Option<&'static [&'static str]>,
 }
 
 macro_rules! cmd {
-    ([$first_alias:expr $(, $alias:expr)*], $desc:expr, [$($sub:tt)*], $category:expr) => {
+    ([$first_alias:expr $(, $alias:expr)*], $desc:expr, [$($sub:tt)*], $category:expr, $hint:expr) => {
         CommandMetadata {
             name: $first_alias,
             aliases: &[$first_alias $(, $alias)*],
             description: $desc,
             subcommands: &[$($sub)*],
             category: $category,
+            hint: $hint,
         }
     };
 }
@@ -44,9 +46,9 @@ use CommandCategory::*;
 use RegisterCommandCategory::*;
 
 const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
-    cmd!(["r", "run"], "Run the program", [], Some(Run)),
-    cmd!(["c", "continue"], "Continue execution", [], Some(Continue)),
-    cmd!(["q", "quit", "exit"], "Exit the debugger", [], Some(Exit)),
+    cmd!(["r", "run"], "Run the program", [], Some(Run), None),
+    cmd!(["c", "continue"], "Continue execution", [], Some(Continue), None),
+    cmd!(["q", "quit", "exit"], "Exit the debugger", [], Some(Exit), None),
     cmd!(
         ["reg", "register"],
         "Register operations",
@@ -55,22 +57,26 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 ["r", "read"],
                 "Read registers. Usage: 'register read all' or 'register read <register_name>'",
                 [],
-                Some(Register(Read))
+                Some(Register(Read)),
+                Some(&["<register_name>"])
             ),
             cmd!(
                 ["w", "write"],
                 "Write to registers",
                 [],
-                Some(Register(Write))
+                Some(Register(Write)),
+                Some(&["<register_name>", "<value>"])
             ),
         ],
+        None,
         None
     ),
     cmd!(
         ["dco", "dump_child_output"],
         "Dump child process output",
         [],
-        Some(DumpChildOutput)
+        Some(DumpChildOutput),
+        None
     ),
     cmd!(
         ["b", "breakpoint"],
@@ -80,39 +86,46 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 ["l", "list"],
                 "List all breakpoints. Usage: 'breakpoint list'",
                 [],
-                Some(Breakpoint(List))
+                Some(Breakpoint(List)),
+                None
             ),
             cmd!(
                 ["i", "info"],
                 "Get information about a specific breakpoint. Usage: 'breakpoint info <breakpoint_id>'",
                 [],
-                Some(Breakpoint(Info))
+                Some(Breakpoint(Info)),
+                Some(&["<breakpoint_id>"])
             ),
             cmd!(
                 ["s", "set"],
                 "Set a new breakpoint. Usage: 'breakpoint set <address>'",
                 [],
-                Some(Breakpoint(Set))
+                Some(Breakpoint(Set)),
+                Some(&["<address in hex>"])
             ),
             cmd!(
                 ["rm", "remove"],
                 "Remove a breakpoint. Usage: 'breakpoint remove <breakpoint_id>'",
                 [],
-                Some(Breakpoint(Remove))
+                Some(Breakpoint(Remove)),
+                Some(&["<breakpoint_id>"])
             ),
             cmd!(
                 ["e", "enable"],
                 "Enable a breakpoint. Usage: 'breakpoint enable <breakpoint_id>'",
                 [],
-                Some(Breakpoint(Enable))
+                Some(Breakpoint(Enable)),
+                Some(&["<breakpoint_id>"])
             ),
             cmd!(
                 ["d", "disable"],
                 "Disable a breakpoint. Usage: 'breakpoint disable <breakpoint_id>'",
                 [],
-                Some(Breakpoint(Disable))
+                Some(Breakpoint(Disable)),
+                Some(&["<breakpoint_id>"])
             ),
         ],
+        None,
         None
     ),
 ];
@@ -123,6 +136,7 @@ const HELP_COMMAND_METADATA: CommandMetadata = CommandMetadata {
     description: "Show help information for commands",
     subcommands: &COMMAND_METADATA_LIST,
     category: Some(Help),
+    hint: None,
 };
 
 #[derive(Debug, Clone)]

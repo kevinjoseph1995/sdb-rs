@@ -29,9 +29,14 @@ impl Highlighter for CustomHelper {}
 
 impl Hinter for CustomHelper {
     type Hint = String;
-    fn hint(&self, line: &str, pos: usize, ctx: &Context<'_>) -> Option<Self::Hint> {
-        let _ = (line, pos, ctx);
-        // TODO: Implement custom hint logic
+    fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+        if let Ok(command) = Command::parse(&line) {
+            if let Some(hint_list) = command.metadata.hint  {
+                if command.args.len() < hint_list.len() && line.ends_with(char::is_whitespace) {
+                    return Some(hint_list[command.args.len()..].join(" ").to_string());
+                }
+            }
+        }
         None
     }
 }
