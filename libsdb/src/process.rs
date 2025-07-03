@@ -1032,7 +1032,23 @@ mod tests {
         );
     }
 
+    /// Computes the section load bias for the given ELF file.
+    /// The section load bias is the difference between the address of the `.text` section and
+    /// the offset of the `.text` section in the file.
     fn compute_section_load_bias(file: &elf::ElfBytes<elf::endian::AnyEndian>) -> Result<u64> {
+        /* From Man 5 elf:
+         sh_addr
+               If this section appears in the memory image of a process,
+               this member holds the address at which the section's first
+               byte should reside.  Otherwise, the member contains zero.
+
+        sh_offset
+               This member's value holds the byte offset from the
+               beginning of the file to the first byte in the section.
+               One section type, SHT_NOBITS, occupies no space in the
+               file, and its sh_offset member locates the conceptual
+               placement in the file.
+          */
         let text_section_header = file
             .section_header_by_name(".text")
             .expect("Failed to find .text section")
@@ -1041,6 +1057,10 @@ mod tests {
         Ok(load_bias)
     }
 
+    /// Computes the entry point offset from the start of the file.
+    /// This is the offset from the start of the file to the entry point address.
+    /// The entry point address is the address where the program starts executing.
+    /// The offset is computed by subtracting the section load bias from the entry point address.
     fn get_entry_point_offset(file_path: &PathBuf) -> Result<usize> {
         let file = std::fs::read(file_path).expect("Could not read file.");
         let file = elf::ElfBytes::<elf::endian::AnyEndian>::minimal_parse(file.as_slice())
@@ -1114,5 +1134,101 @@ mod tests {
             "Process did not stop at the expected breakpoint address: {}",
             load_address
         );
+    }
+
+    #[test]
+    fn test_memory_operations() {
+        let test_binary_path = PathBuf::from(
+            build_test_binary("memory_test", &PathBuf::from_iter(["..", "tools"]))
+                .expect("Failed to build test binary"),
+        );
+        let (read_port, write_port) =
+            create_pipe_channel(true).expect("Failed to create pipe channel");
+        let mut target_process = Process::launch(
+            &test_binary_path,
+            None,
+            true,
+            Some(write_port.into_internal_fd()),
+        )
+        .expect("Process failed to launch");
+
+        assert!(
+            get_process_state(target_process.pid).expect("Failed to get process state")
+                == ProcessState::TracingStopped,
+        );
+
+        {
+            target_process
+                .resume_process()
+                .expect("Failed to resume process");
+            target_process
+                .wait_on_signal(None)
+                .expect("Failed to wait for process");
+            // Process should have raised a SIGTRAP signal and stopped.
+            // Read the value of a local stack variable whose value we know is 0xdeadbeef.
+            let stdout_from_child = read_port.read().expect("Failed to read from pipe channel");
+            let address_string =
+                String::from_utf8(stdout_from_child).expect("Failed to convert stdout to string");
+            // The address string should be in the format "0x<address>"
+            let address_to_read_from = u64::from_str_radix(&address_string[2..], 16)
+                .expect("Failed to parse address from string");
+
+            let value_read_bytes = target_process
+                .read_memory(VirtAddress::new(address_to_read_from as usize), 8)
+                .expect("Failed to read memory");
+
+            let value_read_u64 = u64::from_le_bytes(value_read_bytes[0..8].try_into().unwrap());
+            assert_eq!(
+                value_read_u64, 0xdeadbeef,
+                "Expected to read 0xdeadbeef from memory, got: 0x{:x}",
+                value_read_u64
+            );
+        }
+        {
+            target_process
+                .resume_process()
+                .expect("Failed to resume process");
+            target_process
+                .wait_on_signal(None)
+                .expect("Failed to wait for process");
+            // Process should have raised a SIGTRAP signal and stopped.
+            // Get the address of a local array variable.
+            let stdout_from_child = read_port.read().expect("Failed to read from pipe channel");
+            let address_string =
+                String::from_utf8(stdout_from_child).expect("Failed to convert stdout to string");
+            // The address string should be in the format "0x<address>"
+            let array_address = u64::from_str_radix(&address_string[2..], 16)
+                .expect("Failed to parse address from string");
+            const CONST_STRING: &str = "Hello, sdb!";
+            let values_to_write: [u8; 12] = {
+                let mut array = [0; 12];
+                for (i, char) in CONST_STRING.chars().enumerate() {
+                    array[i] = char as u8;
+                }
+                array[11] = 0; // Null-terminate the string
+                array
+            };
+            target_process
+                .write_memory(VirtAddress::new(array_address as usize), &values_to_write)
+                .expect("Failed to write memory");
+            target_process
+                .resume_process()
+                .expect("Failed to resume process");
+            target_process
+                .wait_on_signal(None)
+                .expect("Failed to wait for process");
+            let stdout_from_child = read_port.read().expect("Failed to read from pipe channel");
+            // Compare with the bytes we wrote to the memory.
+            values_to_write
+                .iter()
+                .zip(stdout_from_child.iter())
+                .for_each(|(expected_byte, read_byte)| {
+                    assert_eq!(
+                        expected_byte, read_byte,
+                        "Expected byte {} to be {}, got: {}",
+                        expected_byte, expected_byte, read_byte
+                    );
+                });
+        }
     }
 }
