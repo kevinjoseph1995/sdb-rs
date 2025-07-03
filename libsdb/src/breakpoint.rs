@@ -15,9 +15,25 @@ impl VirtAddress {
         VirtAddress { address }
     }
 
+    pub fn get(self) -> usize {
+        self.address
+    }
+
     pub fn subtract(self, offset: usize) -> Self {
         VirtAddress {
             address: self.address - offset,
+        }
+    }
+
+    /// Returns the next page boundary address after this address.
+    /// Example 4095 -> 4096
+    /// Example 4096 -> 8192
+    /// Example 8192 -> 12288
+    /// Example 0 -> 4096
+    pub fn next_page_boundary(&self) -> Self {
+        const PAGE_SIZE: usize = 0x1000; // Assume 4 KiB page size
+        VirtAddress {
+            address: (self.address + PAGE_SIZE) & !0xFFF,
         }
     }
 
@@ -278,5 +294,16 @@ mod tests {
         assert_eq!(BreakpointSite::get_next_id(), 3);
         assert_eq!(BreakpointSite::get_next_id(), 4);
         assert_eq!(BreakpointSite::get_next_id(), 5);
+    }
+
+    #[test]
+    fn test_virt_address() {
+        let va = VirtAddress::new(0x1234);
+        assert_eq!(va.next_page_boundary().address, 0x2000);
+        assert_eq!(va.next_page_boundary().next_page_boundary().address, 0x3000);
+        assert_eq!(va.next_page_boundary().next_page_boundary().next_page_boundary().address, 0x4000);
+        let va = VirtAddress::new(4095);
+        assert_eq!(va.next_page_boundary().address, 4096);
+        assert_eq!(va.next_page_boundary().next_page_boundary().address, 8192);
     }
 }

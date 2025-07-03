@@ -12,6 +12,7 @@ use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
 use nix::sys::signal::Signal;
 use nix::sys::signal::kill;
+use nix::sys::uio::RemoteIoVec;
 use nix::sys::wait::WaitPidFlag;
 use nix::sys::wait::WaitStatus;
 use nix::sys::wait::waitpid;
@@ -350,16 +351,16 @@ impl Process {
     }
 
     pub fn single_step(&mut self) -> Result<WaitStatus> {
-        assert!(
-            self.is_attached,
-            "Process must be attached to single step"
-        );
+        assert!(self.is_attached, "Process must be attached to single step");
 
         let mut breakpoint_to_reenable: Option<usize> = None;
         let program_counter = self.get_pc()?;
-        if let Some(breakpoint_site_index) = self.breakpoint_sites.get_stop_point_index_by_address(program_counter) {
+        if let Some(breakpoint_site_index) = self
+            .breakpoint_sites
+            .get_stop_point_index_by_address(program_counter)
+        {
             let breakpoint = &mut self.breakpoint_sites.stop_points[breakpoint_site_index];
-            if breakpoint.is_enabled(){
+            if breakpoint.is_enabled() {
                 // If the breakpoint is enabled at the instruction address, we need to disable it before single stepping.
                 breakpoint.disable()?;
                 breakpoint_to_reenable = Some(breakpoint_site_index);
@@ -420,6 +421,74 @@ impl Process {
             self.poke_user_data(aligned_offset, value)?;
         }
         Ok(())
+    }
+
+    pub fn write_memory(&self, start: VirtAddress, data: &[u8]) -> Result<()> {
+        assert!(self.is_attached, "Process must be attached to write memory");
+        let mut written = 0usize;
+        while written < data.len() {
+            let remaining_bytes = &data[written..];
+            let eight_byte_chunk: [u8; 8] = {
+                if remaining_bytes.len() > 8 {
+                    let mut chunk = [0u8; 8];
+                    chunk.copy_from_slice(&remaining_bytes[0..8]);
+                    chunk
+                } else {
+                    let mut chunk = [0u8; 8];
+                    let read_memory = self.read_memory(start.add(written), 8)?;
+                    chunk.copy_from_slice(&read_memory[0..8]); // Copy the existing memory to the chunk
+                    chunk[0..remaining_bytes.len()].copy_from_slice(remaining_bytes); // Copy the new data to the first part
+                    chunk
+                }
+            };
+            ptrace::write(
+                self.pid,
+                start.add(written).get() as *mut std::ffi::c_void,
+                i64::from_le_bytes(eight_byte_chunk),
+            )
+            .context("Failed to write memory")?;
+
+            written += 8;
+        }
+
+        Ok(())
+    }
+
+    /// Reads the memory of the process being debugged.
+    /// This function reads the memory of the process using the `process_vm_readv` system call.
+    /// The memory is read in chunks that are page aligned.
+    /// The number of bytes returned may be less than the number of bytes requested.
+    pub fn read_memory(&self, start: VirtAddress, num_bytes: usize) -> Result<Vec<u8>> {
+        assert!(self.is_attached, "Process must be attached to read memory");
+        // Setup remote descriptors. Split the read into chunks that are page aligned.
+        // Each chunk can have a maximum size of 4096 bytes(which is the default page size of x64 Linux).
+        let remote_iovs: Vec<RemoteIoVec> = {
+            let mut remote_iovs = vec![];
+            let mut start = start;
+            let mut num_bytes = num_bytes;
+            while num_bytes > 0 {
+                let next_page_boundary = start.next_page_boundary();
+                let chunk_size =
+                    std::cmp::min(num_bytes, next_page_boundary.subtract(start.get()).get());
+                remote_iovs.push(RemoteIoVec {
+                    base: start.get(),
+                    len: chunk_size,
+                });
+                start = start.add(chunk_size);
+                num_bytes -= chunk_size;
+            }
+            remote_iovs
+        };
+        let mut buffer_to_return = vec![0u8; num_bytes];
+        let total_number_of_bytes_read = nix::sys::uio::process_vm_readv(
+            self.pid,
+            &mut [std::io::IoSliceMut::new(&mut buffer_to_return)],
+            &remote_iovs,
+        )
+        .context("Failed to read memory")?;
+        assert!(total_number_of_bytes_read <= num_bytes);
+        buffer_to_return.resize(total_number_of_bytes_read, 0);
+        Ok(buffer_to_return)
     }
 
     pub fn read_all_registers(&mut self) -> Result<()> {

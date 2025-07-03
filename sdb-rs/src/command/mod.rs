@@ -1,11 +1,15 @@
 /////////////////////////////////////////
 use anyhow::{Ok, Result};
 /////////////////////////////////////////
+pub mod breakpoint_command;
+pub mod memory_command;
+pub mod register_command;
+/////////////////////////////////////////
 use breakpoint_command::BreakpointCommandCategory;
+use libsdb::process::Process;
+use memory_command::MemoryCommandCategory;
 use register_command::RegisterCommandCategory;
 /////////////////////////////////////////
-pub mod breakpoint_command;
-pub mod register_command;
 
 #[derive(Debug, Clone)]
 pub struct CommandMetadata {
@@ -39,17 +43,29 @@ pub enum CommandCategory {
     DumpChildOutput,
     Breakpoint(BreakpointCommandCategory),
     Help,
-    Step
+    Step,
+    Memory(MemoryCommandCategory),
 }
 
 use BreakpointCommandCategory::*;
 use CommandCategory::*;
-use RegisterCommandCategory::*;
 
 const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
     cmd!(["r", "run"], "Run the program", [], Some(Run), None),
-    cmd!(["c", "continue"], "Continue execution", [], Some(Continue), None),
-    cmd!(["q", "quit", "exit"], "Exit the debugger", [], Some(Exit), None),
+    cmd!(
+        ["c", "continue"],
+        "Continue execution",
+        [],
+        Some(Continue),
+        None
+    ),
+    cmd!(
+        ["q", "quit", "exit"],
+        "Exit the debugger",
+        [],
+        Some(Exit),
+        None
+    ),
     cmd!(
         ["reg", "register"],
         "Register operations",
@@ -58,14 +74,14 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 ["r", "read"],
                 "Read registers. Usage: 'register read all' or 'register read <register_name>'",
                 [],
-                Some(Register(Read)),
+                Some(Register(RegisterCommandCategory::Read)),
                 Some(&["<register_name>"])
             ),
             cmd!(
                 ["w", "write"],
                 "Write to registers",
                 [],
-                Some(Register(Write)),
+                Some(Register(RegisterCommandCategory::Write)),
                 Some(&["<register_name>", "<value>"])
             ),
         ],
@@ -134,6 +150,28 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         "Step over a single instruction",
         [],
         Some(Step),
+        None
+    ),
+    cmd!(
+        ["memory", "m"],
+        "Memory operations",
+        [
+            cmd!(
+                ["r", "read"],
+                "Read memory. Usage: 'memory read <address> [<size>]'",
+                [],
+                Some(Memory(MemoryCommandCategory::Read)),
+                Some(&["<address>", "[<size>]"])
+            ),
+            cmd!(
+                ["w", "write"],
+                "Write to memory. Usage: 'memory write <address> [<value>, <value>...]'",
+                [],
+                Some(Memory(MemoryCommandCategory::Write)),
+                Some(&["<address>", "<byte_value1_in_hex> <byte_value2_in_hex> ..."])
+            ),
+        ],
+        None,
         None
     ),
 ];
@@ -310,6 +348,15 @@ pub fn get_description_for_help(help_command: &Command) -> Result<String> {
     return Ok(description);
 }
 
+pub trait CommandHandler {
+    fn handle_command(
+        &self,
+        metadata: &CommandMetadata,
+        args: Vec<String>,
+        process: &mut Process,
+    ) -> Result<()>;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -345,14 +392,14 @@ mod tests {
                 .expect("Unable to parse command")
                 .metadata
                 .category,
-            Some(Register(Read))
+            Some(Register(RegisterCommandCategory::Read))
         );
         assert_eq!(
             Command::parse("reg w")
                 .expect("Unable to parse command")
                 .metadata
                 .category,
-            Some(Register(Write))
+            Some(Register(RegisterCommandCategory::Write))
         );
         assert_eq!(
             Command::parse("run")

@@ -6,6 +6,8 @@ use libsdb::{
     process::Process,
     register_info::{REGISTER_INFO_TABLE, RegisterValue, get_register_info_by_name},
 };
+
+use super::CommandHandler;
 /////////////////////////////////////////
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -82,8 +84,10 @@ impl RegisterCommandCategory {
         let register_value = RegisterValue::parse(&args[1], register_info)?;
         process.write_register_value(register_info.id, register_value)
     }
+}
 
-    pub fn handle_command(
+impl CommandHandler for RegisterCommandCategory {
+    fn handle_command(
         &self,
         metadata: &CommandMetadata,
         args: Vec<String>,

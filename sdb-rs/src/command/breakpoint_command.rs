@@ -1,5 +1,7 @@
 /////////////////////////////////////////
 use anyhow::{Context, Ok, Result};
+use crate::command::CommandHandler;
+
 /////////////////////////////////////////
 use super::CommandMetadata;
 use libsdb::{
@@ -18,8 +20,8 @@ pub enum BreakpointCommandCategory {
     Remove,
 }
 
-impl BreakpointCommandCategory {
-    pub fn handle_command(
+impl CommandHandler for BreakpointCommandCategory {
+    fn handle_command(
         &self,
         metadata: &CommandMetadata,
         args: Vec<String>,

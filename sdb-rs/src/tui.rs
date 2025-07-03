@@ -9,7 +9,9 @@ use rustyline::{
     history::DefaultHistory, validate::Validator,
 };
 /////////////////////////////////////////
-use crate::command::{Command, CommandCategory, get_completions, get_description_for_help};
+use crate::command::{
+    Command, CommandCategory, CommandHandler, get_completions, get_description_for_help,
+};
 use libsdb::process::Process;
 /////////////////////////////////////////
 
@@ -155,6 +157,9 @@ impl Application {
                 self.inferior_process.single_step()?;
                 Ok(())
             }
+            CommandCategory::Memory(cmd) => {
+                cmd.handle_command(&command.metadata, command.args, &mut self.inferior_process)
+            }
         }
     }
 
@@ -194,6 +199,7 @@ impl Application {
                 }
             }
         }
+        rl.save_history(&self.history_file)?;
 
         anyhow::Ok(())
     }
