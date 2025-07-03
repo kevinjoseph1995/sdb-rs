@@ -194,6 +194,8 @@ impl Process {
                 };
                 println!("Launching process with PID: {}", child_process_handle.pid);
                 if debug_process_being_launched {
+                    // If we are debugging the process being launched, we need to wait for it to stop.
+                    // traceme() is called in the child process, so we need to wait for it to stop.
                     match child_process_handle.wait_on_signal(None)? {
                         WaitStatus::Exited(_, exit_code) => {
                             let mut error_message =
@@ -670,6 +672,7 @@ mod tests {
 
     use super::*;
     use extended::Extended;
+    use procfs::process::MMPermissions;
     use test_binary::build_test_binary;
 
     #[test]
@@ -1026,6 +1029,90 @@ mod tests {
                 .create_breakpoint_site(VirtAddress::new(0x1000))
                 .is_err(), // Should fail because breakpoint already exists at 0x1000
             "Expected to fail creating breakpoint site at 0x1000 again"
+        );
+    }
+
+    fn compute_section_load_bias(file: &elf::ElfBytes<elf::endian::AnyEndian>) -> Result<u64> {
+        let text_section_header = file
+            .section_header_by_name(".text")
+            .expect("Failed to find .text section")
+            .expect("Failed to find .text section");
+        let load_bias: u64 = text_section_header.sh_addr - text_section_header.sh_offset;
+        Ok(load_bias)
+    }
+
+    fn get_entry_point_offset(file_path: &PathBuf) -> Result<usize> {
+        let file = std::fs::read(file_path).expect("Could not read file.");
+        let file = elf::ElfBytes::<elf::endian::AnyEndian>::minimal_parse(file.as_slice())
+            .expect("Failed to parse ELF file");
+        let section_load_bias =
+            compute_section_load_bias(&file).expect("Failed to compute section load bias");
+        let entry_point_offset = file
+            .ehdr
+            .e_entry
+            .checked_sub(section_load_bias)
+            .ok_or_else(|| anyhow!("Failed to compute entry point address"))?
+            as usize;
+
+        Ok(entry_point_offset)
+    }
+
+    fn get_load_address(pid: Pid, offset: u64) -> Result<VirtAddress> {
+        let process_entry =
+            procfs::process::Process::new(pid.as_raw()).context("Failed to get process entry")?;
+        let maps = process_entry.maps()?;
+        let executable_map = maps
+            .iter()
+            .find(|m| m.perms.contains(MMPermissions::EXECUTE))
+            .expect("Failed to find executable map");
+        let file_offset = executable_map.offset;
+        let (range_begin, _) = &executable_map.address;
+        return Ok(VirtAddress::new(
+            (range_begin + offset - file_offset) as usize,
+        ));
+    }
+
+    #[test]
+    fn test_breakpoint_setting() {
+        let test_binary_path = PathBuf::from(
+            build_test_binary("hello_sdb", &PathBuf::from_iter(["..", "tools"]))
+                .expect("Failed to build test binary"),
+        );
+        let offset =
+            get_entry_point_offset(&test_binary_path).expect("Failed to get entry point offset");
+        let mut target_process =
+            Process::launch(&test_binary_path, None, true, None).expect("Process failed to launch");
+
+        let load_address = get_load_address(target_process.pid, offset as u64)
+            .expect("Failed to get load address");
+        let break_point_site = target_process
+            .create_breakpoint_site(load_address)
+            .expect("Failed to create breakpoint site at load address");
+        break_point_site
+            .enable()
+            .expect("Failed to enable breakpoint site");
+        assert!(
+            get_process_state(target_process.pid).expect("Failed to get process state")
+                == ProcessState::TracingStopped,
+        );
+        target_process
+            .resume_process()
+            .expect("Failed to resume process");
+        let wait_status = target_process
+            .wait_on_signal(None)
+            .expect("Failed to wait for process");
+        assert!(matches!(
+            wait_status,
+            WaitStatus::Stopped(_, Signal::SIGTRAP)
+        ));
+        // The process should have stopped at the breakpoint.
+        let pc = target_process
+            .get_pc()
+            .expect("Failed to get program counter");
+        assert_eq!(
+            pc, load_address,
+            "Process did not stop at the expected breakpoint address: {}",
+            load_address
         );
     }
 }
