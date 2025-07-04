@@ -34,8 +34,8 @@ use crate::register_info::RegisterValue;
 
 type Pid = nix::unistd::Pid;
 
-#[derive(PartialEq)]
-enum ProcessHandleState {
+#[derive(PartialEq, Clone, Copy, Debug)]
+pub enum ProcessHandleState {
     Running,
     Stopped,
     Exited,

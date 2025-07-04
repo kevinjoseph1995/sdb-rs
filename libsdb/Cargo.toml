@@ -9,6 +9,7 @@ extended = "0.1.0"
 libc = "0.2.172"
 nix = { version = "0.30.1", features = ["ptrace", "signal", "fs", "uio"] }
 test-binary = "3.0.2"
+zydis = "4.1.1"
 
 [dev-dependencies]
 elf = "0.8.0"
