@@ -191,76 +191,74 @@ pub struct Command {
     pub args: Vec<String>,
 }
 
-impl Command {
-    /// Traverse the command tree to find the command metadata
-    /// and return the remaining arguments.
-    fn traverse_command_tree(input: &str) -> Result<(&'static CommandMetadata, Vec<String>)> {
-        let mut token_iterator = input
-            .trim_start()
-            .split_whitespace()
-            .map(|str| str.trim())
-            .peekable();
-        let mut current_command_level = COMMAND_METADATA_LIST;
-        loop {
-            let token = match token_iterator.next() {
-                Some(token) => token,
-                None => return Err(anyhow::anyhow!("No command provided")),
-            };
-            let command = match current_command_level.iter().find_map(|cmd| {
-                if cmd.aliases.contains(&token) {
-                    Some(cmd)
-                } else {
-                    None
-                }
-            }) {
-                Some(cmd) => cmd,
-                None => return Err(anyhow::anyhow!("Unknown command: {}", token)),
-            };
-            if command.subcommands.is_empty() || token_iterator.peek().is_none() {
-                return Ok((
-                    command,
-                    token_iterator.map(String::from).collect::<Vec<String>>(),
-                ));
-            } else {
-                // Traverse the command tree hierarchy
-                current_command_level = command.subcommands;
-            }
-        }
-    }
-
-    /// Parse the command input and return a Command struct.
-    /// Example:
-    /// ```
-    /// let command = Command::parse("reg r rax").unwrap();
-    /// assert_eq!(command.metadata.name, "read");
-    /// assert_eq!(command.args, vec!["rax"]);
-    pub fn parse(input: &str) -> Result<Self> {
-        let (first_token, rest) = match input.find(|c: char| c.is_whitespace()) {
-            Some(index) => {
-                let first_token = &input[..index];
-                let rest = &input[index..];
-                (first_token, rest)
-            }
-            None => (input, ""),
+/// Traverse the command tree to find the command metadata
+/// and return the remaining arguments.
+fn traverse_command_tree(input: &str) -> Result<(&'static CommandMetadata, Vec<String>)> {
+    let mut token_iterator = input
+        .trim_start()
+        .split_whitespace()
+        .map(|str| str.trim())
+        .peekable();
+    let mut current_command_level = COMMAND_METADATA_LIST;
+    loop {
+        let token = match token_iterator.next() {
+            Some(token) => token,
+            None => return Err(anyhow::anyhow!("No command provided")),
         };
-        if first_token == "help" || first_token == "h" {
-            return Ok(Command {
-                metadata: &HELP_COMMAND_METADATA,
-                args: rest.trim().split_whitespace().map(String::from).collect(),
-            });
-        }
-        let (command_metadata, args) = Self::traverse_command_tree(input)?;
-        if !command_metadata.subcommands.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Incomplete command: expected subcommand for '{}'",
-                command_metadata.name
+        let command = match current_command_level.iter().find_map(|cmd| {
+            if cmd.aliases.contains(&token) {
+                Some(cmd)
+            } else {
+                None
+            }
+        }) {
+            Some(cmd) => cmd,
+            None => return Err(anyhow::anyhow!("Unknown command: {}", token)),
+        };
+        if command.subcommands.is_empty() || token_iterator.peek().is_none() {
+            return Ok((
+                command,
+                token_iterator.map(String::from).collect::<Vec<String>>(),
             ));
+        } else {
+            // Traverse the command tree hierarchy
+            current_command_level = command.subcommands;
         }
-        Ok(Command {
-            metadata: command_metadata,
-            args,
-        })
     }
+}
+
+/// Parse the command input and return a Command struct.
+/// Example:
+/// ```
+/// let command = parse("reg r rax").unwrap();
+/// assert_eq!(command.metadata.name, "read");
+/// assert_eq!(command.args, vec!["rax"]);
+pub fn parse(input: &str) -> Result<Command> {
+    let (first_token, rest) = match input.find(|c: char| c.is_whitespace()) {
+        Some(index) => {
+            let first_token = &input[..index];
+            let rest = &input[index..];
+            (first_token, rest)
+        }
+        None => (input, ""),
+    };
+    if first_token == "help" || first_token == "h" {
+        return Ok(Command {
+            metadata: &HELP_COMMAND_METADATA,
+            args: rest.trim().split_whitespace().map(String::from).collect(),
+        });
+    }
+    let (command_metadata, args) = traverse_command_tree(input)?;
+    if !command_metadata.subcommands.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Incomplete command: expected subcommand for '{}'",
+            command_metadata.name
+        ));
+    }
+    Ok(Command {
+        metadata: command_metadata,
+        args,
+    })
 }
 
 fn handle_completions_for_commands(
@@ -334,7 +332,7 @@ pub fn get_description_for_help(help_command: &Command) -> Result<String> {
         }
         return Ok(description);
     }
-    let (metadata, _) = Command::traverse_command_tree(&help_command.args.join(" "))?;
+    let (metadata, _) = traverse_command_tree(&help_command.args.join(" "))?;
     let mut description = format!("{}: {}", metadata.name, metadata.description);
     if !metadata.subcommands.is_empty() {
         description.push_str("\nAvailable sub-commands:");
@@ -388,42 +386,42 @@ mod tests {
     #[test]
     fn test_command_parsing() {
         assert_eq!(
-            Command::parse("reg r")
+            parse("reg r")
                 .expect("Unable to parse command")
                 .metadata
                 .category,
             Some(Register(RegisterCommandCategory::Read))
         );
         assert_eq!(
-            Command::parse("reg w")
+            parse("reg w")
                 .expect("Unable to parse command")
                 .metadata
                 .category,
             Some(Register(RegisterCommandCategory::Write))
         );
         assert_eq!(
-            Command::parse("run")
+            parse("run")
                 .expect("Unable to parse command")
                 .metadata
                 .category,
             Some(Run)
         );
         assert_eq!(
-            Command::parse("continue")
+            parse("continue")
                 .expect("Unable to parse command")
                 .metadata
                 .category,
             Some(Continue)
         );
         assert_eq!(
-            Command::parse("q")
+            parse("q")
                 .expect("Unable to parse command")
                 .metadata
                 .category,
             Some(Exit)
         );
         assert_eq!(
-            Command::parse("dco")
+            parse("dco")
                 .expect("Unable to parse command")
                 .metadata
                 .category,
@@ -431,37 +429,33 @@ mod tests {
         );
 
         assert_eq!(
-            Command::parse("reg r rax")
-                .expect("Unable to parse command")
-                .args,
+            parse("reg r rax").expect("Unable to parse command").args,
             vec!["rax"]
         );
 
         assert_eq!(
-            Command::parse("reg w rax 123")
+            parse("reg w rax 123")
                 .expect("Unable to parse command")
                 .args,
             vec!["rax", "123"]
         );
 
         assert_eq!(
-            Command::parse("help")
+            parse("help")
                 .expect("Unable to parse command")
                 .metadata
                 .category,
             Some(Help)
         );
         assert_eq!(
-            Command::parse("help reg")
+            parse("help reg")
                 .expect("Unable to parse command")
                 .metadata
                 .name,
             "help"
         );
         assert_eq!(
-            Command::parse("help reg")
-                .expect("Unable to parse command")
-                .args,
+            parse("help reg").expect("Unable to parse command").args,
             vec!["reg"]
         );
     }
@@ -516,19 +510,19 @@ mod tests {
     #[test]
     fn test_get_description_for_help() {
         {
-            let help_command = Command::parse("help ").expect("Unable to parse command");
+            let help_command = parse("help ").expect("Unable to parse command");
             let description =
                 get_description_for_help(&help_command).expect("Unable to get description");
             assert!(description.contains("Available commands:"));
         }
         {
-            let help_command = Command::parse("help reg").expect("Unable to parse command");
+            let help_command = parse("help reg").expect("Unable to parse command");
             let description =
                 get_description_for_help(&help_command).expect("Unable to get description");
             assert!(description.contains("Available sub-commands:"));
         }
         {
-            let help_command = Command::parse("help reg w").expect("Unable to parse command");
+            let help_command = parse("help reg w").expect("Unable to parse command");
             let description =
                 get_description_for_help(&help_command).expect("Unable to get description");
             assert!(!description.contains("Available commands:"));

@@ -32,7 +32,7 @@ impl Highlighter for CustomHelper {}
 impl Hinter for CustomHelper {
     type Hint = String;
     fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
-        if let Ok(command) = Command::parse(&line) {
+        if let Ok(command) = crate::command::parse(&line) {
             if let Some(hint_list) = command.metadata.hint {
                 if command.args.len() < hint_list.len() && line.ends_with(char::is_whitespace) {
                     return Some(hint_list[command.args.len()..].join(" ").to_string());
@@ -178,7 +178,7 @@ impl Application {
             match readline {
                 Ok(line) => {
                     rl.add_history_entry(line.as_str())?;
-                    if let Ok(command) = Command::parse(&line) {
+                    if let Ok(command) = crate::command::parse(&line) {
                         if let Err(err) = self.handle_command(command) {
                             eprintln!("Error handling command: {}", err);
                         }
