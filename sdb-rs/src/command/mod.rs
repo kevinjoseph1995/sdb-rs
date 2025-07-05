@@ -1,8 +1,10 @@
+/////////////////////////////////////////
 use std::iter::Peekable;
 /////////////////////////////////////////
 use anyhow::{Ok, Result};
 /////////////////////////////////////////
 pub mod breakpoint_command;
+pub mod disassemble_command;
 pub mod memory_command;
 pub mod register_command;
 /////////////////////////////////////////
@@ -16,7 +18,7 @@ use register_command::RegisterCommandCategory;
 pub struct OptionMetadata {
     pub aliases: &'static [&'static str],
     pub is_required: bool,
-    pub description: &'static str,
+    pub _description: &'static str,
     pub hint: &'static str,
 }
 
@@ -50,7 +52,7 @@ macro_rules! opt {
         OptionMetadata {
             aliases: &[$first_alias $(, $alias)*],
             is_required: $is_required,
-            description: $desc,
+            _description: $desc,
             hint: $hint,
         }
     };
@@ -74,7 +76,7 @@ use BreakpointCommandCategory::*;
 use CommandCategory::*;
 
 const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
-    cmd!(["r", "run"], "Run the program", [], Some(Run), None, []),
+    cmd!(["run", "r"], "Run the program", [], Some(Run), None, []),
     cmd!(
         ["c", "continue"],
         "Continue execution",
@@ -84,7 +86,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         []
     ),
     cmd!(
-        ["q", "quit", "exit"],
+        ["quit", "exit", "q"],
         "Exit the debugger",
         [],
         Some(Exit),
@@ -92,11 +94,11 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         []
     ),
     cmd!(
-        ["reg", "register"],
+        ["register", "reg"],
         "Register operations",
         [
             cmd!(
-                ["r", "read"],
+                ["read", "r"],
                 "Read registers. Usage: 'register read all' or 'register read <register_name>'",
                 [],
                 Some(Register(RegisterCommandCategory::Read)),
@@ -104,7 +106,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 []
             ),
             cmd!(
-                ["w", "write"],
+                ["write", "w"],
                 "Write to registers",
                 [],
                 Some(Register(RegisterCommandCategory::Write)),
@@ -117,7 +119,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         []
     ),
     cmd!(
-        ["dco", "dump_child_output"],
+        ["dump_child_output", "dco"],
         "Dump child process output",
         [],
         Some(DumpChildOutput),
@@ -125,11 +127,11 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         []
     ),
     cmd!(
-        ["b", "breakpoint"],
+        ["breakpoint", "b"],
         "Breakpoint operations",
         [
             cmd!(
-                ["l", "list"],
+                ["list", "l"],
                 "List all breakpoints. Usage: 'breakpoint list'",
                 [],
                 Some(Breakpoint(List)),
@@ -137,7 +139,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 []
             ),
             cmd!(
-                ["i", "info"],
+                ["info", "i"],
                 "Get information about a specific breakpoint. Usage: 'breakpoint info <breakpoint_id>'",
                 [],
                 Some(Breakpoint(Info)),
@@ -145,7 +147,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 []
             ),
             cmd!(
-                ["s", "set"],
+                ["set", "s"],
                 "Set a new breakpoint. Usage: 'breakpoint set <address>'",
                 [],
                 Some(Breakpoint(Set)),
@@ -153,7 +155,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 []
             ),
             cmd!(
-                ["rm", "remove"],
+                ["remove", "rm"],
                 "Remove a breakpoint. Usage: 'breakpoint remove <breakpoint_id>'",
                 [],
                 Some(Breakpoint(Remove)),
@@ -161,7 +163,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 []
             ),
             cmd!(
-                ["e", "enable"],
+                ["enable", "e"],
                 "Enable a breakpoint. Usage: 'breakpoint enable <breakpoint_id>'",
                 [],
                 Some(Breakpoint(Enable)),
@@ -169,7 +171,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 []
             ),
             cmd!(
-                ["d", "disable"],
+                ["disable", "d"],
                 "Disable a breakpoint. Usage: 'breakpoint disable <breakpoint_id>'",
                 [],
                 Some(Breakpoint(Disable)),
@@ -194,7 +196,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         "Memory operations",
         [
             cmd!(
-                ["r", "read"],
+                ["read", "r"],
                 "Read memory. Usage: 'memory read <address> [<size>]'",
                 [],
                 Some(Memory(MemoryCommandCategory::Read)),
@@ -202,7 +204,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 []
             ),
             cmd!(
-                ["w", "write"],
+                ["write", "w"],
                 "Write to memory. Usage: 'memory write <address> [<value>, <value>...]'",
                 [],
                 Some(Memory(MemoryCommandCategory::Write)),
@@ -224,13 +226,13 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
             opt!(
                 ["-a", "--address"],
                 "Address to disassemble from",
-                true,
+                false,
                 "-a <address> | --address <address> (in hex format)"
             ),
             opt!(
                 ["-n", "--number"],
                 "Number of instructions to disassemble",
-                true,
+                false,
                 "-n <number> | --number <number> (default is 10)"
             ),
         ]
@@ -249,92 +251,117 @@ const HELP_COMMAND_METADATA: CommandMetadata = CommandMetadata {
 
 #[derive(Debug, Clone)]
 pub struct Command {
-    pub metadata: &'static CommandMetadata,
+    pub parsed_nodes: Vec<ParseChainNode>,
     pub args: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
 pub struct ParsedOption {
     pub metadata: &'static OptionMetadata,
     pub value: String,
 }
 
+#[derive(Debug, Clone)]
 pub struct ParseChainNode {
     pub metadata: &'static CommandMetadata,
     pub parsed_options: Vec<ParsedOption>,
 }
 
-fn consume_options<'a>(
-    token_iterator: &mut Peekable<impl Iterator<Item = &'a str>>,
-    command_metadata: &CommandMetadata,
-) -> Result<Vec<ParsedOption>> {
-    if command_metadata.options.is_empty() {
-        return Ok(Vec::new());
+#[derive(Debug, Clone)]
+pub struct PotentialParseChainNode {
+    pub metadata: &'static CommandMetadata,
+    pub parsed_options: Vec<(String, String)>,
+}
+
+impl PotentialParseChainNode {
+    fn convert_to_parse_chain_node(self) -> Result<ParseChainNode> {
+        // Perform all the validation checks
+        let command_metadata = self.metadata;
+        let all_options = self.parsed_options;
+        // Check if required options are present
+        for option_metadata in command_metadata.options {
+            if option_metadata.is_required
+                && !all_options
+                    .iter()
+                    .any(|(opt, _)| option_metadata.aliases.contains(&opt.as_str()))
+            {
+                return Err(anyhow::anyhow!(
+                    "Required option missing: {}",
+                    option_metadata.aliases.join(", ")
+                ));
+            }
+        }
+        // Check if any option is provided that is not defined in the command metadata
+        for (option, _) in &all_options {
+            if !command_metadata
+                .options
+                .iter()
+                .any(|opt| opt.aliases.contains(&option.as_str()))
+            {
+                return Err(anyhow::anyhow!(
+                    "Unknown option: {}. Available options: {:?}",
+                    option,
+                    command_metadata
+                        .options
+                        .iter()
+                        .flat_map(|opt| opt.aliases)
+                        .collect::<Vec<_>>()
+                ));
+            }
+        }
+        let parsed_options: Vec<ParsedOption> = all_options
+            .into_iter()
+            .map(|(option, value)| {
+                let option_metadata = command_metadata
+                    .options
+                    .iter()
+                    .find(|opt| opt.aliases.contains(&option.as_str()))
+                    .expect("Option metadata not found");
+                ParsedOption {
+                    metadata: option_metadata,
+                    value,
+                }
+            })
+            .collect();
+        Ok(ParseChainNode {
+            metadata: command_metadata,
+            parsed_options,
+        })
     }
-    let mut all_options: Vec<(&str, &str)> = Vec::new();
-    while let Some(token) = token_iterator.peek() {
-        if token.starts_with('-') || token.starts_with("--") {
-            let option = token_iterator.next().unwrap();
-            let option_value = token_iterator
-                .next()
-                .ok_or(anyhow::anyhow!("Expected value for option: {}", option))?;
-            all_options.push((option, option_value));
+}
+
+fn try_consume_options<'a>(
+    token_iterator: &mut Peekable<impl Iterator<Item = &'a str>>,
+) -> Vec<(String, String)> {
+    let mut potential_options: Vec<(String, String)> = Vec::new();
+    loop {
+        let current_token = match token_iterator.peek() {
+            Some(t) => *t,
+            None => {
+                break;
+            }
+        };
+        if current_token.starts_with('-') || current_token.starts_with("--") {
+            let option = token_iterator.next().unwrap(); // Consume the option token
+            let option_value = match token_iterator.next() {
+                Some(value) => value,
+                None => {
+                    break;
+                }
+            };
+            potential_options.push((option.to_string(), option_value.to_string()));
         } else {
             break; // No more options
         }
     }
-
-    // Validation checks
-    // Check if required options are present
-    for option_metadata in command_metadata.options {
-        if option_metadata.is_required
-            && !all_options
-                .iter()
-                .any(|(opt, _)| option_metadata.aliases.contains(&opt))
-        {
-            return Err(anyhow::anyhow!(
-                "Required option missing: {}",
-                option_metadata.aliases.join(", ")
-            ));
-        }
-    }
-    // Check if any option is provided that is not defined in the command metadata
-    for (option, _) in &all_options {
-        if !command_metadata
-            .options
-            .iter()
-            .any(|opt| opt.aliases.contains(&option))
-        {
-            return Err(anyhow::anyhow!(
-                "Unknown option: {}. Available options: {:?}",
-                option,
-                command_metadata
-                    .options
-                    .iter()
-                    .flat_map(|opt| opt.aliases)
-                    .collect::<Vec<_>>()
-            ));
-        }
-    }
-
-    let parsed_options: Vec<ParsedOption> = all_options
-        .into_iter()
-        .map(|(option, value)| {
-            let option_metadata = command_metadata
-                .options
-                .iter()
-                .find(|opt| opt.aliases.contains(&option))
-                .expect("Option metadata not found");
-            ParsedOption {
-                metadata: option_metadata,
-                value: value.to_string(),
-            }
-        })
-        .collect();
-
-    Ok(parsed_options)
+    return potential_options;
 }
 
-fn traverse_command_tree(input: &str) -> Result<(Vec<ParseChainNode>, Vec<String>)> {
+/// A best effort to traverse the command tree and parse the input.
+/// It does not return any errors, but instead returns a list of potential
+/// parse nodes and any remaining unparsed tokens.
+/// This is useful for command completion and help commands.
+pub fn try_traverse_command_tree(input: &str) -> (Vec<PotentialParseChainNode>, Vec<String>) {
     let mut parse_chain = Vec::new();
     let mut token_iterator = input
         .trim_start()
@@ -343,35 +370,55 @@ fn traverse_command_tree(input: &str) -> Result<(Vec<ParseChainNode>, Vec<String
         .peekable();
     let mut current_command_level = COMMAND_METADATA_LIST;
     loop {
-        let token = match token_iterator.next() {
-            Some(token) => token,
-            None => return Err(anyhow::anyhow!("No command provided")),
+        let current_token = match token_iterator.peek() {
+            Some(t) => *t,
+            None => {
+                break;
+            }
         };
         let command_metadata = match current_command_level.iter().find_map(|cmd| {
-            if cmd.aliases.contains(&token) {
+            if cmd.aliases.contains(&current_token) {
                 Some(cmd)
             } else {
                 None
             }
         }) {
             Some(cmd) => cmd,
-            None => return Err(anyhow::anyhow!("Unknown command: {}", token)),
+            None => break,
         };
-        let parsed_options = consume_options(&mut token_iterator, command_metadata)?;
-        parse_chain.push(ParseChainNode {
+        // At this stage we've mapped the current token to a command. Consume the token and move to the next level
+        token_iterator.next();
+        let potential_options = try_consume_options(&mut token_iterator);
+        parse_chain.push(PotentialParseChainNode {
             metadata: command_metadata,
-            parsed_options,
+            parsed_options: potential_options,
         });
-        if command_metadata.subcommands.is_empty() || token_iterator.peek().is_none() {
-            return Ok((
-                parse_chain,
-                token_iterator.map(String::from).collect::<Vec<String>>(),
-            ));
+        if command_metadata.subcommands.is_empty() {
+            // We've reached the end of the command tree
+            break;
         } else {
             // Traverse the command tree hierarchy
             current_command_level = command_metadata.subcommands;
         }
     }
+    return (
+        parse_chain,
+        token_iterator.map(String::from).collect::<Vec<String>>(),
+    );
+}
+
+fn validate_parse_chain(parse_chain: &[ParseChainNode]) -> Result<()> {
+    if parse_chain.is_empty() {
+        return Err(anyhow::anyhow!("Parse chain is empty"));
+    }
+    let terminal_parse_node = parse_chain.last().unwrap();
+    if !terminal_parse_node.metadata.subcommands.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Incomplete command: expected subcommand for '{}'",
+            terminal_parse_node.metadata.name
+        ));
+    }
+    Ok(())
 }
 
 /// Parse the command input and return a Command struct.
@@ -391,17 +438,22 @@ pub fn parse(input: &str) -> Result<Command> {
     };
     if first_token == "help" || first_token == "h" {
         return Ok(Command {
-            metadata: &HELP_COMMAND_METADATA,
+            parsed_nodes: vec![ParseChainNode {
+                metadata: &HELP_COMMAND_METADATA,
+                parsed_options: Vec::new(),
+            }],
             args: rest.trim().split_whitespace().map(String::from).collect(),
         });
     }
-    let (parse_chain, args) = traverse_command_tree(input)?;
-    let terminal_parse_node = parse_chain
-        .last()
-        .ok_or(anyhow::anyhow!("No command in parse chain"))?;
+    let (potential_parse_chain, remaining_args) = try_traverse_command_tree(input);
+    let parse_chain: Vec<ParseChainNode> = potential_parse_chain
+        .into_iter()
+        .map(|node| node.convert_to_parse_chain_node())
+        .collect::<Result<Vec<_>>>()?;
+    validate_parse_chain(&parse_chain)?;
     Ok(Command {
-        metadata: terminal_parse_node.metadata,
-        args,
+        parsed_nodes: parse_chain,
+        args: remaining_args,
     })
 }
 
@@ -468,7 +520,15 @@ pub fn get_completions(partial_command_string: &str) -> Vec<&'static str> {
 }
 
 pub fn get_description_for_help(help_command: &Command) -> Result<String> {
-    assert!(help_command.metadata.category == Some(Help));
+    assert!(
+        help_command
+            .parsed_nodes
+            .last()
+            .expect("No command in parse chain")
+            .metadata
+            .category
+            == Some(Help)
+    );
     if help_command.args.is_empty() {
         let mut description = String::from("Available commands:");
         for command in COMMAND_METADATA_LIST {
@@ -476,7 +536,7 @@ pub fn get_description_for_help(help_command: &Command) -> Result<String> {
         }
         return Ok(description);
     }
-    let (parse_chain, _) = traverse_command_tree(&help_command.args.join(" "))?;
+    let (parse_chain, _) = try_traverse_command_tree(&help_command.args.join(" "));
     let terminal_parse_node = parse_chain
         .last()
         .ok_or(anyhow::anyhow!("No command in parse chain"))?;
@@ -538,6 +598,9 @@ mod tests {
         assert_eq!(
             parse("reg r")
                 .expect("Unable to parse command")
+                .parsed_nodes
+                .last()
+                .expect("No command in parse chain")
                 .metadata
                 .category,
             Some(Register(RegisterCommandCategory::Read))
@@ -545,6 +608,9 @@ mod tests {
         assert_eq!(
             parse("reg w")
                 .expect("Unable to parse command")
+                .parsed_nodes
+                .last()
+                .expect("No command in parse chain")
                 .metadata
                 .category,
             Some(Register(RegisterCommandCategory::Write))
@@ -552,6 +618,9 @@ mod tests {
         assert_eq!(
             parse("run")
                 .expect("Unable to parse command")
+                .parsed_nodes
+                .last()
+                .expect("No command in parse chain")
                 .metadata
                 .category,
             Some(Run)
@@ -559,6 +628,9 @@ mod tests {
         assert_eq!(
             parse("continue")
                 .expect("Unable to parse command")
+                .parsed_nodes
+                .last()
+                .expect("No command in parse chain")
                 .metadata
                 .category,
             Some(Continue)
@@ -566,6 +638,9 @@ mod tests {
         assert_eq!(
             parse("q")
                 .expect("Unable to parse command")
+                .parsed_nodes
+                .last()
+                .expect("No command in parse chain")
                 .metadata
                 .category,
             Some(Exit)
@@ -573,6 +648,9 @@ mod tests {
         assert_eq!(
             parse("dco")
                 .expect("Unable to parse command")
+                .parsed_nodes
+                .last()
+                .expect("No command in parse chain")
                 .metadata
                 .category,
             Some(DumpChildOutput)
@@ -593,6 +671,9 @@ mod tests {
         assert_eq!(
             parse("help")
                 .expect("Unable to parse command")
+                .parsed_nodes
+                .last()
+                .expect("No command in parse chain")
                 .metadata
                 .category,
             Some(Help)
@@ -600,6 +681,9 @@ mod tests {
         assert_eq!(
             parse("help reg")
                 .expect("Unable to parse command")
+                .parsed_nodes
+                .last()
+                .expect("No command in parse chain")
                 .metadata
                 .name,
             "help"

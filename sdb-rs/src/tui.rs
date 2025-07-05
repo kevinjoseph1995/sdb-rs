@@ -32,17 +32,61 @@ impl Highlighter for CustomHelper {}
 impl Hinter for CustomHelper {
     type Hint = String;
     fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
-        if let Ok(command) = crate::command::parse(&line) {
-            if !command.metadata.options.is_empty() {
-                todo!("Handle options hinting");
-            }
-            if let Some(hint_list) = command.metadata.hint {
-                if command.args.len() < hint_list.len() && line.ends_with(char::is_whitespace) {
-                    return Some(hint_list[command.args.len()..].join(" ").to_string());
-                }
+        let (parse_nodes, remaining_tokens) = crate::command::try_traverse_command_tree(line);
+        if !remaining_tokens.is_empty() {
+            // If there are remaining tokens, we can't provide a hint
+            return None;
+        }
+        if let Some(last_char) = line.chars().last() {
+            if !last_char.is_whitespace() {
+                // If the last character is not whitespace, we can't provide a hint
+                return None;
             }
         }
-        None
+        let last_node = match parse_nodes.last() {
+            Some(n) => n,
+            None => return None,
+        };
+        // Option hinting
+        if last_node.metadata.options.len() > 0 {
+            // This command has options, so we can provide a hint
+            let specified_options = &last_node.parsed_options;
+            return Some(
+                last_node
+                    .metadata
+                    .options
+                    .iter()
+                    .filter(|option| {
+                        // Filter out options that are already specified
+                        !specified_options
+                            .iter()
+                            .any(|(option_name, _)| option.aliases.contains(&option_name.as_str()))
+                    })
+                    .map(|option| option.hint)
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            );
+        }
+        // If the command itself has any hint, return that
+        if let Some(hint_list) = last_node.metadata.hint {
+            if remaining_tokens.len() < hint_list.len() && line.ends_with(char::is_whitespace) {
+                return Some(hint_list[remaining_tokens.len()..].join(" ").to_string());
+            }
+        }
+        // Subcommand hinting
+        if last_node.metadata.subcommands.len() > 0 {
+            // This command has subcommands, so we can provide a hint
+            return Some(
+                last_node
+                    .metadata
+                    .subcommands
+                    .iter()
+                    .map(|subcommand| subcommand.name)
+                    .collect::<Vec<_>>()
+                    .join(" | "),
+            );
+        }
+        return None;
     }
 }
 
@@ -121,7 +165,11 @@ impl Application {
     }
 
     fn handle_command(&mut self, command: Command) -> Result<()> {
-        let category = command
+        let last_in_chain = command
+            .parsed_nodes
+            .last()
+            .expect("No command in parse chain");
+        let category = last_in_chain
             .metadata
             .category
             .expect("Command category should always be present");
@@ -150,20 +198,29 @@ impl Application {
                 Ok(())
             }
             CommandCategory::Help => self.handle_help_command(command),
-            CommandCategory::Register(cmd) => {
-                cmd.handle_command(command.metadata, command.args, &mut self.inferior_process)
-            }
-            CommandCategory::Breakpoint(cmd) => {
-                cmd.handle_command(&command.metadata, command.args, &mut self.inferior_process)
-            }
+            CommandCategory::Register(cmd) => cmd.handle_command(
+                last_in_chain.metadata,
+                command.args,
+                &mut self.inferior_process,
+            ),
+            CommandCategory::Breakpoint(cmd) => cmd.handle_command(
+                &last_in_chain.metadata,
+                command.args,
+                &mut self.inferior_process,
+            ),
             CommandCategory::Step => {
                 self.inferior_process.single_step()?;
                 Ok(())
             }
-            CommandCategory::Memory(cmd) => {
-                cmd.handle_command(&command.metadata, command.args, &mut self.inferior_process)
-            }
-            CommandCategory::Disassemble => todo!(),
+            CommandCategory::Memory(cmd) => cmd.handle_command(
+                &last_in_chain.metadata,
+                command.args,
+                &mut self.inferior_process,
+            ),
+            CommandCategory::Disassemble => crate::command::disassemble_command::handle_command(
+                &command,
+                &self.inferior_process,
+            ),
         }
     }
 
