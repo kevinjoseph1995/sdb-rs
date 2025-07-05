@@ -191,9 +191,12 @@ pub struct Command {
     pub args: Vec<String>,
 }
 
-/// Traverse the command tree to find the command metadata
-/// and return the remaining arguments.
-fn traverse_command_tree(input: &str) -> Result<(&'static CommandMetadata, Vec<String>)> {
+pub struct ParseChainNode {
+    pub metadata: &'static CommandMetadata,
+}
+
+fn traverse_command_tree(input: &str) -> Result<(Vec<ParseChainNode>, Vec<String>)> {
+    let mut parse_chain = Vec::new();
     let mut token_iterator = input
         .trim_start()
         .split_whitespace()
@@ -215,9 +218,10 @@ fn traverse_command_tree(input: &str) -> Result<(&'static CommandMetadata, Vec<S
             Some(cmd) => cmd,
             None => return Err(anyhow::anyhow!("Unknown command: {}", token)),
         };
+        parse_chain.push(ParseChainNode { metadata: command });
         if command.subcommands.is_empty() || token_iterator.peek().is_none() {
             return Ok((
-                command,
+                parse_chain,
                 token_iterator.map(String::from).collect::<Vec<String>>(),
             ));
         } else {
@@ -248,15 +252,12 @@ pub fn parse(input: &str) -> Result<Command> {
             args: rest.trim().split_whitespace().map(String::from).collect(),
         });
     }
-    let (command_metadata, args) = traverse_command_tree(input)?;
-    if !command_metadata.subcommands.is_empty() {
-        return Err(anyhow::anyhow!(
-            "Incomplete command: expected subcommand for '{}'",
-            command_metadata.name
-        ));
-    }
+    let (parse_chain, args) = traverse_command_tree(input)?;
+    let terminal_parse_node = parse_chain
+        .last()
+        .ok_or(anyhow::anyhow!("No command in parse chain"))?;
     Ok(Command {
-        metadata: command_metadata,
+        metadata: terminal_parse_node.metadata,
         args,
     })
 }
@@ -332,11 +333,17 @@ pub fn get_description_for_help(help_command: &Command) -> Result<String> {
         }
         return Ok(description);
     }
-    let (metadata, _) = traverse_command_tree(&help_command.args.join(" "))?;
-    let mut description = format!("{}: {}", metadata.name, metadata.description);
-    if !metadata.subcommands.is_empty() {
+    let (parse_chain, _) = traverse_command_tree(&help_command.args.join(" "))?;
+    let terminal_parse_node = parse_chain
+        .last()
+        .ok_or(anyhow::anyhow!("No command in parse chain"))?;
+    let mut description = format!(
+        "{}: {}",
+        terminal_parse_node.metadata.name, terminal_parse_node.metadata.description
+    );
+    if !terminal_parse_node.metadata.subcommands.is_empty() {
         description.push_str("\nAvailable sub-commands:");
-        for sub_command in metadata.subcommands {
+        for sub_command in terminal_parse_node.metadata.subcommands {
             description.push_str(&format!(
                 "\n  {}: {}",
                 sub_command.name, sub_command.description
