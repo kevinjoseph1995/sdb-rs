@@ -1,3 +1,4 @@
+use std::iter::Peekable;
 /////////////////////////////////////////
 use anyhow::{Ok, Result};
 /////////////////////////////////////////
@@ -12,6 +13,14 @@ use register_command::RegisterCommandCategory;
 /////////////////////////////////////////
 
 #[derive(Debug, Clone)]
+pub struct OptionMetadata {
+    pub aliases: &'static [&'static str],
+    pub is_required: bool,
+    pub description: &'static str,
+    pub hint: &'static str,
+}
+
+#[derive(Debug, Clone)]
 pub struct CommandMetadata {
     pub name: &'static str,
     pub aliases: &'static [&'static str],
@@ -19,16 +28,29 @@ pub struct CommandMetadata {
     pub subcommands: &'static [CommandMetadata],
     pub category: Option<CommandCategory>,
     pub hint: Option<&'static [&'static str]>,
+    pub options: &'static [OptionMetadata],
 }
 
 macro_rules! cmd {
-    ([$first_alias:expr $(, $alias:expr)*], $desc:expr, [$($sub:tt)*], $category:expr, $hint:expr) => {
+    ([$first_alias:expr $(, $alias:expr)*], $desc:expr, [$($sub:tt)*], $category:expr, $hint:expr, [$($opt:tt)*]) => {
         CommandMetadata {
             name: $first_alias,
             aliases: &[$first_alias $(, $alias)*],
             description: $desc,
             subcommands: &[$($sub)*],
             category: $category,
+            hint: $hint,
+            options: &[$($opt)*],
+        }
+    };
+}
+
+macro_rules! opt {
+    ([$first_alias:expr $(, $alias:expr)*], $desc:expr, $is_required:expr, $hint:expr) => {
+        OptionMetadata {
+            aliases: &[$first_alias $(, $alias)*],
+            is_required: $is_required,
+            description: $desc,
             hint: $hint,
         }
     };
@@ -45,26 +67,29 @@ pub enum CommandCategory {
     Help,
     Step,
     Memory(MemoryCommandCategory),
+    Disassemble,
 }
 
 use BreakpointCommandCategory::*;
 use CommandCategory::*;
 
 const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
-    cmd!(["r", "run"], "Run the program", [], Some(Run), None),
+    cmd!(["r", "run"], "Run the program", [], Some(Run), None, []),
     cmd!(
         ["c", "continue"],
         "Continue execution",
         [],
         Some(Continue),
-        None
+        None,
+        []
     ),
     cmd!(
         ["q", "quit", "exit"],
         "Exit the debugger",
         [],
         Some(Exit),
-        None
+        None,
+        []
     ),
     cmd!(
         ["reg", "register"],
@@ -75,25 +100,29 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 "Read registers. Usage: 'register read all' or 'register read <register_name>'",
                 [],
                 Some(Register(RegisterCommandCategory::Read)),
-                Some(&["<register_name>"])
+                Some(&["<register_name>"]),
+                []
             ),
             cmd!(
                 ["w", "write"],
                 "Write to registers",
                 [],
                 Some(Register(RegisterCommandCategory::Write)),
-                Some(&["<register_name>", "<value>"])
+                Some(&["<register_name>", "<value>"]),
+                []
             ),
         ],
         None,
-        None
+        None,
+        []
     ),
     cmd!(
         ["dco", "dump_child_output"],
         "Dump child process output",
         [],
         Some(DumpChildOutput),
-        None
+        None,
+        []
     ),
     cmd!(
         ["b", "breakpoint"],
@@ -104,53 +133,61 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 "List all breakpoints. Usage: 'breakpoint list'",
                 [],
                 Some(Breakpoint(List)),
-                None
+                None,
+                []
             ),
             cmd!(
                 ["i", "info"],
                 "Get information about a specific breakpoint. Usage: 'breakpoint info <breakpoint_id>'",
                 [],
                 Some(Breakpoint(Info)),
-                Some(&["<breakpoint_id>"])
+                Some(&["<breakpoint_id>"]),
+                []
             ),
             cmd!(
                 ["s", "set"],
                 "Set a new breakpoint. Usage: 'breakpoint set <address>'",
                 [],
                 Some(Breakpoint(Set)),
-                Some(&["<address in hex>"])
+                Some(&["<address in hex>"]),
+                []
             ),
             cmd!(
                 ["rm", "remove"],
                 "Remove a breakpoint. Usage: 'breakpoint remove <breakpoint_id>'",
                 [],
                 Some(Breakpoint(Remove)),
-                Some(&["<breakpoint_id>"])
+                Some(&["<breakpoint_id>"]),
+                []
             ),
             cmd!(
                 ["e", "enable"],
                 "Enable a breakpoint. Usage: 'breakpoint enable <breakpoint_id>'",
                 [],
                 Some(Breakpoint(Enable)),
-                Some(&["<breakpoint_id>"])
+                Some(&["<breakpoint_id>"]),
+                []
             ),
             cmd!(
                 ["d", "disable"],
                 "Disable a breakpoint. Usage: 'breakpoint disable <breakpoint_id>'",
                 [],
                 Some(Breakpoint(Disable)),
-                Some(&["<breakpoint_id>"])
+                Some(&["<breakpoint_id>"]),
+                []
             ),
         ],
         None,
-        None
+        None,
+        []
     ),
     cmd!(
         ["step", "s"],
         "Step over a single instruction",
         [],
         Some(Step),
-        None
+        None,
+        []
     ),
     cmd!(
         ["memory", "m"],
@@ -161,18 +198,42 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 "Read memory. Usage: 'memory read <address> [<size>]'",
                 [],
                 Some(Memory(MemoryCommandCategory::Read)),
-                Some(&["<address>", "[<size>]"])
+                Some(&["<address>", "[<size>]"]),
+                []
             ),
             cmd!(
                 ["w", "write"],
                 "Write to memory. Usage: 'memory write <address> [<value>, <value>...]'",
                 [],
                 Some(Memory(MemoryCommandCategory::Write)),
-                Some(&["<address>", "<byte_value1_in_hex> <byte_value2_in_hex> ..."])
+                Some(&["<address>", "<byte_value1_in_hex> <byte_value2_in_hex> ..."]),
+                []
             ),
         ],
         None,
-        None
+        None,
+        []
+    ),
+    cmd!(
+        ["disassemble", "d"],
+        "Disassemble instructions at a given address",
+        [],
+        Some(Disassemble),
+        None,
+        [
+            opt!(
+                ["-a", "--address"],
+                "Address to disassemble from",
+                true,
+                "-a <address> | --address <address> (in hex format)"
+            ),
+            opt!(
+                ["-n", "--number"],
+                "Number of instructions to disassemble",
+                true,
+                "-n <number> | --number <number> (default is 10)"
+            ),
+        ]
     ),
 ];
 
@@ -183,6 +244,7 @@ const HELP_COMMAND_METADATA: CommandMetadata = CommandMetadata {
     subcommands: &COMMAND_METADATA_LIST,
     category: Some(Help),
     hint: None,
+    options: &[],
 };
 
 #[derive(Debug, Clone)]
@@ -191,8 +253,85 @@ pub struct Command {
     pub args: Vec<String>,
 }
 
+pub struct ParsedOption {
+    pub metadata: &'static OptionMetadata,
+    pub value: String,
+}
+
 pub struct ParseChainNode {
     pub metadata: &'static CommandMetadata,
+    pub parsed_options: Vec<ParsedOption>,
+}
+
+fn consume_options<'a>(
+    token_iterator: &mut Peekable<impl Iterator<Item = &'a str>>,
+    command_metadata: &CommandMetadata,
+) -> Result<Vec<ParsedOption>> {
+    if command_metadata.options.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut all_options: Vec<(&str, &str)> = Vec::new();
+    while let Some(token) = token_iterator.peek() {
+        if token.starts_with('-') || token.starts_with("--") {
+            let option = token_iterator.next().unwrap();
+            let option_value = token_iterator
+                .next()
+                .ok_or(anyhow::anyhow!("Expected value for option: {}", option))?;
+            all_options.push((option, option_value));
+        } else {
+            break; // No more options
+        }
+    }
+
+    // Validation checks
+    // Check if required options are present
+    for option_metadata in command_metadata.options {
+        if option_metadata.is_required
+            && !all_options
+                .iter()
+                .any(|(opt, _)| option_metadata.aliases.contains(&opt))
+        {
+            return Err(anyhow::anyhow!(
+                "Required option missing: {}",
+                option_metadata.aliases.join(", ")
+            ));
+        }
+    }
+    // Check if any option is provided that is not defined in the command metadata
+    for (option, _) in &all_options {
+        if !command_metadata
+            .options
+            .iter()
+            .any(|opt| opt.aliases.contains(&option))
+        {
+            return Err(anyhow::anyhow!(
+                "Unknown option: {}. Available options: {:?}",
+                option,
+                command_metadata
+                    .options
+                    .iter()
+                    .flat_map(|opt| opt.aliases)
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    let parsed_options: Vec<ParsedOption> = all_options
+        .into_iter()
+        .map(|(option, value)| {
+            let option_metadata = command_metadata
+                .options
+                .iter()
+                .find(|opt| opt.aliases.contains(&option))
+                .expect("Option metadata not found");
+            ParsedOption {
+                metadata: option_metadata,
+                value: value.to_string(),
+            }
+        })
+        .collect();
+
+    Ok(parsed_options)
 }
 
 fn traverse_command_tree(input: &str) -> Result<(Vec<ParseChainNode>, Vec<String>)> {
@@ -208,7 +347,7 @@ fn traverse_command_tree(input: &str) -> Result<(Vec<ParseChainNode>, Vec<String
             Some(token) => token,
             None => return Err(anyhow::anyhow!("No command provided")),
         };
-        let command = match current_command_level.iter().find_map(|cmd| {
+        let command_metadata = match current_command_level.iter().find_map(|cmd| {
             if cmd.aliases.contains(&token) {
                 Some(cmd)
             } else {
@@ -218,15 +357,19 @@ fn traverse_command_tree(input: &str) -> Result<(Vec<ParseChainNode>, Vec<String
             Some(cmd) => cmd,
             None => return Err(anyhow::anyhow!("Unknown command: {}", token)),
         };
-        parse_chain.push(ParseChainNode { metadata: command });
-        if command.subcommands.is_empty() || token_iterator.peek().is_none() {
+        let parsed_options = consume_options(&mut token_iterator, command_metadata)?;
+        parse_chain.push(ParseChainNode {
+            metadata: command_metadata,
+            parsed_options,
+        });
+        if command_metadata.subcommands.is_empty() || token_iterator.peek().is_none() {
             return Ok((
                 parse_chain,
                 token_iterator.map(String::from).collect::<Vec<String>>(),
             ));
         } else {
             // Traverse the command tree hierarchy
-            current_command_level = command.subcommands;
+            current_command_level = command_metadata.subcommands;
         }
     }
 }
