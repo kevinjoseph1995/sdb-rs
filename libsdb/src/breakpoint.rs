@@ -116,6 +116,17 @@ pub trait StopPoint {
     fn get_data(&self) -> Option<u8>;
 }
 
+impl Drop for BreakpointSite {
+    fn drop(&mut self) {
+        if self.is_enabled {
+            // If the breakpoint is enabled, disable it before dropping
+            if let Err(e) = self.disable() {
+                eprintln!("Failed to disable breakpoint {}: {}", self.id, e);
+            }
+        }
+    }
+}
+
 impl StopPoint for BreakpointSite {
     fn enable(&mut self) -> Result<()> {
         if self.is_enabled {
