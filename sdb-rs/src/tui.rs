@@ -10,7 +10,7 @@ use rustyline::{
     history::DefaultHistory, validate::Validator,
 };
 /////////////////////////////////////////
-use crate::command::{Command, CommandCategory, get_completions, get_description_for_help};
+use crate::command::{self, Command, CommandCategory, get_completions, get_description_for_help};
 use libsdb::process::Process;
 /////////////////////////////////////////
 
@@ -167,6 +167,13 @@ impl Application {
                 println!("Unhandled wait status: {:?}", waitstatus);
             }
         }
+        if self.inferior_process.get_state() == libsdb::process::ProcessHandleState::Stopped {
+            command::disassemble_command::print_disassembly(
+                &self.inferior_process,
+                1,
+                self.inferior_process.get_pc().ok(),
+            )?;
+        }
         Ok(())
     }
 
@@ -216,6 +223,14 @@ impl Application {
             ),
             CommandCategory::Step => {
                 self.inferior_process.single_step()?;
+                if self.inferior_process.get_state() == libsdb::process::ProcessHandleState::Stopped
+                {
+                    command::disassemble_command::print_disassembly(
+                        &self.inferior_process,
+                        1,
+                        self.inferior_process.get_pc().ok(),
+                    )?;
+                }
                 Ok(())
             }
             CommandCategory::Memory(cmd) => {
@@ -238,10 +253,15 @@ impl Application {
         } else {
             println!("No history file found, starting fresh.");
         }
+        let mut last_line = String::new();
         while self.loop_running {
             let readline = rl.readline("(sdb) ");
             match readline {
-                Ok(line) => {
+                Ok(mut line) => {
+                    if line.trim().is_empty() {
+                        // If the line is empty, use the last line. This is useful for repeating the last command by pressing Enter.
+                        line = last_line;
+                    }
                     rl.add_history_entry(line.as_str())?;
                     match crate::command::parse(&line) {
                         Ok(command) => {
@@ -253,6 +273,7 @@ impl Application {
                             eprintln!("Error parsing command: {}", err);
                         }
                     }
+                    last_line = line; // Store the last line for potential reuse
                 }
                 Err(rustyline::error::ReadlineError::Interrupted) => {
                     self.inferior_process.stop_process()?;

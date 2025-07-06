@@ -112,6 +112,8 @@ pub trait StopPoint {
     fn in_range(&self, low: VirtAddress, high: VirtAddress) -> bool;
 
     fn is_at_address(&self, address: VirtAddress) -> bool;
+
+    fn get_data(&self) -> Option<u8>;
 }
 
 impl StopPoint for BreakpointSite {
@@ -173,6 +175,10 @@ impl StopPoint for BreakpointSite {
 
     fn get_id(&self) -> StopPointId {
         self.id
+    }
+
+    fn get_data(&self) -> Option<u8> {
+        self.saved_data
     }
 }
 
@@ -243,7 +249,9 @@ impl<T: StopPoint> StopPointCollection<T> {
 
     pub fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Result<()> {
         if let Some(pos) = self.stop_points.iter().position(|sp| sp.get_id() == id) {
-            let _ = self.stop_points.remove(pos);
+            let _ = {
+                self.stop_points.remove(pos);
+            };
             Ok(())
         } else {
             Err(anyhow::Error::msg(format!(
@@ -301,7 +309,13 @@ mod tests {
         let va = VirtAddress::new(0x1234);
         assert_eq!(va.next_page_boundary().address, 0x2000);
         assert_eq!(va.next_page_boundary().next_page_boundary().address, 0x3000);
-        assert_eq!(va.next_page_boundary().next_page_boundary().next_page_boundary().address, 0x4000);
+        assert_eq!(
+            va.next_page_boundary()
+                .next_page_boundary()
+                .next_page_boundary()
+                .address,
+            0x4000
+        );
         let va = VirtAddress::new(4095);
         assert_eq!(va.next_page_boundary().address, 4096);
         assert_eq!(va.next_page_boundary().next_page_boundary().address, 8192);

@@ -456,6 +456,10 @@ impl Process {
         Ok(())
     }
 
+    pub fn get_state(&self) -> ProcessHandleState {
+        self.state
+    }
+
     /// Reads the memory of the process being debugged.
     /// This function reads the memory of the process using the `process_vm_readv` system call.
     /// The memory is read in chunks that are page aligned.
@@ -491,6 +495,28 @@ impl Process {
         assert!(total_number_of_bytes_read <= num_bytes);
         buffer_to_return.resize(total_number_of_bytes_read, 0);
         Ok(buffer_to_return)
+    }
+
+    /// Reads the memory of the process being debugged. Filters all the int3 instructions
+    /// and replaces them with the original data from the breakpoint sites.
+    pub fn read_memory_without_breakpoint_traps(
+        &self,
+        start: VirtAddress,
+        num_bytes: usize,
+    ) -> Result<Vec<u8>> {
+        let mut bytes = self.read_memory(start, num_bytes)?;
+        for breakpoint in self.breakpoint_sites.iter() {
+            if breakpoint.is_enabled() {
+                let break_point_address = breakpoint.get_virtual_address();
+                if break_point_address >= start && break_point_address < start.add(num_bytes) {
+                    let offset = break_point_address.subtract(start.get()).get();
+                    bytes[offset] = breakpoint
+                        .get_data()
+                        .expect("Breakpoint data should be present");
+                }
+            }
+        }
+        Ok(bytes)
     }
 
     pub fn read_all_registers(&mut self) -> Result<()> {

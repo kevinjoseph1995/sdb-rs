@@ -4,6 +4,18 @@ use super::Command;
 use anyhow::{Ok, Result};
 use libsdb::{breakpoint::VirtAddress, process::Process};
 
+pub fn print_disassembly(
+    process: &Process,
+    number_of_instructions: usize,
+    address: Option<VirtAddress>,
+) -> Result<()> {
+    let instructions = libsdb::disassembler::disassemble(process, number_of_instructions, address)?;
+    for instruction in instructions {
+        println!("{}: {}", instruction.address, instruction.text);
+    }
+    Ok(())
+}
+
 pub fn handle_command(command: &Command, process: &Process) -> Result<()> {
     assert!(
         !command.parsed_nodes.is_empty(),
@@ -64,10 +76,6 @@ pub fn handle_command(command: &Command, process: &Process) -> Result<()> {
         }
         None => 10, // Default to 10 instructions if not specified
     };
-    let instructions =
-        libsdb::disassembler::disassemble(process, number_of_instructions, Some(address))?;
-    for instruction in instructions {
-        println!("{}: {}", instruction.address, instruction.text);
-    }
-    Ok(())
+
+    print_disassembly(process, number_of_instructions, Some(address))
 }

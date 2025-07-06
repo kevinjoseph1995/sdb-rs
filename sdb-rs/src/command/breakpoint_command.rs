@@ -115,6 +115,14 @@ impl BreakpointCommandCategory {
                         breakpoint_id
                     )));
                 }
+                let breakpoint = process
+                    .breakpoint_sites
+                    .get_stop_point_by_id_mut(breakpoint_id)
+                    .ok_or(anyhow::Error::msg(format!(
+                        "Breakpoint with ID {} not found.",
+                        breakpoint_id
+                    )))?;
+                breakpoint.disable()?;
                 process
                     .breakpoint_sites
                     .remove_stop_point_by_id(breakpoint_id)?;

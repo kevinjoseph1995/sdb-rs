@@ -66,7 +66,7 @@ pub fn disassemble(
     };
     const SIZE_OF_LARGEST_X64_INSTRUCTION: usize = 15;
     let code_bytes = process
-        .read_memory(
+        .read_memory_without_breakpoint_traps(
             address,
             SIZE_OF_LARGEST_X64_INSTRUCTION * number_of_instructions,
         )
