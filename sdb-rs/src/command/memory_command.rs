@@ -1,5 +1,3 @@
-use super::CommandHandler;
-use super::CommandMetadata;
 use anyhow::Result;
 use libsdb::breakpoint::VirtAddress;
 
@@ -9,11 +7,7 @@ pub enum MemoryCommandCategory {
     Write,
 }
 
-fn handle_read_command(
-    _metadata: &CommandMetadata,
-    args: Vec<String>,
-    process: &libsdb::process::Process,
-) -> Result<()> {
+fn handle_read_command(args: Vec<String>, process: &libsdb::process::Process) -> Result<()> {
     if args.len() > 2 {
         return Err(anyhow::anyhow!(format!(
             "Invalid number of arguments for read command: expected atleast 1, got {}. Usage: <address> [<size>]",
@@ -70,11 +64,7 @@ fn handle_read_command(
     Ok(())
 }
 
-fn handle_write_command(
-    _metadata: &CommandMetadata,
-    args: Vec<String>,
-    process: &mut libsdb::process::Process,
-) -> Result<()> {
+fn handle_write_command(args: Vec<String>, process: &mut libsdb::process::Process) -> Result<()> {
     if args.len() < 2 {
         return Err(anyhow::anyhow!(format!(
             "Invalid number of arguments for write command: expected at least 2, got {}. Usage: <address> <value> [<value>...]",
@@ -125,16 +115,15 @@ fn handle_write_command(
     Ok(())
 }
 
-impl CommandHandler for MemoryCommandCategory {
-    fn handle_command(
+impl MemoryCommandCategory {
+    pub fn handle_command(
         &self,
-        metadata: &CommandMetadata,
         args: Vec<String>,
         process: &mut libsdb::process::Process,
     ) -> Result<()> {
         match self {
-            MemoryCommandCategory::Read => handle_read_command(metadata, args, process),
-            MemoryCommandCategory::Write => handle_write_command(metadata, args, process),
+            MemoryCommandCategory::Read => handle_read_command(args, process),
+            MemoryCommandCategory::Write => handle_write_command(args, process),
         }
     }
 }

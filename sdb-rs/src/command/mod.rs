@@ -9,7 +9,6 @@ pub mod memory_command;
 pub mod register_command;
 /////////////////////////////////////////
 use breakpoint_command::BreakpointCommandCategory;
-use libsdb::process::Process;
 use memory_command::MemoryCommandCategory;
 use register_command::RegisterCommandCategory;
 /////////////////////////////////////////
@@ -556,15 +555,6 @@ pub fn get_description_for_help(help_command: &Command) -> Result<String> {
     return Ok(description);
 }
 
-pub trait CommandHandler {
-    fn handle_command(
-        &self,
-        metadata: &CommandMetadata,
-        args: Vec<String>,
-        process: &mut Process,
-    ) -> Result<()>;
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -762,5 +752,32 @@ mod tests {
             assert!(!description.contains("Available commands:"));
             assert!(!description.contains("Available sub-commands:"));
         }
+    }
+
+    fn validate_options_at_level(cmd: &[CommandMetadata]) {
+        let mut options_at_level = std::collections::HashSet::new();
+        for command in cmd {
+            for option in command.options {
+                for option_alias in option.aliases {
+                    assert!(
+                        options_at_level.insert(option_alias),
+                        "Duplicate option alias found: {}",
+                        option_alias
+                    );
+                    assert!(!option_alias.is_empty(), "Option alias cannot be empty");
+                    assert!(
+                        option_alias.starts_with('-') || option_alias.starts_with("--"),
+                        "Option alias must start with '-' or '--': {}",
+                        option_alias
+                    );
+                }
+            }
+            validate_level(command.subcommands);
+        }
+    }
+
+    #[test]
+    fn test_options_at_all_levels() {
+        validate_options_at_level(&[HELP_COMMAND_METADATA]);
     }
 }

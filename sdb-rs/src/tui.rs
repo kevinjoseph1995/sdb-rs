@@ -1,7 +1,8 @@
 /////////////////////////////////////////
-use std::path::PathBuf;
+use std::{borrow::Cow, path::PathBuf};
 /////////////////////////////////////////
 use anyhow::Result;
+use colored::Colorize;
 use ctrlc::Signal;
 use nix::sys::wait::WaitStatus;
 use rustyline::{
@@ -9,9 +10,7 @@ use rustyline::{
     history::DefaultHistory, validate::Validator,
 };
 /////////////////////////////////////////
-use crate::command::{
-    Command, CommandCategory, CommandHandler, get_completions, get_description_for_help,
-};
+use crate::command::{Command, CommandCategory, get_completions, get_description_for_help};
 use libsdb::process::Process;
 /////////////////////////////////////////
 
@@ -27,7 +26,14 @@ struct CustomHelper {
 
 impl Validator for CustomHelper {}
 
-impl Highlighter for CustomHelper {}
+impl Highlighter for CustomHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> Cow<'h, str> {
+        // Highlight the hint with ANSI color
+        // Detect if the the terminal supports colors
+        let colorized = hint.blue();
+        Cow::Owned(colorized.to_string())
+    }
+}
 
 impl Hinter for CustomHelper {
     type Hint = String;
@@ -212,11 +218,9 @@ impl Application {
                 self.inferior_process.single_step()?;
                 Ok(())
             }
-            CommandCategory::Memory(cmd) => cmd.handle_command(
-                &last_in_chain.metadata,
-                command.args,
-                &mut self.inferior_process,
-            ),
+            CommandCategory::Memory(cmd) => {
+                cmd.handle_command(command.args, &mut self.inferior_process)
+            }
             CommandCategory::Disassemble => crate::command::disassemble_command::handle_command(
                 &command,
                 &self.inferior_process,
