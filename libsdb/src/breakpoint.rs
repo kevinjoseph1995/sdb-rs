@@ -10,6 +10,12 @@ pub struct VirtAddress {
     address: usize,
 }
 
+pub enum StopPointMode {
+    ReadWrite,
+    Write,
+    Execute,
+}
+
 impl VirtAddress {
     pub fn new(address: usize) -> Self {
         VirtAddress { address }

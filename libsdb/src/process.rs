@@ -24,6 +24,8 @@ use nix::unistd::fork;
 use crate::breakpoint::BreakpointSite;
 use crate::breakpoint::StopPoint;
 use crate::breakpoint::StopPointCollection;
+use crate::breakpoint::StopPointId;
+use crate::breakpoint::StopPointMode;
 use crate::breakpoint::VirtAddress;
 use crate::pipe_channel;
 use crate::register_info;
@@ -590,6 +592,152 @@ impl Process {
         self.breakpoint_sites
             .push_and_return_mut_ref(BreakpointSite::new(address, self.pid))
             .ok_or_else(|| anyhow!("Failed to create breakpoint site at address: {}", address))
+    }
+
+    fn find_free_stop_point_register(control: u64) -> Result<u32> {
+        // Check the control register to find a free debug register.
+        /*
+        Bit 0 Local DR0 breakpoint enabled
+        Bit 1 Global DR0 breakpoint enabled
+        --------------------------------
+        Bit 2 Local DR1 breakpoint enabled
+        Bit 3 Global DR1 breakpoint enabled
+        --------------------------------
+        Bit 4 Local DR2 breakpoint enabled
+        Bit 5 Global DR2 breakpoint enabled
+        --------------------------------
+        Bit 6 Local DR3 breakpoint enabled
+        Bit 7 Global DR3 breakpoint enabled
+        --------------------------------
+        ...
+        ...
+        ...
+         */
+        for i in 0..4u32 {
+            if (control & (0b11 << (i * 2))) == 0 {
+                return Ok(i);
+            }
+        }
+        Err(anyhow!("No free debug registers available"))
+    }
+
+    fn encode_mode_flag(mode: StopPointMode) -> u64 {
+        match mode {
+            StopPointMode::Write => 0b01,     // Write access
+            StopPointMode::ReadWrite => 0b11, // Read and write access
+            StopPointMode::Execute => 0b00,   // Execute access
+        }
+    }
+
+    fn encode_size_flag(size: usize) -> u64 {
+        match size {
+            1 => 0b00, // 1 byte
+            2 => 0b01, // 2 bytes
+            4 => 0b11, // 4 bytes
+            8 => 0b10, // 8 bytes
+            _ => panic!("Invalid size for hardware stop point: {}", size),
+        }
+    }
+
+    /// Sets a hardware stop point at the specified address with the given size and mode.
+    /// This function finds a free debug register, writes the address to it, and encodes
+    /// the stop point mode and size into the control register.
+    /// Returns the index of the debug register used for the stop point.
+    pub fn set_hardware_stoppoint(
+        &mut self,
+        address: VirtAddress,
+        size: usize,
+        mode: StopPointMode,
+    ) -> Result<u32> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to set hardware stop point"
+        );
+        /*
+               https://wiki.osdev.org/CPU_Registers_x86-64#DR7
+               Bit	Description
+               0	Local DR0 Breakpoint
+               1	Global DR0 Breakpoint
+               2	Local DR1 Breakpoint
+               3	Global DR1 Breakpoint
+               4	Local DR2 Breakpoint
+               5	Global DR2 Breakpoint
+               6	Local DR3 Breakpoint
+               7	Global DR3 Breakpoint
+               16-17	Conditions for DR0
+               18-19	Size of DR0 Breakpoint
+               20-21	Conditions for DR1
+               22-23	Size of DR1 Breakpoint
+               24-25	Conditions for DR2
+               26-27	Size of DR2 Breakpoint
+               28-29	Conditions for DR3
+               30-31	Size of DR3 Breakpoint
+        */
+        // Step 1: Find a free space among the DR registers for the new stop point by locating one that isn’t yet enabled.
+        let control: u64 = match self
+            .registers
+            .get_register_value(register_info::RegisterId::dr(7))?
+        {
+            RegisterValue::U64(value) => value,
+            _ => panic!("Unexpected register value type for DR7"),
+        };
+        let free_register_index = Self::find_free_stop_point_register(control)
+            .context("Failed to find free debug register")?;
+        assert!(
+            free_register_index < 4,
+            "Free register index out of bounds: {}",
+            free_register_index
+        );
+
+        // Step 2: Write the desired address to the correct DR register.
+        let debug_register_id = register_info::RegisterId::dr(free_register_index as u32);
+        self.write_register_value(debug_register_id, RegisterValue::U64(address.get() as u64))
+            .context("Failed to write debug register value")?;
+
+        // Step 3: Encode the stop point mode and size into the form expected by the control register.
+        let mode_flag = Self::encode_mode_flag(mode);
+        let size_flag = Self::encode_size_flag(size);
+        let enable_bit = 0b1u64 << (free_register_index * 2);
+        let mode_bits = mode_flag << (free_register_index * 4 + 16);
+        let size_bits = size_flag << (free_register_index * 4 + 18);
+        let clear_mask = (0b11u64 << (free_register_index * 2)) | // Clear the bits for the free register
+                         (0b1111u64 << (free_register_index * 4 + 16)); // Clear the mode and byte bits
+        let masked = control & !clear_mask; // Clear the bits for the free register and mode bits
+        let masked = masked | enable_bit | mode_bits | size_bits; // Set the bits for the free register and mode bits
+        self.write_register_value(register_info::RegisterId::dr(7), RegisterValue::U64(masked))
+            .context("Failed to write control register value")?;
+        // Step 4: Return the index of the debug register used for the stop point.
+        Ok(free_register_index)
+    }
+
+    /// Clears the hardware stop point at the specified index.
+    /// This function clears the bits for the specified debug register in the control register.
+    /// The index should be in the range of 0 to 3, corresponding to DR0 to DR3.
+    /// Returns a Result indicating success or failure.
+    pub fn clear_hardware_stoppoint(&mut self, index: u32) -> Result<()> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to clear hardware stop point"
+        );
+        assert!(
+            index < 4,
+            "Index out of bounds for hardware stop point: {}",
+            index
+        );
+        // Clear the bits for the specified debug register in the control register.
+        let control: u64 = match self
+            .registers
+            .get_register_value(register_info::RegisterId::dr(7))?
+        {
+            RegisterValue::U64(value) => value,
+            _ => panic!("Unexpected register value type for DR7"),
+        };
+        let clear_mask = 0b11u64 << (index * 2) |// Clear the bits for the specified debug register 
+                            0b1111u64 << (index * 4 + 16); // Clear the mode and byte size bits
+        let masked = control & !clear_mask; // Clear the bits for the specified debug register and mode bits
+        self.write_register_value(register_info::RegisterId::dr(7), RegisterValue::U64(masked))
+            .context("Failed to clear hardware stop point")?;
+        Ok(())
     }
 }
 
