@@ -25,12 +25,6 @@ impl VirtAddress {
         self.address
     }
 
-    pub fn subtract(self, offset: usize) -> Self {
-        VirtAddress {
-            address: self.address - offset,
-        }
-    }
-
     /// Returns the next page boundary address after this address.
     /// Example 4095 -> 4096
     /// Example 4096 -> 8192
@@ -42,11 +36,29 @@ impl VirtAddress {
             address: (self.address + PAGE_SIZE) & !0xFFF,
         }
     }
+}
 
-    pub fn add(self, offset: usize) -> Self {
-        VirtAddress {
-            address: self.address + offset,
-        }
+impl std::ops::Add<VirtAddress> for VirtAddress {
+    type Output = Self;
+
+    fn add(self, rhs: VirtAddress) -> Self::Output {
+        VirtAddress::new(self.address + rhs.address)
+    }
+}
+
+impl std::ops::Add<usize> for VirtAddress {
+    type Output = VirtAddress;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        VirtAddress::new(self.address + rhs)
+    }
+}
+
+impl std::ops::Sub<VirtAddress> for VirtAddress {
+    type Output = Self;
+
+    fn sub(self, rhs: VirtAddress) -> Self::Output {
+        VirtAddress::new(self.address - rhs.address)
     }
 }
 

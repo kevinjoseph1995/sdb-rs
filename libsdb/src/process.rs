@@ -24,12 +24,12 @@ use nix::unistd::fork;
 use crate::breakpoint::BreakpointSite;
 use crate::breakpoint::StopPoint;
 use crate::breakpoint::StopPointCollection;
-use crate::breakpoint::StopPointId;
 use crate::breakpoint::StopPointMode;
 use crate::breakpoint::VirtAddress;
 use crate::pipe_channel;
 use crate::register_info;
 use crate::register_info::RegisterFormat;
+
 use crate::register_info::RegisterInfo;
 use crate::register_info::RegisterType;
 use crate::register_info::RegisterValue;
@@ -318,7 +318,7 @@ impl Process {
         }
         if let WaitStatus::Stopped(_, Signal::SIGTRAP) = waitstatus {
             // When the process stops due to a SIGTRAP, it is likely due to a breakpoint or single-step.
-            let instruction_begin = self.get_pc()?.subtract(1);
+            let instruction_begin = self.get_pc()? - VirtAddress::new(1usize);
             if self
                 .breakpoint_sites
                 .is_enabled_at_address(instruction_begin)
@@ -439,7 +439,7 @@ impl Process {
                     chunk
                 } else {
                     let mut chunk = [0u8; 8];
-                    let read_memory = self.read_memory(start.add(written), 8)?;
+                    let read_memory = self.read_memory(start + written, 8)?;
                     chunk.copy_from_slice(&read_memory[0..8]); // Copy the existing memory to the chunk
                     chunk[0..remaining_bytes.len()].copy_from_slice(remaining_bytes); // Copy the new data to the first part
                     chunk
@@ -447,7 +447,7 @@ impl Process {
             };
             ptrace::write(
                 self.pid,
-                start.add(written).get() as *mut std::ffi::c_void,
+                (start + written).get() as *mut std::ffi::c_void,
                 i64::from_le_bytes(eight_byte_chunk),
             )
             .context("Failed to write memory")?;
@@ -476,13 +476,12 @@ impl Process {
             let mut num_bytes = num_bytes;
             while num_bytes > 0 {
                 let next_page_boundary = start.next_page_boundary();
-                let chunk_size =
-                    std::cmp::min(num_bytes, next_page_boundary.subtract(start.get()).get());
+                let chunk_size = std::cmp::min(num_bytes, (next_page_boundary - start).get());
                 remote_iovs.push(RemoteIoVec {
                     base: start.get(),
                     len: chunk_size,
                 });
-                start = start.add(chunk_size);
+                start = start + chunk_size;
                 num_bytes -= chunk_size;
             }
             remote_iovs
@@ -510,9 +509,9 @@ impl Process {
         for breakpoint in self.breakpoint_sites.iter() {
             if breakpoint.is_enabled() {
                 let break_point_address = breakpoint.get_virtual_address();
-                if break_point_address >= start && break_point_address < start.add(num_bytes) {
-                    let offset = break_point_address.subtract(start.get()).get();
-                    bytes[offset] = breakpoint
+                if break_point_address >= start && break_point_address < start + num_bytes {
+                    let offset = break_point_address - start;
+                    bytes[offset.get()] = breakpoint
                         .get_data()
                         .expect("Breakpoint data should be present");
                 }

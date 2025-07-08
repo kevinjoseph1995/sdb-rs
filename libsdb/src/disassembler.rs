@@ -30,9 +30,7 @@ mod detail {
                 }
             };
             instructions.push(Instruction {
-                address: start_offset
-                    .unwrap_or(VirtAddress::from(0))
-                    .add(instr_offset as usize),
+                address: start_offset.unwrap_or(VirtAddress::from(0)) + (instr_offset as usize),
                 text: instruction.to_string(),
             });
         }
