@@ -2,7 +2,7 @@
 use anyhow::{Context, Result};
 use zydis::VisibleOperands;
 /////////////////////////////////////////
-use crate::{breakpoint::VirtAddress, process::Process};
+use crate::{process::Process, process::VirtAddress};
 /////////////////////////////////////////
 
 #[derive(Debug)]

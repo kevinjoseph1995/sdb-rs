@@ -1,4 +1,3 @@
-pub mod breakpoint;
 pub mod disassembler;
 pub mod pipe_channel;
 pub mod process;

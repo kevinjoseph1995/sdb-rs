@@ -2,10 +2,7 @@
 use anyhow::{Context, Ok, Result};
 /////////////////////////////////////////
 use super::CommandMetadata;
-use libsdb::{
-    breakpoint::{self, StopPoint},
-    process::Process,
-};
+use libsdb::process::{BreakPointCollection, Process, VirtAddress};
 /////////////////////////////////////////
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -91,8 +88,7 @@ impl BreakpointCommandCategory {
                         err, args[0]
                     ))
                 })?;
-                let breakpoint =
-                    process.create_breakpoint_site(breakpoint::VirtAddress::from(address))?;
+                let breakpoint = process.create_breakpoint_site(VirtAddress::from(address))?;
                 breakpoint.enable()?;
                 println!(
                     "Breakpoint set at address: {}, ID: {}",

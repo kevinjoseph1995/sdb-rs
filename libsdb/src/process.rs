@@ -1,9 +1,11 @@
 /////////////////////////////////////////
 use std::ffi::CString;
+use std::fmt::Display;
 use std::path::PathBuf;
 /////////////////////////////////////////
 use anyhow::{Context, Result, anyhow};
 use core::panic;
+use libc::c_long;
 use libc::personality;
 use libc::user;
 use nix::errno::Errno;
@@ -21,15 +23,9 @@ use nix::unistd::dup2_stdout;
 use nix::unistd::execvp;
 use nix::unistd::fork;
 /////////////////////////////////////////
-use crate::breakpoint::BreakpointSite;
-use crate::breakpoint::StopPoint;
-use crate::breakpoint::StopPointCollection;
-use crate::breakpoint::StopPointMode;
-use crate::breakpoint::VirtAddress;
 use crate::pipe_channel;
 use crate::register_info;
 use crate::register_info::RegisterFormat;
-
 use crate::register_info::RegisterInfo;
 use crate::register_info::RegisterType;
 use crate::register_info::RegisterValue;
@@ -69,82 +65,6 @@ impl From<char> for ProcessState {
     }
 }
 
-pub struct Registers {
-    data: user,
-}
-
-impl Registers {
-    fn new() -> Self {
-        Registers {
-            // Safety: This is safe because we are initializing the `user` struct to zero.
-            // The `user` struct is used to hold the registers and is expected to be zeroed out before use.
-            data: { unsafe { std::mem::zeroed::<libc::user>() } },
-        }
-    }
-
-    fn set_register_value(
-        &mut self,
-        register_info: &'static RegisterInfo,
-        value: RegisterValue,
-    ) -> Result<()> {
-        let payload_size = value.get_payload_size_in_bytes();
-        if payload_size <= register_info.size {
-            let value_widened = value.widen_to_fixed_buffer(&register_info);
-            let structure_bytes = register_info::as_mutable_bytes_of_struct::<user>(&mut self.data);
-            value_widened[0..register_info.size]
-                .iter()
-                .enumerate()
-                .for_each(|(i, &byte)| {
-                    structure_bytes[register_info.offset as usize + i] = byte;
-                });
-        } else {
-            panic!(
-                "Register value size {} exceeds register info size {}",
-                payload_size, register_info.size
-            );
-        }
-        Ok(())
-    }
-
-    /// Load a register’s value from `self.data` and wrap it in the right enum variant.
-    pub fn get_register_value(&self, id: register_info::RegisterId) -> Result<RegisterValue> {
-        let info = register_info::get_register_info(id)
-            .ok_or_else(|| anyhow!("unknown register {:?}", id))?;
-        let off = info.offset as usize;
-
-        // ↓ one-liner to avoid writing the same call 9×
-        macro_rules! load {
-            ($ty:ty) => {
-                register_info::coerce_bytes_of_struct_to_type_at_offset::<user, $ty>(
-                    &self.data, off,
-                )
-            };
-        }
-
-        use RegisterFormat::*;
-
-        Ok(match (info.reg_format, info.size) {
-            // ───── unsigned integers ─────
-            (UnsignedInt, 1) => RegisterValue::U8(load!(u8)?),
-            (UnsignedInt, 2) => RegisterValue::U16(load!(u16)?),
-            (UnsignedInt, 4) => RegisterValue::U32(load!(u32)?),
-            (UnsignedInt, 8) => RegisterValue::U64(load!(u64)?),
-
-            // ───── floating-point ─────
-            (DoubleFloat, 4) => RegisterValue::F32(load!(f32)?),
-            (DoubleFloat, 8) => RegisterValue::F64(load!(f64)?),
-            (LongDouble, 16) => RegisterValue::LongDouble(load!([u8; 16])?),
-
-            // ───── vectors ─────
-            (Vector, 8) => RegisterValue::Byte64(load!([u8; 8])?),
-            (Vector, 16) => RegisterValue::Byte128(load!([u8; 16])?),
-
-            // ───── anything else ─────
-            (fmt, sz) => anyhow::bail!("unsupported register: {:?} ({} bytes)", fmt, sz),
-        })
-    }
-}
-
 pub struct Process {
     pub pid: Pid,
     terminate_on_end: bool,
@@ -152,7 +72,7 @@ pub struct Process {
     read_port: Option<pipe_channel::ReadPort>,
     is_attached: bool,
     registers: Registers,
-    pub breakpoint_sites: StopPointCollection<BreakpointSite>,
+    pub breakpoint_sites: Vec<BreakpointSite>,
 }
 
 impl Process {
@@ -166,7 +86,7 @@ impl Process {
             read_port: None,
             is_attached: true,
             registers: Registers::new(),
-            breakpoint_sites: StopPointCollection::<BreakpointSite>::new(),
+            breakpoint_sites: Vec::new(),
         };
         let _stop_reason = child_process_handle.wait_on_signal(None)?;
         Ok(child_process_handle)
@@ -192,7 +112,7 @@ impl Process {
                     read_port: None,
                     is_attached: debug_process_being_launched,
                     registers: Registers::new(),
-                    breakpoint_sites: StopPointCollection::<BreakpointSite>::new(),
+                    breakpoint_sites: Vec::new(),
                 };
                 println!("Launching process with PID: {}", child_process_handle.pid);
                 if debug_process_being_launched {
@@ -363,7 +283,7 @@ impl Process {
             .breakpoint_sites
             .get_stop_point_index_by_address(program_counter)
         {
-            let breakpoint = &mut self.breakpoint_sites.stop_points[breakpoint_site_index];
+            let breakpoint = &mut self.breakpoint_sites[breakpoint_site_index];
             if breakpoint.is_enabled() {
                 // If the breakpoint is enabled at the instruction address, we need to disable it before single stepping.
                 breakpoint.disable()?;
@@ -374,7 +294,7 @@ impl Process {
         let reason = self.wait_on_signal(None)?;
         // Re-enable the breakpoint if it was enabled before the single step.
         if let Some(breakpoint_site_index) = breakpoint_to_reenable {
-            let breakpoint = &mut self.breakpoint_sites.stop_points[breakpoint_site_index];
+            let breakpoint = &mut self.breakpoint_sites[breakpoint_site_index];
             breakpoint.enable()?;
         }
         Ok(reason)
@@ -833,4 +753,390 @@ pub fn get_process_state(pid: Pid) -> Result<ProcessState> {
         .nth(index_of_state_char)
         .ok_or_else(|| anyhow!("Failed to find state character in /proc file"))?;
     Ok(ProcessState::from(state_char))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtAddress {
+    address: usize,
+}
+
+pub enum StopPointMode {
+    ReadWrite,
+    Write,
+    Execute,
+}
+
+impl VirtAddress {
+    pub fn new(address: usize) -> Self {
+        VirtAddress { address }
+    }
+
+    pub fn get(self) -> usize {
+        self.address
+    }
+
+    /// Returns the next page boundary address after this address.
+    /// Example 4095 -> 4096
+    /// Example 4096 -> 8192
+    /// Example 8192 -> 12288
+    /// Example 0 -> 4096
+    pub fn next_page_boundary(&self) -> Self {
+        const PAGE_SIZE: usize = 0x1000; // Assume 4 KiB page size
+        VirtAddress {
+            address: (self.address + PAGE_SIZE) & !0xFFF,
+        }
+    }
+}
+
+impl std::ops::Add<VirtAddress> for VirtAddress {
+    type Output = Self;
+
+    fn add(self, rhs: VirtAddress) -> Self::Output {
+        VirtAddress::new(self.address + rhs.address)
+    }
+}
+
+impl std::ops::Add<usize> for VirtAddress {
+    type Output = VirtAddress;
+
+    fn add(self, rhs: usize) -> Self::Output {
+        VirtAddress::new(self.address + rhs)
+    }
+}
+
+impl std::ops::Sub<VirtAddress> for VirtAddress {
+    type Output = Self;
+
+    fn sub(self, rhs: VirtAddress) -> Self::Output {
+        VirtAddress::new(self.address - rhs.address)
+    }
+}
+
+impl PartialOrd for VirtAddress {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.address.partial_cmp(&other.address)
+    }
+}
+
+impl Display for VirtAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "0x{:x}", self.address)
+    }
+}
+
+impl From<usize> for VirtAddress {
+    fn from(address: usize) -> Self {
+        VirtAddress::new(address)
+    }
+}
+
+impl Into<usize> for VirtAddress {
+    fn into(self) -> usize {
+        self.address
+    }
+}
+
+pub struct Registers {
+    data: user,
+}
+
+impl Registers {
+    fn new() -> Self {
+        Registers {
+            // Safety: This is safe because we are initializing the `user` struct to zero.
+            // The `user` struct is used to hold the registers and is expected to be zeroed out before use.
+            data: { unsafe { std::mem::zeroed::<libc::user>() } },
+        }
+    }
+
+    fn set_register_value(
+        &mut self,
+        register_info: &'static RegisterInfo,
+        value: RegisterValue,
+    ) -> Result<()> {
+        let payload_size = value.get_payload_size_in_bytes();
+        if payload_size <= register_info.size {
+            let value_widened = value.widen_to_fixed_buffer(&register_info);
+            let structure_bytes = register_info::as_mutable_bytes_of_struct::<user>(&mut self.data);
+            value_widened[0..register_info.size]
+                .iter()
+                .enumerate()
+                .for_each(|(i, &byte)| {
+                    structure_bytes[register_info.offset as usize + i] = byte;
+                });
+        } else {
+            panic!(
+                "Register value size {} exceeds register info size {}",
+                payload_size, register_info.size
+            );
+        }
+        Ok(())
+    }
+
+    /// Load a register’s value from `self.data` and wrap it in the right enum variant.
+    pub fn get_register_value(&self, id: register_info::RegisterId) -> Result<RegisterValue> {
+        let info = register_info::get_register_info(id)
+            .ok_or_else(|| anyhow!("unknown register {:?}", id))?;
+        let off = info.offset as usize;
+
+        // ↓ one-liner to avoid writing the same call 9×
+        macro_rules! load {
+            ($ty:ty) => {
+                register_info::coerce_bytes_of_struct_to_type_at_offset::<user, $ty>(
+                    &self.data, off,
+                )
+            };
+        }
+
+        use RegisterFormat::*;
+
+        Ok(match (info.reg_format, info.size) {
+            // ───── unsigned integers ─────
+            (UnsignedInt, 1) => RegisterValue::U8(load!(u8)?),
+            (UnsignedInt, 2) => RegisterValue::U16(load!(u16)?),
+            (UnsignedInt, 4) => RegisterValue::U32(load!(u32)?),
+            (UnsignedInt, 8) => RegisterValue::U64(load!(u64)?),
+
+            // ───── floating-point ─────
+            (DoubleFloat, 4) => RegisterValue::F32(load!(f32)?),
+            (DoubleFloat, 8) => RegisterValue::F64(load!(f64)?),
+            (LongDouble, 16) => RegisterValue::LongDouble(load!([u8; 16])?),
+
+            // ───── vectors ─────
+            (Vector, 8) => RegisterValue::Byte64(load!([u8; 8])?),
+            (Vector, 16) => RegisterValue::Byte128(load!([u8; 16])?),
+
+            // ───── anything else ─────
+            (fmt, sz) => anyhow::bail!("unsupported register: {:?} ({} bytes)", fmt, sz),
+        })
+    }
+}
+
+pub type StopPointId = i32;
+
+#[derive(Debug, Copy, Clone)]
+pub struct BreakpointSite {
+    id: StopPointId,
+    is_enabled: bool,
+    virtual_address: VirtAddress,
+    saved_data: Option<u8>,
+    pid: Pid,
+}
+
+impl BreakpointSite {
+    fn get_next_id() -> StopPointId {
+        static NEXT_ID: std::sync::Mutex<StopPointId> = std::sync::Mutex::new(0);
+        let mut id = NEXT_ID.lock().unwrap();
+        let next_id = *id;
+        *id += 1;
+        next_id
+    }
+
+    fn new(virtual_address: VirtAddress, pid: Pid) -> Self {
+        BreakpointSite {
+            id: BreakpointSite::get_next_id(),
+            is_enabled: false,
+            virtual_address,
+            saved_data: None,
+            pid,
+        }
+    }
+
+    pub fn enable(&mut self) -> Result<()> {
+        if self.is_enabled {
+            return Ok(());
+        }
+        // Read a word from the process memory at the breakpoint address
+        let data = nix::sys::ptrace::read(self.pid, self.virtual_address.address as *mut _)
+            .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
+        self.saved_data = Some((data as u64 & 0xFFu64) as u8);
+        const INT3: u8 = 0xCC; // Breakpoint instruction
+        let data_with_int3: u64 = (data as u64 & !0xFFu64) | INT3 as u64;
+        // Write the breakpoint instruction to the process memory
+        nix::sys::ptrace::write(
+            self.pid,
+            self.virtual_address.address as *mut _,
+            data_with_int3 as c_long,
+        )
+        .context("Failed to write memory")?;
+        self.is_enabled = true;
+        Ok(())
+    }
+
+    pub fn disable(&mut self) -> Result<()> {
+        if !self.is_enabled {
+            return Ok(());
+        }
+        let data = nix::sys::ptrace::read(self.pid, self.virtual_address.address as *mut _)
+            .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
+        let restored_word = (data as u64 & !0xFFu64)
+            | self.saved_data.expect("saved_data should be present") as u64;
+        // Write the original instruction back to the process memory
+        nix::sys::ptrace::write(
+            self.pid,
+            self.virtual_address.address as *mut _,
+            restored_word as c_long,
+        )
+        .context("Disabling breakpoint failed. Failed to write memory")?;
+        self.is_enabled = false;
+        Ok(())
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.is_enabled
+    }
+
+    pub fn get_virtual_address(&self) -> VirtAddress {
+        self.virtual_address
+    }
+
+    pub fn in_range(&self, low: VirtAddress, high: VirtAddress) -> bool {
+        self.virtual_address >= low && self.virtual_address < high
+    }
+
+    pub fn is_at_address(&self, address: VirtAddress) -> bool {
+        self.virtual_address == address
+    }
+
+    pub fn get_id(&self) -> StopPointId {
+        self.id
+    }
+
+    pub fn get_data(&self) -> Option<u8> {
+        self.saved_data
+    }
+}
+
+/// Not a trait that's going to be implemented by anything other that Vec<BreakpointSite>, but rather extends the functionality of Vec<BreakpointSite>.
+pub trait BreakPointCollection {
+    fn push_and_return_mut_ref(
+        &mut self,
+        stop_point: BreakpointSite,
+    ) -> Option<&mut BreakpointSite>;
+    fn push_and_return_ref(&mut self, stop_point: BreakpointSite) -> Option<&BreakpointSite>;
+    fn contains_id(&self, id: StopPointId) -> bool;
+    fn contains_address(&self, address: VirtAddress) -> bool;
+    fn is_enabled_at_address(&self, address: VirtAddress) -> bool;
+    fn get_stop_point_by_id(&self, id: StopPointId) -> Option<&BreakpointSite>;
+    fn get_stop_point_by_id_mut(&mut self, id: StopPointId) -> Option<&mut BreakpointSite>;
+    fn get_stop_point_by_address(&self, address: VirtAddress) -> Option<&BreakpointSite>;
+    fn get_stop_point_by_address_mut(
+        &mut self,
+        address: VirtAddress,
+    ) -> Option<&mut BreakpointSite>;
+    fn get_stop_point_index_by_address(&mut self, address: VirtAddress) -> Option<usize>;
+    fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Result<()>;
+    fn remove_stop_point_by_address(&mut self, address: VirtAddress) -> Result<()>;
+}
+
+impl BreakPointCollection for Vec<BreakpointSite> {
+    /// Push a stop point and return a mutable reference to element that was just pushed.
+    fn push_and_return_mut_ref(
+        &mut self,
+        stop_point: BreakpointSite,
+    ) -> Option<&mut BreakpointSite> {
+        self.push(stop_point);
+        self.last_mut()
+    }
+
+    /// Push a stop point and return an immutable reference to element that was just pushed.
+    fn push_and_return_ref(&mut self, stop_point: BreakpointSite) -> Option<&BreakpointSite> {
+        self.push(stop_point);
+        self.last()
+    }
+
+    fn contains_id(&self, id: StopPointId) -> bool {
+        self.iter().any(|sp| sp.get_id() == id)
+    }
+
+    fn contains_address(&self, address: VirtAddress) -> bool {
+        self.iter().any(|sp| sp.is_at_address(address))
+    }
+
+    fn is_enabled_at_address(&self, address: VirtAddress) -> bool {
+        self.iter()
+            .any(|sp| sp.is_at_address(address) && sp.is_enabled())
+    }
+
+    fn get_stop_point_by_id(&self, id: StopPointId) -> Option<&BreakpointSite> {
+        self.iter().find(|sp| sp.get_id() == id)
+    }
+
+    fn get_stop_point_by_id_mut(&mut self, id: StopPointId) -> Option<&mut BreakpointSite> {
+        self.iter_mut().find(|sp| sp.get_id() == id)
+    }
+
+    fn get_stop_point_by_address(&self, address: VirtAddress) -> Option<&BreakpointSite> {
+        self.iter().find(|sp| sp.is_at_address(address))
+    }
+
+    fn get_stop_point_by_address_mut(
+        &mut self,
+        address: VirtAddress,
+    ) -> Option<&mut BreakpointSite> {
+        self.iter_mut().find(|sp| sp.is_at_address(address))
+    }
+
+    fn get_stop_point_index_by_address(&mut self, address: VirtAddress) -> Option<usize> {
+        self.iter_mut().position(|sp| sp.is_at_address(address))
+    }
+
+    fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Result<()> {
+        if let Some(pos) = self.iter().position(|sp| sp.get_id() == id) {
+            let _ = {
+                self[pos].disable()?; // This is essential to restore the original instruction before removing the breakpoint.
+                self.remove(pos);
+            };
+            Ok(())
+        } else {
+            Err(anyhow::Error::msg(format!(
+                "Stop point with ID {} not found",
+                id
+            )))
+        }
+    }
+
+    fn remove_stop_point_by_address(&mut self, address: VirtAddress) -> Result<()> {
+        if let Some(pos) = self.iter().position(|sp| sp.is_at_address(address)) {
+            let _ = self.remove(pos);
+            Ok(())
+        } else {
+            Err(anyhow::Error::msg(format!(
+                "Stop point with address {} not found",
+                address
+            )))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_next_id() {
+        assert_eq!(BreakpointSite::get_next_id(), 0);
+        assert_eq!(BreakpointSite::get_next_id(), 1);
+        assert_eq!(BreakpointSite::get_next_id(), 2);
+        assert_eq!(BreakpointSite::get_next_id(), 3);
+        assert_eq!(BreakpointSite::get_next_id(), 4);
+        assert_eq!(BreakpointSite::get_next_id(), 5);
+    }
+
+    #[test]
+    fn test_virt_address() {
+        let va = VirtAddress::new(0x1234);
+        assert_eq!(va.next_page_boundary().address, 0x2000);
+        assert_eq!(va.next_page_boundary().next_page_boundary().address, 0x3000);
+        assert_eq!(
+            va.next_page_boundary()
+                .next_page_boundary()
+                .next_page_boundary()
+                .address,
+            0x4000
+        );
+        let va = VirtAddress::new(4095);
+        assert_eq!(va.next_page_boundary().address, 4096);
+        assert_eq!(va.next_page_boundary().next_page_boundary().address, 8192);
+    }
 }
