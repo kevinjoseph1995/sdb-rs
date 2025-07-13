@@ -2,7 +2,7 @@
 use anyhow::{Context, Ok, Result};
 /////////////////////////////////////////
 use super::CommandMetadata;
-use libsdb::process::{BreakPointCollection, Process, VirtAddress};
+use libsdb::process::{Process, VirtAddress};
 /////////////////////////////////////////
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -51,9 +51,10 @@ impl BreakpointCommandCategory {
                 let break_point_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
                 let breakpoint = process
                     .breakpoint_sites
-                    .get_stop_point_by_id(break_point_id)
+                    .iter()
+                    .find(|bp| bp.get_id() == break_point_id)
                     .ok_or(anyhow::Error::msg(format!(
-                        "Breakpoint with ID {} not found",
+                        "Breakpoint with ID {} not found.",
                         break_point_id
                     )))?;
                 println!(
@@ -105,15 +106,18 @@ impl BreakpointCommandCategory {
                     )));
                 }
                 let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
-                if !process.breakpoint_sites.contains_id(breakpoint_id) {
+                if !process
+                    .breakpoint_sites
+                    .iter()
+                    .find(|bp| bp.get_id() == breakpoint_id)
+                    .is_some()
+                {
                     return Err(anyhow::Error::msg(format!(
                         "Breakpoint with ID {} not found.",
                         breakpoint_id
                     )));
                 }
-                process
-                    .breakpoint_sites
-                    .remove_stop_point_by_id(breakpoint_id)?;
+                process.remove_stop_point_by_id(breakpoint_id)?;
                 println!("Breakpoint removed: ID {}", breakpoint_id);
                 Ok(())
             }
@@ -125,14 +129,12 @@ impl BreakpointCommandCategory {
                     )));
                 }
                 let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
-                let breakpoint = process
-                    .breakpoint_sites
-                    .get_stop_point_by_id_mut(breakpoint_id)
-                    .ok_or(anyhow::Error::msg(format!(
-                        "Breakpoint with ID {} not found.",
+                process
+                    .enable_breakpoint_site(breakpoint_id)
+                    .context(format!(
+                        "Failed to enable breakpoint with ID {}.",
                         breakpoint_id
-                    )))?;
-                breakpoint.enable()?;
+                    ))?;
                 println!("Breakpoint enabled: ID {}", breakpoint_id);
                 Ok(())
             }
@@ -144,14 +146,12 @@ impl BreakpointCommandCategory {
                     )));
                 }
                 let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
-                let breakpoint = process
-                    .breakpoint_sites
-                    .get_stop_point_by_id_mut(breakpoint_id)
-                    .ok_or(anyhow::Error::msg(format!(
-                        "Breakpoint with ID {} not found.",
+                process
+                    .disable_breakpoint_site(breakpoint_id)
+                    .context(format!(
+                        "Failed to disable breakpoint with ID {}.",
                         breakpoint_id
-                    )))?;
-                breakpoint.disable()?;
+                    ))?;
                 println!("Breakpoint disabled: ID {}", breakpoint_id);
                 Ok(())
             }

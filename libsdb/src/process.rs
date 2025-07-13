@@ -241,7 +241,9 @@ impl Process {
             let instruction_begin = self.get_pc()? - VirtAddress::new(1usize);
             if self
                 .breakpoint_sites
-                .is_enabled_at_address(instruction_begin)
+                .iter()
+                .find(|bp| bp.get_virtual_address() == instruction_begin && bp.is_enabled())
+                .is_some()
             {
                 // If the breakpoint is enabled at the instruction address, we need to set the PC to the instruction address.
                 self.set_pc(instruction_begin)?;
@@ -255,10 +257,17 @@ impl Process {
         let pc = self
             .get_pc()
             .context("Failed to get program counter (PC) register")?;
-        if self.breakpoint_sites.is_enabled_at_address(pc) {
+        // If the breakpoint at PC is enabled, we need to disable it before resuming.
+        if let Some(index) = self
+            .breakpoint_sites
+            .iter()
+            .position(|bp| bp.get_virtual_address() == pc && bp.is_enabled())
+        {
+            // Disable the breakpoint at PC, step over the int3 instruction, and then re-enable it.
+            // This is necessary to avoid hitting the breakpoint again immediately after resuming.
             let breakpoint_site = self
                 .breakpoint_sites
-                .get_stop_point_by_address_mut(pc)
+                .get_mut(index)
                 .ok_or_else(|| anyhow!("Breakpoint site not found at address: {}", pc))?;
             breakpoint_site.disable()?;
             ptrace::step(self.pid, None).context("Failed to step process")?; // Step over the int3 instruction.
@@ -281,7 +290,8 @@ impl Process {
         let program_counter = self.get_pc()?;
         if let Some(breakpoint_site_index) = self
             .breakpoint_sites
-            .get_stop_point_index_by_address(program_counter)
+            .iter()
+            .position(|bp| bp.get_virtual_address() == program_counter)
         {
             let breakpoint = &mut self.breakpoint_sites[breakpoint_site_index];
             if breakpoint.is_enabled() {
@@ -502,15 +512,19 @@ impl Process {
         &'a mut self,
         address: VirtAddress,
     ) -> Result<&'a mut BreakpointSite> {
-        if self.breakpoint_sites.contains_address(address) {
+        if self
+            .breakpoint_sites
+            .iter()
+            .any(|bp| bp.get_virtual_address() == address)
+        {
             return Err(anyhow!(
                 "Breakpoint site already exists at address: {}",
                 address
             ));
         }
         self.breakpoint_sites
-            .push_and_return_mut_ref(BreakpointSite::new(address, self.pid))
-            .ok_or_else(|| anyhow!("Failed to create breakpoint site at address: {}", address))
+            .push(BreakpointSite::new(address, self.pid));
+        Ok(self.breakpoint_sites.last_mut().unwrap())
     }
 
     fn find_free_stop_point_register(control: u64) -> Result<u32> {
@@ -656,6 +670,40 @@ impl Process {
         let masked = control & !clear_mask; // Clear the bits for the specified debug register and mode bits
         self.write_register_value(register_info::RegisterId::dr(7), RegisterValue::U64(masked))
             .context("Failed to clear hardware stop point")?;
+        Ok(())
+    }
+
+    pub fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Result<()> {
+        let position = self
+            .breakpoint_sites
+            .iter()
+            .position(|site| site.id == id)
+            .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
+        let breakpoint_site = &mut self.breakpoint_sites[position];
+        if breakpoint_site.is_enabled() {
+            breakpoint_site.disable()?;
+        }
+        self.breakpoint_sites.remove(position);
+        Ok(())
+    }
+
+    pub fn enable_breakpoint_site(&mut self, id: StopPointId) -> Result<()> {
+        let breakpoint = self
+            .breakpoint_sites
+            .iter_mut()
+            .find(|site| site.id == id)
+            .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
+        breakpoint.enable()?;
+        Ok(())
+    }
+
+    pub fn disable_breakpoint_site(&mut self, id: StopPointId) -> Result<()> {
+        let breakpoint = self
+            .breakpoint_sites
+            .iter_mut()
+            .find(|site| site.id == id)
+            .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
+        breakpoint.disable()?;
         Ok(())
     }
 }
@@ -1004,108 +1052,6 @@ impl BreakpointSite {
 
     pub fn get_data(&self) -> Option<u8> {
         self.saved_data
-    }
-}
-
-/// Not a trait that's going to be implemented by anything other that Vec<BreakpointSite>, but rather extends the functionality of Vec<BreakpointSite>.
-pub trait BreakPointCollection {
-    fn push_and_return_mut_ref(
-        &mut self,
-        stop_point: BreakpointSite,
-    ) -> Option<&mut BreakpointSite>;
-    fn push_and_return_ref(&mut self, stop_point: BreakpointSite) -> Option<&BreakpointSite>;
-    fn contains_id(&self, id: StopPointId) -> bool;
-    fn contains_address(&self, address: VirtAddress) -> bool;
-    fn is_enabled_at_address(&self, address: VirtAddress) -> bool;
-    fn get_stop_point_by_id(&self, id: StopPointId) -> Option<&BreakpointSite>;
-    fn get_stop_point_by_id_mut(&mut self, id: StopPointId) -> Option<&mut BreakpointSite>;
-    fn get_stop_point_by_address(&self, address: VirtAddress) -> Option<&BreakpointSite>;
-    fn get_stop_point_by_address_mut(
-        &mut self,
-        address: VirtAddress,
-    ) -> Option<&mut BreakpointSite>;
-    fn get_stop_point_index_by_address(&mut self, address: VirtAddress) -> Option<usize>;
-    fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Result<()>;
-    fn remove_stop_point_by_address(&mut self, address: VirtAddress) -> Result<()>;
-}
-
-impl BreakPointCollection for Vec<BreakpointSite> {
-    /// Push a stop point and return a mutable reference to element that was just pushed.
-    fn push_and_return_mut_ref(
-        &mut self,
-        stop_point: BreakpointSite,
-    ) -> Option<&mut BreakpointSite> {
-        self.push(stop_point);
-        self.last_mut()
-    }
-
-    /// Push a stop point and return an immutable reference to element that was just pushed.
-    fn push_and_return_ref(&mut self, stop_point: BreakpointSite) -> Option<&BreakpointSite> {
-        self.push(stop_point);
-        self.last()
-    }
-
-    fn contains_id(&self, id: StopPointId) -> bool {
-        self.iter().any(|sp| sp.get_id() == id)
-    }
-
-    fn contains_address(&self, address: VirtAddress) -> bool {
-        self.iter().any(|sp| sp.is_at_address(address))
-    }
-
-    fn is_enabled_at_address(&self, address: VirtAddress) -> bool {
-        self.iter()
-            .any(|sp| sp.is_at_address(address) && sp.is_enabled())
-    }
-
-    fn get_stop_point_by_id(&self, id: StopPointId) -> Option<&BreakpointSite> {
-        self.iter().find(|sp| sp.get_id() == id)
-    }
-
-    fn get_stop_point_by_id_mut(&mut self, id: StopPointId) -> Option<&mut BreakpointSite> {
-        self.iter_mut().find(|sp| sp.get_id() == id)
-    }
-
-    fn get_stop_point_by_address(&self, address: VirtAddress) -> Option<&BreakpointSite> {
-        self.iter().find(|sp| sp.is_at_address(address))
-    }
-
-    fn get_stop_point_by_address_mut(
-        &mut self,
-        address: VirtAddress,
-    ) -> Option<&mut BreakpointSite> {
-        self.iter_mut().find(|sp| sp.is_at_address(address))
-    }
-
-    fn get_stop_point_index_by_address(&mut self, address: VirtAddress) -> Option<usize> {
-        self.iter_mut().position(|sp| sp.is_at_address(address))
-    }
-
-    fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Result<()> {
-        if let Some(pos) = self.iter().position(|sp| sp.get_id() == id) {
-            let _ = {
-                self[pos].disable()?; // This is essential to restore the original instruction before removing the breakpoint.
-                self.remove(pos);
-            };
-            Ok(())
-        } else {
-            Err(anyhow::Error::msg(format!(
-                "Stop point with ID {} not found",
-                id
-            )))
-        }
-    }
-
-    fn remove_stop_point_by_address(&mut self, address: VirtAddress) -> Result<()> {
-        if let Some(pos) = self.iter().position(|sp| sp.is_at_address(address)) {
-            let _ = self.remove(pos);
-            Ok(())
-        } else {
-            Err(anyhow::Error::msg(format!(
-                "Stop point with address {} not found",
-                address
-            )))
-        }
     }
 }
 
