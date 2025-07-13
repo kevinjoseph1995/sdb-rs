@@ -346,7 +346,7 @@ fn test_create_breakpoint_site() {
     {
         assert_eq!(
             target_process
-                .create_breakpoint_site(VirtAddress::new(0x1000))
+                .create_breakpoint_site(VirtAddress::new(0x1000), false)
                 .expect("Failed to create breakpoint site at 0x1000")
                 .get_virtual_address(),
             VirtAddress::new(0x1000)
@@ -354,18 +354,18 @@ fn test_create_breakpoint_site() {
     }
     assert_eq!(
         target_process
-            .create_breakpoint_site(VirtAddress::new(0x2000))
+            .create_breakpoint_site(VirtAddress::new(0x2000), false)
             .expect("Failed to create breakpoint site at 0x2000")
             .get_id()
             + 1,
         target_process
-            .create_breakpoint_site(VirtAddress::new(0x3000))
+            .create_breakpoint_site(VirtAddress::new(0x3000), false)
             .expect("Failed to create breakpoint site at 0x3000")
             .get_id()
     );
     assert!(
         target_process
-            .create_breakpoint_site(VirtAddress::new(0x1000))
+            .create_breakpoint_site(VirtAddress::new(0x1000), false)
             .is_err(), // Should fail because breakpoint already exists at 0x1000
         "Expected to fail creating breakpoint site at 0x1000 again"
     );
@@ -443,12 +443,9 @@ fn test_breakpoint_setting() {
 
     let load_address =
         get_load_address(target_process.pid, offset as u64).expect("Failed to get load address");
-    let break_point_site = target_process
-        .create_breakpoint_site(load_address)
+    let _ = target_process
+        .create_breakpoint_site(load_address, true)
         .expect("Failed to create breakpoint site at load address");
-    break_point_site
-        .enable()
-        .expect("Failed to enable breakpoint site");
     assert!(
         get_process_state(target_process.pid).expect("Failed to get process state")
             == ProcessState::TracingStopped,

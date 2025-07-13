@@ -32,8 +32,8 @@ impl BreakpointCommandCategory {
                 for breakpoint in process.breakpoint_sites.iter() {
                     println!(
                         "{}: address = {}, {}",
-                        breakpoint.get_id(),
-                        breakpoint.get_virtual_address(),
+                        breakpoint.id(),
+                        breakpoint.virtual_address(),
                         if breakpoint.is_enabled() {
                             "enabled"
                         } else {
@@ -52,15 +52,15 @@ impl BreakpointCommandCategory {
                 let breakpoint = process
                     .breakpoint_sites
                     .iter()
-                    .find(|bp| bp.get_id() == break_point_id)
+                    .find(|bp| bp.id() == break_point_id)
                     .ok_or(anyhow::Error::msg(format!(
                         "Breakpoint with ID {} not found.",
                         break_point_id
                     )))?;
                 println!(
                     "Breakpoint ID: {}, Address: {}, Status: {}",
-                    breakpoint.get_id(),
-                    breakpoint.get_virtual_address(),
+                    breakpoint.id(),
+                    breakpoint.virtual_address(),
                     if breakpoint.is_enabled() {
                         "enabled"
                     } else {
@@ -89,11 +89,12 @@ impl BreakpointCommandCategory {
                         err, args[0]
                     ))
                 })?;
-                let breakpoint = process.create_breakpoint_site(VirtAddress::from(address))?;
+                let breakpoint =
+                    process.create_breakpoint_site(VirtAddress::from(address), true)?;
                 println!(
                     "Breakpoint set at address: {}, ID: {}",
-                    breakpoint.get_virtual_address(),
-                    breakpoint.get_id()
+                    breakpoint.virtual_address(),
+                    breakpoint.id()
                 );
                 Ok(())
             }
@@ -108,7 +109,7 @@ impl BreakpointCommandCategory {
                 if !process
                     .breakpoint_sites
                     .iter()
-                    .find(|bp| bp.get_id() == breakpoint_id)
+                    .find(|bp| bp.id() == breakpoint_id)
                     .is_some()
                 {
                     return Err(anyhow::Error::msg(format!(
@@ -146,7 +147,7 @@ impl BreakpointCommandCategory {
                 }
                 let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
                 process
-                    .disable_breakpoint_site(breakpoint_id)
+                    .disable_breakpoint_by_id(breakpoint_id)
                     .context(format!(
                         "Failed to disable breakpoint with ID {}.",
                         breakpoint_id
