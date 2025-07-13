@@ -90,7 +90,6 @@ impl BreakpointCommandCategory {
                     ))
                 })?;
                 let breakpoint = process.create_breakpoint_site(VirtAddress::from(address))?;
-                breakpoint.enable()?;
                 println!(
                     "Breakpoint set at address: {}, ID: {}",
                     breakpoint.get_virtual_address(),
@@ -130,7 +129,7 @@ impl BreakpointCommandCategory {
                 }
                 let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
                 process
-                    .enable_breakpoint_site(breakpoint_id)
+                    .enable_breakpoint_by_id(breakpoint_id)
                     .context(format!(
                         "Failed to enable breakpoint with ID {}.",
                         breakpoint_id

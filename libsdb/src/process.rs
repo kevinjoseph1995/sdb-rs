@@ -269,10 +269,10 @@ impl Process {
                 .breakpoint_sites
                 .get_mut(index)
                 .ok_or_else(|| anyhow!("Breakpoint site not found at address: {}", pc))?;
-            breakpoint_site.disable()?;
+            *breakpoint_site = Self::disable_breakpoint(breakpoint_site.clone())?;
             ptrace::step(self.pid, None).context("Failed to step process")?; // Step over the int3 instruction.
             waitpid(self.pid, None).context("Failed to wait for process after stepping")?;
-            breakpoint_site.enable()?;
+            *breakpoint_site = Self::enable_breakpoint(breakpoint_site.clone())?;
         }
 
         if let Err(e) = nix::sys::ptrace::cont(self.pid, None) {
@@ -296,7 +296,7 @@ impl Process {
             let breakpoint = &mut self.breakpoint_sites[breakpoint_site_index];
             if breakpoint.is_enabled() {
                 // If the breakpoint is enabled at the instruction address, we need to disable it before single stepping.
-                breakpoint.disable()?;
+                *breakpoint = Self::disable_breakpoint(breakpoint.clone())?;
                 breakpoint_to_reenable = Some(breakpoint_site_index);
             }
         }
@@ -305,7 +305,7 @@ impl Process {
         // Re-enable the breakpoint if it was enabled before the single step.
         if let Some(breakpoint_site_index) = breakpoint_to_reenable {
             let breakpoint = &mut self.breakpoint_sites[breakpoint_site_index];
-            breakpoint.enable()?;
+            *breakpoint = Self::enable_breakpoint(breakpoint.clone())?;
         }
         Ok(reason)
     }
@@ -524,6 +524,9 @@ impl Process {
         }
         self.breakpoint_sites
             .push(BreakpointSite::new(address, self.pid));
+        *self.breakpoint_sites.last_mut().unwrap() =
+            Self::enable_breakpoint(self.breakpoint_sites.last_mut().unwrap().clone())
+                .context("Failed to enable breakpoint after creating it")?;
         Ok(self.breakpoint_sites.last_mut().unwrap())
     }
 
@@ -679,21 +682,64 @@ impl Process {
             .iter()
             .position(|site| site.id == id)
             .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
-        let breakpoint_site = &mut self.breakpoint_sites[position];
-        if breakpoint_site.is_enabled() {
-            breakpoint_site.disable()?;
-        }
+        self.disable_breakpoint_site(id)
+            .context("Failed to disable breakpoint site before removing")?;
         self.breakpoint_sites.remove(position);
         Ok(())
     }
 
-    pub fn enable_breakpoint_site(&mut self, id: StopPointId) -> Result<()> {
+    fn enable_breakpoint(mut breakpoint: BreakpointSite) -> Result<BreakpointSite> {
+        if breakpoint.is_enabled() {
+            return Ok(breakpoint); // Breakpoint is already enabled, no action needed
+        }
+        // Read a word from the process memory at the breakpoint address
+        let data =
+            nix::sys::ptrace::read(breakpoint.pid, breakpoint.virtual_address.address as *mut _)
+                .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))
+                .expect("Failed to read memory at breakpoint address");
+        breakpoint.saved_data = Some((data as u64 & 0xFFu64) as u8);
+        const INT3: u8 = 0xCC; // Breakpoint instruction
+        let data_with_int3: u64 = (data as u64 & !0xFFu64) | INT3 as u64;
+        // Write the breakpoint instruction to the process memory
+        nix::sys::ptrace::write(
+            breakpoint.pid,
+            breakpoint.virtual_address.address as *mut _,
+            data_with_int3 as c_long,
+        )
+        .context("Failed to write memory at breakpoint address")?;
+        breakpoint.is_enabled = true;
+        Ok(breakpoint)
+    }
+
+    pub fn disable_breakpoint(mut breakpoint: BreakpointSite) -> Result<BreakpointSite> {
+        if !breakpoint.is_enabled() {
+            return Ok(breakpoint); // Breakpoint is already disabled, no action needed
+        }
+        let data =
+            nix::sys::ptrace::read(breakpoint.pid, breakpoint.virtual_address.address as *mut _)
+                .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
+        // Read the saved data from the breakpoint site
+        let restored_word = (data as u64 & !0xFFu64)
+            | breakpoint.saved_data.expect("saved_data should be present") as u64;
+        // Write the original instruction back to the process memory
+        nix::sys::ptrace::write(
+            breakpoint.pid,
+            breakpoint.virtual_address.address as *mut _,
+            restored_word as c_long,
+        )
+        .context("Failed to write memory at breakpoint address")?;
+        breakpoint.is_enabled = false;
+        Ok(breakpoint)
+    }
+
+    pub fn enable_breakpoint_by_id(&mut self, id: StopPointId) -> Result<()> {
         let breakpoint = self
             .breakpoint_sites
             .iter_mut()
             .find(|site| site.id == id)
             .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
-        breakpoint.enable()?;
+
+        *breakpoint = Self::enable_breakpoint(*breakpoint)?;
         Ok(())
     }
 
@@ -703,7 +749,7 @@ impl Process {
             .iter_mut()
             .find(|site| site.id == id)
             .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
-        breakpoint.disable()?;
+        *breakpoint = Self::disable_breakpoint(*breakpoint)?;
         Ok(())
     }
 }
@@ -988,46 +1034,6 @@ impl BreakpointSite {
             saved_data: None,
             pid,
         }
-    }
-
-    pub fn enable(&mut self) -> Result<()> {
-        if self.is_enabled {
-            return Ok(());
-        }
-        // Read a word from the process memory at the breakpoint address
-        let data = nix::sys::ptrace::read(self.pid, self.virtual_address.address as *mut _)
-            .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
-        self.saved_data = Some((data as u64 & 0xFFu64) as u8);
-        const INT3: u8 = 0xCC; // Breakpoint instruction
-        let data_with_int3: u64 = (data as u64 & !0xFFu64) | INT3 as u64;
-        // Write the breakpoint instruction to the process memory
-        nix::sys::ptrace::write(
-            self.pid,
-            self.virtual_address.address as *mut _,
-            data_with_int3 as c_long,
-        )
-        .context("Failed to write memory")?;
-        self.is_enabled = true;
-        Ok(())
-    }
-
-    pub fn disable(&mut self) -> Result<()> {
-        if !self.is_enabled {
-            return Ok(());
-        }
-        let data = nix::sys::ptrace::read(self.pid, self.virtual_address.address as *mut _)
-            .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
-        let restored_word = (data as u64 & !0xFFu64)
-            | self.saved_data.expect("saved_data should be present") as u64;
-        // Write the original instruction back to the process memory
-        nix::sys::ptrace::write(
-            self.pid,
-            self.virtual_address.address as *mut _,
-            restored_word as c_long,
-        )
-        .context("Disabling breakpoint failed. Failed to write memory")?;
-        self.is_enabled = false;
-        Ok(())
     }
 
     pub fn is_enabled(&self) -> bool {
