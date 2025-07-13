@@ -154,6 +154,14 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 []
             ),
             cmd!(
+                ["set_hardware", "sh"],
+                "Set a new hardware breakpoint. Usage: 'breakpoint set_hardware <address>'",
+                [],
+                Some(Breakpoint(SetHardware)),
+                Some(&["<address in hex>"]),
+                []
+            ),
+            cmd!(
                 ["remove", "rm"],
                 "Remove a breakpoint. Usage: 'breakpoint remove <breakpoint_id>'",
                 [],

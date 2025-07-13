@@ -434,14 +434,15 @@ impl Process {
     ) -> Result<Vec<u8>> {
         let mut bytes = self.read_memory(start, num_bytes)?;
         for breakpoint in self.breakpoint_sites.iter() {
-            if breakpoint.is_enabled {
-                let break_point_address = breakpoint.virtual_address;
-                if break_point_address >= start && break_point_address < start + num_bytes {
-                    let offset = break_point_address - start;
-                    bytes[offset.get()] = breakpoint
-                        .saved_data
-                        .expect("Breakpoint data should be present");
-                }
+            if breakpoint.is_hardware || !breakpoint.is_enabled {
+                continue; // Skip hardware breakpoints and disabled breakpoints
+            }
+            let break_point_address = breakpoint.virtual_address;
+            if break_point_address >= start && break_point_address < start + num_bytes {
+                let offset = break_point_address - start;
+                bytes[offset.get()] = breakpoint
+                    .saved_data
+                    .expect("Breakpoint data should be present");
             }
         }
         Ok(bytes)
@@ -511,6 +512,7 @@ impl Process {
         &'a mut self,
         address: VirtAddress,
         enable_after_creation: bool,
+        is_hardware: bool,
     ) -> Result<&'a mut BreakpointSite> {
         if self
             .breakpoint_sites
@@ -523,7 +525,7 @@ impl Process {
             ));
         }
         self.breakpoint_sites
-            .push(BreakpointSite::new(address, false, false));
+            .push(BreakpointSite::new(address, false, is_hardware));
         if enable_after_creation {
             let index = self.breakpoint_sites.len() - 1;
             self.enable_breakpoint_at_index(index)
@@ -532,7 +534,7 @@ impl Process {
         Ok(self.breakpoint_sites.last_mut().unwrap())
     }
 
-    fn find_free_stop_point_register(control: u64) -> Result<u32> {
+    fn find_free_stop_point_register(control: u64) -> Result<u8> {
         // Check the control register to find a free debug register.
         /*
         Bit 0 Local DR0 breakpoint enabled
@@ -551,7 +553,7 @@ impl Process {
         ...
         ...
          */
-        for i in 0..4u32 {
+        for i in 0..4u8 {
             if (control & (0b11 << (i * 2))) == 0 {
                 return Ok(i);
             }
@@ -581,12 +583,12 @@ impl Process {
     /// This function finds a free debug register, writes the address to it, and encodes
     /// the stop point mode and size into the control register.
     /// Returns the index of the debug register used for the stop point.
-    pub fn set_hardware_stoppoint(
+    pub fn set_hardware_breakpoint(
         &mut self,
         address: VirtAddress,
         size: usize,
         mode: StopPointMode,
-    ) -> Result<u32> {
+    ) -> Result<u8> {
         assert!(
             self.is_attached,
             "Process must be attached to set hardware stop point"
@@ -652,7 +654,7 @@ impl Process {
     /// This function clears the bits for the specified debug register in the control register.
     /// The index should be in the range of 0 to 3, corresponding to DR0 to DR3.
     /// Returns a Result indicating success or failure.
-    pub fn clear_hardware_stoppoint(&mut self, index: u32) -> Result<()> {
+    pub fn clear_hardware_breakpoint(&mut self, index: u8) -> Result<()> {
         assert!(
             self.is_attached,
             "Process must be attached to clear hardware stop point"
@@ -678,7 +680,7 @@ impl Process {
         Ok(())
     }
 
-    pub fn remove_stop_point_by_id(&mut self, id: StopPointId) -> Result<()> {
+    pub fn remove_breakpoint_by_id(&mut self, id: StopPointId) -> Result<()> {
         let position = self
             .breakpoint_sites
             .iter()
@@ -691,13 +693,27 @@ impl Process {
     }
 
     fn enable_breakpoint_at_index(&mut self, index: usize) -> Result<()> {
-        let breakpoint = self
-            .breakpoint_sites
-            .get_mut(index)
-            .ok_or(anyhow!("Breakpoint site with index {} not found", index))?;
-        if breakpoint.is_enabled {
+        if self.breakpoint_sites[index].is_enabled {
             return Ok(()); // Breakpoint is already enabled, no action needed
         }
+        let hardware_index = {
+            if self.breakpoint_sites[index].is_hardware {
+                Some(self.set_hardware_breakpoint(
+                    self.breakpoint_sites[index].virtual_address(),
+                    1,
+                    StopPointMode::Execute,
+                )?)
+            } else {
+                None
+            }
+        };
+        let breakpoint = &mut self.breakpoint_sites[index];
+        if let Some(hardware_index) = hardware_index {
+            breakpoint.hardware_index = Some(hardware_index);
+            breakpoint.is_enabled = true;
+            return Ok(()); // Hardware breakpoint set, no need to write to memory
+        }
+        // This is a software breakpoint, so we need to write the breakpoint/int3 instruction to the process memory.
         // Read a word from the process memory at the breakpoint address
         let data = nix::sys::ptrace::read(self.pid, breakpoint.virtual_address.address as *mut _)
             .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))
@@ -717,13 +733,18 @@ impl Process {
     }
 
     fn disable_breakpoint_at_index(&mut self, index: usize) -> Result<()> {
-        let breakpoint = self
-            .breakpoint_sites
-            .get_mut(index)
-            .ok_or(anyhow!("Breakpoint site with index {} not found", index))?;
-        if !breakpoint.is_enabled {
+        if !self.breakpoint_sites[index].is_enabled {
             return Ok(()); // Breakpoint is already disabled, no action needed
         }
+        if let Some(hardware_index) = self.breakpoint_sites[index].hardware_index {
+            // If this is a hardware breakpoint, we need to clear it.
+            self.clear_hardware_breakpoint(hardware_index)
+                .context("Failed to clear hardware stop point")?;
+            self.breakpoint_sites[index].hardware_index = None;
+            self.breakpoint_sites[index].is_enabled = false;
+            return Ok(()); // Hardware breakpoint cleared, no need to write to memory
+        }
+        let breakpoint = &mut self.breakpoint_sites[index];
         let data = nix::sys::ptrace::read(self.pid, breakpoint.virtual_address.address as *mut _)
             .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
         // Read the saved data from the breakpoint site
@@ -1022,8 +1043,9 @@ pub struct BreakpointSite {
     is_enabled: bool,
     virtual_address: VirtAddress,
     saved_data: Option<u8>,
-    is_internal: bool,
+    _is_internal: bool,
     is_hardware: bool,
+    hardware_index: Option<u8>, // Only used for hardware breakpoints
 }
 
 impl BreakpointSite {
@@ -1041,8 +1063,9 @@ impl BreakpointSite {
             is_enabled: false,
             virtual_address,
             saved_data: None,
-            is_internal,
+            _is_internal: is_internal,
             is_hardware,
+            hardware_index: None,
         }
     }
 

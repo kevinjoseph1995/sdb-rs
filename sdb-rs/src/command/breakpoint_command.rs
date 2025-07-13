@@ -10,9 +10,45 @@ pub enum BreakpointCommandCategory {
     List,
     Info,
     Set,
+    SetHardware,
     Enable,
     Disable,
     Remove,
+}
+
+fn set_breakpoint(
+    metadata: &CommandMetadata,
+    args: Vec<String>,
+    process: &mut Process,
+    is_hardware: bool,
+) -> Result<()> {
+    if args.is_empty() {
+        return Err(anyhow::Error::msg(format!(
+            "No address provided for breakpoint. {}",
+            metadata.description
+        )));
+    }
+    if !(args[0].starts_with("0x") || args[0].starts_with("0X")) {
+        return Err(anyhow::Error::msg(format!(
+            "Invalid address format: {}. Hex-address should start with 0x/0X.",
+            args[0]
+        )));
+    }
+    let address_str = &args[0][2..];
+    let address = usize::from_str_radix(address_str, 16).map_err(|err| {
+        anyhow::Error::msg(format!(
+            "{}: Invalid address format: {}. Hex-address should be a valid hex number.",
+            err, args[0]
+        ))
+    })?;
+    let breakpoint =
+        process.create_breakpoint_site(VirtAddress::from(address), true, is_hardware)?;
+    println!(
+        "Breakpoint set at address: {}, ID: {}",
+        breakpoint.virtual_address(),
+        breakpoint.id()
+    );
+    Ok(())
 }
 
 impl BreakpointCommandCategory {
@@ -69,35 +105,8 @@ impl BreakpointCommandCategory {
                 );
                 Ok(())
             }
-            BreakpointCommandCategory::Set => {
-                if args.is_empty() {
-                    return Err(anyhow::Error::msg(format!(
-                        "No address provided for breakpoint. {}",
-                        metadata.description
-                    )));
-                }
-                if !(args[0].starts_with("0x") || args[0].starts_with("0X")) {
-                    return Err(anyhow::Error::msg(format!(
-                        "Invalid address format: {}. Hex-address should start with 0x/0X.",
-                        args[0]
-                    )));
-                }
-                let address_str = &args[0][2..];
-                let address = usize::from_str_radix(address_str, 16).map_err(|err| {
-                    anyhow::Error::msg(format!(
-                        "{}: Invalid address format: {}. Hex-address should be a valid hex number.",
-                        err, args[0]
-                    ))
-                })?;
-                let breakpoint =
-                    process.create_breakpoint_site(VirtAddress::from(address), true)?;
-                println!(
-                    "Breakpoint set at address: {}, ID: {}",
-                    breakpoint.virtual_address(),
-                    breakpoint.id()
-                );
-                Ok(())
-            }
+            BreakpointCommandCategory::Set => set_breakpoint(metadata, args, process, false),
+            BreakpointCommandCategory::SetHardware => set_breakpoint(metadata, args, process, true),
             BreakpointCommandCategory::Remove => {
                 if args.is_empty() {
                     return Err(anyhow::Error::msg(format!(
@@ -117,7 +126,7 @@ impl BreakpointCommandCategory {
                         breakpoint_id
                     )));
                 }
-                process.remove_stop_point_by_id(breakpoint_id)?;
+                process.remove_breakpoint_by_id(breakpoint_id)?;
                 println!("Breakpoint removed: ID {}", breakpoint_id);
                 Ok(())
             }
