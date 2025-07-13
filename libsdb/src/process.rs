@@ -269,10 +269,10 @@ impl Process {
                 .breakpoint_sites
                 .get_mut(index)
                 .ok_or_else(|| anyhow!("Breakpoint site not found at address: {}", pc))?;
-            *breakpoint_site = Self::disable_breakpoint(breakpoint_site.clone())?;
+            Self::disable_breakpoint(breakpoint_site)?;
             ptrace::step(self.pid, None).context("Failed to step process")?; // Step over the int3 instruction.
             waitpid(self.pid, None).context("Failed to wait for process after stepping")?;
-            *breakpoint_site = Self::enable_breakpoint(breakpoint_site.clone())?;
+            Self::enable_breakpoint(breakpoint_site)?;
         }
 
         if let Err(e) = nix::sys::ptrace::cont(self.pid, None) {
@@ -296,7 +296,7 @@ impl Process {
             let breakpoint = &mut self.breakpoint_sites[breakpoint_site_index];
             if breakpoint.is_enabled() {
                 // If the breakpoint is enabled at the instruction address, we need to disable it before single stepping.
-                *breakpoint = Self::disable_breakpoint(breakpoint.clone())?;
+                Self::disable_breakpoint(breakpoint)?;
                 breakpoint_to_reenable = Some(breakpoint_site_index);
             }
         }
@@ -305,7 +305,7 @@ impl Process {
         // Re-enable the breakpoint if it was enabled before the single step.
         if let Some(breakpoint_site_index) = breakpoint_to_reenable {
             let breakpoint = &mut self.breakpoint_sites[breakpoint_site_index];
-            *breakpoint = Self::enable_breakpoint(breakpoint.clone())?;
+            Self::enable_breakpoint(breakpoint)?;
         }
         Ok(reason)
     }
@@ -524,9 +524,8 @@ impl Process {
         }
         self.breakpoint_sites
             .push(BreakpointSite::new(address, self.pid));
-        *self.breakpoint_sites.last_mut().unwrap() =
-            Self::enable_breakpoint(self.breakpoint_sites.last_mut().unwrap().clone())
-                .context("Failed to enable breakpoint after creating it")?;
+        Self::enable_breakpoint(self.breakpoint_sites.last_mut().unwrap())
+            .context("Failed to enable breakpoint after creating it")?;
         Ok(self.breakpoint_sites.last_mut().unwrap())
     }
 
@@ -688,9 +687,9 @@ impl Process {
         Ok(())
     }
 
-    fn enable_breakpoint(mut breakpoint: BreakpointSite) -> Result<BreakpointSite> {
+    fn enable_breakpoint(breakpoint: &mut BreakpointSite) -> Result<()> {
         if breakpoint.is_enabled() {
-            return Ok(breakpoint); // Breakpoint is already enabled, no action needed
+            return Ok(()); // Breakpoint is already enabled, no action needed
         }
         // Read a word from the process memory at the breakpoint address
         let data =
@@ -708,12 +707,12 @@ impl Process {
         )
         .context("Failed to write memory at breakpoint address")?;
         breakpoint.is_enabled = true;
-        Ok(breakpoint)
+        Ok(())
     }
 
-    pub fn disable_breakpoint(mut breakpoint: BreakpointSite) -> Result<BreakpointSite> {
+    pub fn disable_breakpoint(breakpoint: &mut BreakpointSite) -> Result<()> {
         if !breakpoint.is_enabled() {
-            return Ok(breakpoint); // Breakpoint is already disabled, no action needed
+            return Ok(()); // Breakpoint is already disabled, no action needed
         }
         let data =
             nix::sys::ptrace::read(breakpoint.pid, breakpoint.virtual_address.address as *mut _)
@@ -729,7 +728,7 @@ impl Process {
         )
         .context("Failed to write memory at breakpoint address")?;
         breakpoint.is_enabled = false;
-        Ok(breakpoint)
+        Ok(())
     }
 
     pub fn enable_breakpoint_by_id(&mut self, id: StopPointId) -> Result<()> {
@@ -739,7 +738,7 @@ impl Process {
             .find(|site| site.id == id)
             .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
 
-        *breakpoint = Self::enable_breakpoint(*breakpoint)?;
+        Self::enable_breakpoint(breakpoint)?;
         Ok(())
     }
 
@@ -749,7 +748,7 @@ impl Process {
             .iter_mut()
             .find(|site| site.id == id)
             .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
-        *breakpoint = Self::disable_breakpoint(*breakpoint)?;
+        Self::disable_breakpoint(breakpoint)?;
         Ok(())
     }
 }
