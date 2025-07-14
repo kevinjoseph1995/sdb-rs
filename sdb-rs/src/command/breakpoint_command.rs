@@ -42,7 +42,7 @@ fn set_breakpoint(
         ))
     })?;
     let breakpoint =
-        process.create_breakpoint_site(VirtAddress::from(address), true, is_hardware)?;
+        process.create_breakpoint(VirtAddress::from(address), true, is_hardware)?;
     println!(
         "Breakpoint set at address: {}, ID: {}",
         breakpoint.virtual_address(),
@@ -60,12 +60,12 @@ impl BreakpointCommandCategory {
     ) -> Result<()> {
         match self {
             BreakpointCommandCategory::List => {
-                if process.breakpoint_sites.is_empty() {
+                if process.breakpoints.is_empty() {
                     println!("No breakpoints set.");
                     return Ok(());
                 }
                 println!("Breakpoints:");
-                for breakpoint in process.breakpoint_sites.iter() {
+                for breakpoint in process.breakpoints.iter() {
                     println!(
                         "{}: address = {}, {}",
                         breakpoint.id(),
@@ -86,7 +86,7 @@ impl BreakpointCommandCategory {
                 }
                 let break_point_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
                 let breakpoint = process
-                    .breakpoint_sites
+                    .breakpoints
                     .iter()
                     .find(|bp| bp.id() == break_point_id)
                     .ok_or(anyhow::Error::msg(format!(
@@ -116,7 +116,7 @@ impl BreakpointCommandCategory {
                 }
                 let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
                 if !process
-                    .breakpoint_sites
+                    .breakpoints
                     .iter()
                     .find(|bp| bp.id() == breakpoint_id)
                     .is_some()

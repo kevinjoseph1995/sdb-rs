@@ -346,7 +346,7 @@ fn test_create_breakpoint_site() {
     {
         assert_eq!(
             target_process
-                .create_breakpoint_site(VirtAddress::new(0x1000), false, false)
+                .create_breakpoint(VirtAddress::new(0x1000), false, false)
                 .expect("Failed to create breakpoint site at 0x1000")
                 .virtual_address(),
             VirtAddress::new(0x1000)
@@ -354,18 +354,18 @@ fn test_create_breakpoint_site() {
     }
     assert_eq!(
         target_process
-            .create_breakpoint_site(VirtAddress::new(0x2000), false, false)
+            .create_breakpoint(VirtAddress::new(0x2000), false, false)
             .expect("Failed to create breakpoint site at 0x2000")
             .id()
             + 1,
         target_process
-            .create_breakpoint_site(VirtAddress::new(0x3000), false, false)
+            .create_breakpoint(VirtAddress::new(0x3000), false, false)
             .expect("Failed to create breakpoint site at 0x3000")
             .id()
     );
     assert!(
         target_process
-            .create_breakpoint_site(VirtAddress::new(0x1000), false, false)
+            .create_breakpoint(VirtAddress::new(0x1000), false, false)
             .is_err(), // Should fail because breakpoint already exists at 0x1000
         "Expected to fail creating breakpoint site at 0x1000 again"
     );
@@ -444,7 +444,7 @@ fn test_breakpoint_setting() {
     let load_address =
         get_load_address(target_process.pid, offset as u64).expect("Failed to get load address");
     let _ = target_process
-        .create_breakpoint_site(load_address, true, false)
+        .create_breakpoint(load_address, true, false)
         .expect("Failed to create breakpoint site at load address");
     assert!(
         get_process_state(target_process.pid).expect("Failed to get process state")
@@ -500,7 +500,7 @@ fn test_hardware_breakpoints() {
 
     // Create a software breakpoint at the address where the hardware breakpoint is set.
     let software_breakpoint_id = target_process
-        .create_breakpoint_site(VirtAddress::new(address), true, false)
+        .create_breakpoint(VirtAddress::new(address), true, false)
         .expect("Failed to create software breakpoint")
         .id();
 
@@ -528,7 +528,7 @@ fn test_hardware_breakpoints() {
 
     // This time use a hardware breakpoint.
     let _hardware_breakpoint_id = target_process
-        .create_breakpoint_site(VirtAddress::new(address), true, true)
+        .create_breakpoint(VirtAddress::new(address), true, true)
         .expect("Failed to create software breakpoint")
         .id();
 
