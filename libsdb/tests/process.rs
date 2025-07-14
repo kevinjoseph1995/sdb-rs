@@ -472,6 +472,103 @@ fn test_breakpoint_setting() {
 }
 
 #[test]
+fn test_hardware_breakpoints() {
+    let test_binary_path = PathBuf::from(
+        build_test_binary("anti_debugger", &PathBuf::from_iter(["..", "tools"]))
+            .expect("Failed to build test binary"),
+    );
+    let (read_port, write_port) = create_pipe_channel(true).expect("Failed to create pipe channel");
+    let mut target_process = Process::launch(
+        &test_binary_path,
+        None,
+        true,
+        Some(write_port.into_internal_fd()),
+    )
+    .expect("Process failed to launch");
+
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+    // Process should have raised a SIGTRAP signal and stopped.
+    let stdout_from_child = read_port.read().expect("Failed to read from pipe channel");
+    let address_string =
+        String::from_utf8(stdout_from_child).expect("Failed to convert stdout to string");
+    let address = usize::from_str_radix(address_string.trim(), 16).unwrap();
+
+    // Create a software breakpoint at the address where the hardware breakpoint is set.
+    let software_breakpoint_id = target_process
+        .create_breakpoint_site(VirtAddress::new(address), true, false)
+        .expect("Failed to create software breakpoint")
+        .id();
+
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+    // Process should have raised a SIGTRAP signal and stopped.
+    // The inferior process should have recognized that it is being traced and modified it's execution flow.
+    let stdout_from_child = read_port.read().expect("Failed to read from pipe channel");
+    let output = String::from_utf8(stdout_from_child).expect("Failed to convert stdout to string");
+    assert_eq!(
+        output.trim(),
+        "Checksum mismatch",
+        "Expected output to be 'Checksum mismatch', got: {}",
+        output
+    );
+
+    // Remove the software breakpoint
+    target_process
+        .remove_breakpoint_by_id(software_breakpoint_id)
+        .expect("Failed to remove breakpoint");
+
+    // This time use a hardware breakpoint.
+    let _hardware_breakpoint_id = target_process
+        .create_breakpoint_site(VirtAddress::new(address), true, true)
+        .expect("Failed to create software breakpoint")
+        .id();
+
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+    // Process should have raised a SIGTRAP signal and stopped.
+
+    let program_counter = target_process
+        .get_pc()
+        .expect("Failed to get program counter");
+    assert_eq!(
+        program_counter,
+        VirtAddress::new(address),
+        "Expected program counter to be at the breakpoint address: 0x{:x}, got: {}",
+        address,
+        program_counter
+    );
+
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+    // Process should have raised a SIGTRAP signal and stopped.
+    let stdout_from_child = read_port.read().expect("Failed to read from pipe channel");
+    let output = String::from_utf8(stdout_from_child).expect("Failed to convert stdout to string");
+    assert_eq!(
+        output.trim(),
+        "Unmodified",
+        "Expected output to be 'Unmodified', got: {}",
+        output  
+    );
+}
+
+#[test]
 fn test_memory_operations() {
     let test_binary_path = PathBuf::from(
         build_test_binary("memory_test", &PathBuf::from_iter(["..", "tools"]))
