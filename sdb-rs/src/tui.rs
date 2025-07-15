@@ -240,6 +240,12 @@ impl Application {
                 &command,
                 &self.inferior_process,
             ),
+            CommandCategory::Watchpoint(watchpoint_command_category) => watchpoint_command_category
+                .handle_command(
+                    &last_in_chain.metadata,
+                    command.args,
+                    &mut self.inferior_process,
+                ),
         }
     }
 

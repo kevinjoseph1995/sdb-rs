@@ -745,6 +745,18 @@ impl Process {
         Ok(())
     }
 
+    pub fn remove_watchpoint_by_id(&mut self, id: StopPointId) -> Result<()> {
+        let position = self
+            .watchpoints
+            .iter()
+            .position(|site| site.id == id)
+            .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
+        self.disable_watchpoint_by_id(id)
+            .context("Failed to disable breakpoint site before removing")?;
+        self.watchpoints.remove(position);
+        Ok(())
+    }
+
     fn enable_breakpoint_at_index(&mut self, index: usize) -> Result<()> {
         if self.breakpoints[index].is_enabled {
             return Ok(()); // Breakpoint is already enabled, no action needed
@@ -1139,6 +1151,10 @@ impl Watchpoint {
             size,
             hardware_index: None,
         })
+    }
+
+    pub fn mode(&self) -> StopPointMode {
+        self.mode
     }
 
     pub fn virtual_address(&self) -> VirtAddress {

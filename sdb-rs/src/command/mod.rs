@@ -69,10 +69,13 @@ pub enum CommandCategory {
     Step,
     Memory(MemoryCommandCategory),
     Disassemble,
+    Watchpoint(WatchpointCommandCategory),
 }
 
 use BreakpointCommandCategory::*;
 use CommandCategory::*;
+
+use crate::command::breakpoint_command::WatchpointCommandCategory;
 
 const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
     cmd!(["run", "r"], "Run the program", [], Some(Run), None, []),
@@ -243,6 +246,63 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
                 "-n <number> | --number <number> (default is 10)"
             ),
         ]
+    ),
+    cmd!(
+        ["watchpoint", "w"],
+        "Watchpoint operations",
+        [
+            cmd!(
+                ["list", "l"],
+                "List all watchpoints. Usage: 'watchpoint list'",
+                [],
+                Some(Watchpoint(WatchpointCommandCategory::List)),
+                None,
+                []
+            ),
+            cmd!(
+                ["info", "i"],
+                "Get information about a specific watchpoint. Usage: 'watchpoint info <watchpoint_id>'",
+                [],
+                Some(Watchpoint(WatchpointCommandCategory::Info)),
+                Some(&["<watchpoint_id>"]),
+                []
+            ),
+            cmd!(
+                ["set", "s"],
+                "Set a new watchpoint. Usage: 'watchpoint set <address> <mode> <size>'. w = Write, rw = Read/Write, x = Execute",
+                [],
+                Some(Watchpoint(WatchpointCommandCategory::Set)),
+                Some(&["<address in hex>", "w | rw | x", "<size>"]),
+                []
+            ),
+            cmd!(
+                ["remove", "rm"],
+                "Remove a watchpoint. Usage: 'watchpoint remove <watchpoint_id>'",
+                [],
+                Some(Watchpoint(WatchpointCommandCategory::Remove)),
+                Some(&["<watchpoint_id>"]),
+                []
+            ),
+            cmd!(
+                ["enable", "e"],
+                "Enable a watchpoint. Usage: 'watchpoint enable <watchpoint_id>'",
+                [],
+                Some(Watchpoint(WatchpointCommandCategory::Enable)),
+                Some(&["<watchpoint_id>"]),
+                []
+            ),
+            cmd!(
+                ["disable", "d"],
+                "Disable a watchpoint. Usage: 'watchpoint disable <watchpoint_id>'",
+                [],
+                Some(Watchpoint(WatchpointCommandCategory::Disable)),
+                Some(&["<watchpoint_id>"]),
+                []
+            ),
+        ],
+        None,
+        None,
+        []
     ),
 ];
 
