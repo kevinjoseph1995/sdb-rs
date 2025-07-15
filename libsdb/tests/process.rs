@@ -564,7 +564,7 @@ fn test_hardware_breakpoints() {
         output.trim(),
         "Unmodified",
         "Expected output to be 'Unmodified', got: {}",
-        output  
+        output
     );
 }
 
@@ -661,4 +661,88 @@ fn test_memory_operations() {
                 );
             });
     }
+}
+
+#[test]
+fn test_watchpoints() {
+    let test_binary_path = PathBuf::from(
+        build_test_binary("anti_debugger", &PathBuf::from_iter(["..", "tools"]))
+            .expect("Failed to build test binary"),
+    );
+    let (read_port, write_port) = create_pipe_channel(true).expect("Failed to create pipe channel");
+    let mut target_process = Process::launch(
+        &test_binary_path,
+        None,
+        true,
+        Some(write_port.into_internal_fd()),
+    )
+    .expect("Process failed to launch");
+
+    assert!(
+        get_process_state(target_process.pid).expect("Failed to get process state")
+            == ProcessState::TracingStopped,
+    );
+
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+    // Process is stopped at the first raise(SIGTRAP) call in the anti_debugger test binary.
+
+    // Get the address of the function "an_innocent_function" in the anti_debugger test binary.
+    let stdout_from_child = read_port.read().expect("Failed to read from pipe channel");
+    let address_string =
+        String::from_utf8(stdout_from_child).expect("Failed to convert stdout to string");
+    let address = usize::from_str_radix(address_string.trim(), 16).unwrap();
+
+    // Set a watchpoint on the address of the function "an_innocent_function".
+    // The watchpoint should trigger when the function is called.
+    let _watchpoint_id = target_process
+        .create_watchpoint(
+            VirtAddress::new(address),
+            1,
+            libsdb::process::StopPointMode::ReadWrite,
+            true,
+        )
+        .expect("Failed to create watchpoint")
+        .id();
+
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+    // Process should have stopped at the watchpoint.
+
+    target_process.single_step().expect("Failed to single step"); // Single step over the watchpoint
+    // Create a software breakpoint at the address where the watchpoint is set.
+    target_process
+        .create_breakpoint(VirtAddress::new(address), true, false)
+        .expect("Failed to create breakpoint site at load address");
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    let reason = target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+    // Process should have stopped at the second raise(SIGTRAP) call in the anti_debugger test binary.
+    assert!(matches!(reason, WaitStatus::Stopped(_, Signal::SIGTRAP)));
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+    // Process should have raised a SIGTRAP due to the watchpoint we have set
+    let stdout_from_child = read_port.read().expect("Failed to read from pipe channel");
+    let output = String::from_utf8(stdout_from_child).expect("Failed to convert stdout to string");
+    assert_eq!(
+        output.trim(),
+        "Unmodified",
+        "Expected output to be 'Checksum mismatch', got: {}",
+        output
+    );
 }

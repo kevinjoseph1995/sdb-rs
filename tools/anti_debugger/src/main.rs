@@ -21,6 +21,7 @@ fn main() {
                 println!("Checksum mismatch");
                 stdout().flush().unwrap();
             }
+
             raise(nix::sys::signal::Signal::SIGTRAP).unwrap();
         }
     }

@@ -33,11 +33,13 @@ pub fn handle_command(command: &Command, process: &Process) -> Result<()> {
         last_in_chain.metadata.category == Some(CommandCategory::Disassemble),
         "Command category should be Disassemble"
     );
-    let address = match last_in_chain
-        .parsed_options
-        .iter()
-        .find(|option| option.metadata.aliases.contains(&"address"))
-    {
+    let address = match last_in_chain.parsed_options.iter().find(|option| {
+        option
+            .metadata
+            .aliases
+            .iter()
+            .any(|alias_arg| alias_arg.contains(&"address"))
+    }) {
         Some(ParsedOption { value, metadata }) => {
             if value.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -58,11 +60,13 @@ pub fn handle_command(command: &Command, process: &Process) -> Result<()> {
         None => process.get_pc()?,
     };
 
-    let number_of_instructions = match last_in_chain
-        .parsed_options
-        .iter()
-        .find(|option| option.metadata.aliases.contains(&"number"))
-    {
+    let number_of_instructions = match last_in_chain.parsed_options.iter().find(|option| {
+        option
+            .metadata
+            .aliases
+            .iter()
+            .any(|alias_arg| alias_arg.contains(&"number"))
+    }) {
         Some(ParsedOption { value, metadata }) => {
             if value.is_empty() {
                 return Err(anyhow::anyhow!(
@@ -76,6 +80,5 @@ pub fn handle_command(command: &Command, process: &Process) -> Result<()> {
         }
         None => 10, // Default to 10 instructions if not specified
     };
-
     print_disassembly(process, number_of_instructions, Some(address))
 }
