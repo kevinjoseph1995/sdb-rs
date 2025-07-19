@@ -5,6 +5,9 @@ use std::path::PathBuf;
 /////////////////////////////////////////
 use anyhow::{Context, Result, anyhow};
 use core::panic;
+use libc::SI_KERNEL;
+use libc::TRAP_HWBKPT;
+use libc::TRAP_TRACE;
 use libc::c_long;
 use libc::personality;
 use libc::user;
@@ -49,6 +52,19 @@ pub enum ProcessState {
     Stopped,        // Stopped on a signal.
     TracingStopped, // Tracing stopped
     Unknown(char),
+}
+
+#[derive(Debug)]
+pub enum TrapType {
+    SoftwareBreakpoint,
+    HardwareBreakpoint,
+    SingleStep,
+}
+
+#[derive(Debug)]
+pub struct StopReason {
+    pub wait_status: WaitStatus,
+    pub trap_type: Option<TrapType>,
 }
 
 impl From<char> for ProcessState {
@@ -121,7 +137,7 @@ impl Process {
                 if debug_process_being_launched {
                     // If we are debugging the process being launched, we need to wait for it to stop.
                     // traceme() is called in the child process, so we need to wait for it to stop.
-                    match child_process_handle.wait_on_signal(None)? {
+                    match child_process_handle.wait_on_signal(None)?.wait_status {
                         WaitStatus::Exited(_, exit_code) => {
                             let mut error_message =
                                 format!("Child process exited with exit code: {} . ", exit_code);
@@ -216,11 +232,30 @@ impl Process {
         return &self.registers;
     }
 
+    pub fn get_trap_reason(&self) -> Result<Option<TrapType>> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to get trap reason"
+        );
+        assert!(
+            self.state == ProcessHandleState::Stopped,
+            "Process must be stopped to get trap reason"
+        );
+        let siginfo = nix::sys::ptrace::getsiginfo(self.pid)?;
+        match siginfo.si_code {
+            TRAP_TRACE => Ok(Some(TrapType::SingleStep)),
+            SI_KERNEL => Ok(Some(TrapType::SoftwareBreakpoint)), // Linux kernel uses SI_KERNEL for software breakpoints
+            TRAP_HWBKPT => Ok(Some(TrapType::HardwareBreakpoint)),
+            _ => Ok(None),
+        }
+    }
+
     /// Waits for the process to stop or exit. This function blocks until the process undergoes a state change.
-    pub fn wait_on_signal(&mut self, options: Option<WaitPidFlag>) -> Result<WaitStatus> {
-        let waitstatus: WaitStatus =
+    pub fn wait_on_signal(&mut self, options: Option<WaitPidFlag>) -> Result<StopReason> {
+        let wait_status: WaitStatus =
             waitpid(self.pid, options).context("Failed to wait for process")?;
-        match &waitstatus {
+        let mut trap_type: Option<TrapType> = None;
+        match &wait_status {
             WaitStatus::Exited(_, _) => {
                 self.state = ProcessHandleState::Exited;
             }
@@ -238,8 +273,9 @@ impl Process {
         if self.is_attached && self.state == ProcessHandleState::Stopped {
             self.read_all_registers()
                 .context("Failed to read registers after waiting for process")?;
+            trap_type = self.get_trap_reason()?;
         }
-        if let WaitStatus::Stopped(_, Signal::SIGTRAP) = waitstatus {
+        if let WaitStatus::Stopped(_, Signal::SIGTRAP) = wait_status {
             // When the process stops due to a SIGTRAP, it is likely due to a breakpoint or single-step.
             let instruction_begin = self.get_pc()? - VirtAddress::new(1usize);
             if self
@@ -252,7 +288,10 @@ impl Process {
                 self.set_pc(instruction_begin)?;
             }
         }
-        Ok(waitstatus)
+        Ok(StopReason {
+            wait_status,
+            trap_type,
+        })
     }
 
     /// Resumes the execution of the process being debugged.
@@ -283,7 +322,7 @@ impl Process {
         Ok(())
     }
 
-    pub fn single_step(&mut self) -> Result<WaitStatus> {
+    pub fn single_step(&mut self) -> Result<StopReason> {
         assert!(self.is_attached, "Process must be attached to single step");
 
         let mut breakpoint_to_reenable: Option<usize> = None;

@@ -455,7 +455,8 @@ fn test_breakpoint_setting() {
         .expect("Failed to resume process");
     let wait_status = target_process
         .wait_on_signal(None)
-        .expect("Failed to wait for process");
+        .expect("Failed to wait for process")
+        .wait_status;
     assert!(matches!(
         wait_status,
         WaitStatus::Stopped(_, Signal::SIGTRAP)
@@ -727,7 +728,8 @@ fn test_watchpoints() {
         .expect("Failed to resume process");
     let reason = target_process
         .wait_on_signal(None)
-        .expect("Failed to wait for process");
+        .expect("Failed to wait for process")
+        .wait_status;
     // Process should have stopped at the second raise(SIGTRAP) call in the anti_debugger test binary.
     assert!(matches!(reason, WaitStatus::Stopped(_, Signal::SIGTRAP)));
     target_process

@@ -11,7 +11,7 @@ use rustyline::{
 };
 /////////////////////////////////////////
 use crate::command::{self, Command, CommandCategory, get_completions, get_description_for_help};
-use libsdb::process::Process;
+use libsdb::process::{Process, StopReason};
 /////////////////////////////////////////
 
 pub struct Application {
@@ -140,8 +140,8 @@ impl Application {
         Ok(())
     }
 
-    fn handle_stop_reason(&self, waitstatus: WaitStatus) -> Result<()> {
-        match waitstatus {
+    fn handle_stop_reason(&self, stop_reason: StopReason) -> Result<()> {
+        match stop_reason.wait_status {
             WaitStatus::Exited(_, exit_status) => {
                 println!("Process exited with status: {}", exit_status);
             }
@@ -164,7 +164,7 @@ impl Application {
                 println!("Process is still alive.");
             }
             _ => {
-                println!("Unhandled wait status: {:?}", waitstatus);
+                println!("Unhandled wait status: {:?}", stop_reason.wait_status);
             }
         }
         if self.inferior_process.get_state() == libsdb::process::ProcessHandleState::Stopped {
