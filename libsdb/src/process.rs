@@ -54,7 +54,7 @@ pub enum ProcessState {
     Unknown(char),
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum TrapType {
     SoftwareBreakpoint,
     HardwareBreakpoint,
@@ -228,6 +228,73 @@ impl Process {
         }
     }
 
+    pub fn get_current_hardware_stoppoint(&self) -> Result<HardwareStopPointId> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to get current hardware stop point"
+        );
+        assert!(
+            self.state == ProcessHandleState::Stopped,
+            "Process must be stopped to get current hardware stop point"
+        );
+        /* DR6 Debug status register:
+        The least significant 4 bits of the status register (DR6) correspond to each of these registers in turn.
+        If code triggers a hardware breakpoint for one of those addresses, the relevant bit in DR6 will be set to 1.
+        For example, triggering the breakpoint for the address held in DR2 would set the third bit in DR6.
+        */
+        let status = match self
+            .get_registers()
+            .get_register_value(register_info::RegisterId::dr(6))
+            .context("Failed to get DR6 register")?
+        {
+            RegisterValue::U64(value) => value,
+            _ => {
+                return Err(anyhow!("Unexpected register value type for DR6",));
+            }
+        };
+        if status & 0b1111 == 0 {
+            return Err(anyhow!("No hardware stop point triggered"));
+        }
+        // Find the first set bit in the status register.
+        let triggered_index = status.trailing_zeros() as u32;
+        if triggered_index >= 4 {
+            return Err(anyhow!(
+                "Triggered index out of bounds: {}",
+                triggered_index
+            ));
+        }
+        // The triggered index corresponds to the debug register that was triggered.
+        let debug_register_id = register_info::RegisterId::dr(triggered_index);
+        let address = match self
+            .get_registers()
+            .get_register_value(debug_register_id)
+            .context("Failed to get debug register value")?
+        {
+            RegisterValue::U64(value) => VirtAddress::from(value as usize),
+            _ => {
+                return Err(anyhow!(
+                    "Unexpected register value type for debug register: {:?}",
+                    debug_register_id
+                ));
+            }
+        };
+        // Check if it is a hardware stop point or a watchpoint.
+        for watchpoint in self.watchpoints.iter() {
+            if watchpoint.virtual_address == address {
+                return Ok(HardwareStopPointId::WatchpointId(watchpoint.id));
+            }
+        }
+        for breakpoint in self.breakpoints.iter() {
+            if breakpoint.virtual_address == address && breakpoint.is_hardware {
+                return Ok(HardwareStopPointId::HardwareStopPointId(breakpoint.id));
+            }
+        }
+        panic!(
+            "No hardware stop point or watchpoint found for address: {}",
+            address
+        );
+    }
+
     pub fn get_registers(&self) -> &Registers {
         return &self.registers;
     }
@@ -286,6 +353,17 @@ impl Process {
             {
                 // If the breakpoint is enabled at the instruction address, we need to set the PC to the instruction address.
                 self.set_pc(instruction_begin)?;
+            } else if trap_type == Some(TrapType::HardwareBreakpoint) {
+                if let HardwareStopPointId::WatchpointId(watchpoint_id) =
+                    self.get_current_hardware_stoppoint()?
+                {
+                    let index = self
+                        .watchpoints
+                        .iter()
+                        .position(|wp| wp.id == watchpoint_id)
+                        .expect("Watchpoint not found");
+                    self.update_watchpoint_data(index)?;
+                }
             }
         }
         Ok(StopReason {
@@ -566,12 +644,42 @@ impl Process {
             ));
         }
         self.watchpoints.push(Watchpoint::new(address, mode, size)?);
+        let index = self.watchpoints.len() - 1;
         if enable_after_creation {
-            let index = self.watchpoints.len() - 1;
             self.enable_watchpoint_at_index(index)
                 .context("Failed to enable watchpoint after creation")?;
         }
+        self.update_watchpoint_data(index)
+            .context("Failed to update watchpoint data after enabling")?;
         Ok(self.watchpoints.last_mut().unwrap())
+    }
+
+    fn update_watchpoint_data(&mut self, index: usize) -> Result<()> {
+        assert!(
+            self.is_attached,
+            "Process must be attached to update watchpoint data"
+        );
+        let watchpoint_address = self.watchpoints[index].virtual_address;
+        let watchpoint_size = self.watchpoints[index].size as usize;
+        let current_data = self
+            .read_memory(watchpoint_address, watchpoint_size)
+            .context("Failed to read watchpoint data")?;
+        if current_data.len() != watchpoint_size {
+            return Err(anyhow!(
+                "Watchpoint size mismatch: expected {}, got {}",
+                watchpoint_size,
+                current_data.len()
+            ));
+        }
+        // current_data.len() can be less than 8 bytes, so we need to handle that.
+        // We will convert the current_data to a u64, filling with zeros if necessary.
+        let mut data = [0u8; 8];
+        data[..current_data.len()].copy_from_slice(&current_data); // Least significant bytes first, most significant bytes zeroed-> Little Endian
+        self.watchpoints[index].previous_data = self.watchpoints[index].data;
+        self.watchpoints[index].data = Some(u64::from_le_bytes(
+            data.try_into().expect("Invalid watchpoint data length"),
+        ));
+        Ok(())
     }
 
     fn enable_watchpoint_at_index(&mut self, index: usize) -> Result<()> {
@@ -1162,6 +1270,12 @@ impl Registers {
 
 pub type StopPointId = i32;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HardwareStopPointId {
+    HardwareStopPointId(StopPointId),
+    WatchpointId(StopPointId),
+}
+
 #[derive(Debug)]
 pub struct Watchpoint {
     id: StopPointId,
@@ -1170,6 +1284,8 @@ pub struct Watchpoint {
     mode: StopPointMode,
     size: u8,
     hardware_index: Option<u8>, // Only used for hardware breakpoints
+    data: Option<u64>,
+    previous_data: Option<u64>,
 }
 
 impl Watchpoint {
@@ -1189,6 +1305,8 @@ impl Watchpoint {
             mode,
             size,
             hardware_index: None,
+            data: None,
+            previous_data: None,
         })
     }
 
@@ -1202,6 +1320,14 @@ impl Watchpoint {
 
     pub fn id(&self) -> StopPointId {
         self.id
+    }
+
+    pub fn get_data(&self) -> Option<u64> {
+        self.data
+    }
+
+    pub fn get_previous_data(&self) -> Option<u64> {
+        self.previous_data
     }
 
     pub fn is_enabled(&self) -> bool {

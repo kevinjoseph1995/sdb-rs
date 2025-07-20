@@ -11,7 +11,7 @@ use rustyline::{
 };
 /////////////////////////////////////////
 use crate::command::{self, Command, CommandCategory, get_completions, get_description_for_help};
-use libsdb::process::{Process, StopReason};
+use libsdb::process::{HardwareStopPointId, Process, StopReason};
 /////////////////////////////////////////
 
 pub struct Application {
@@ -145,12 +145,41 @@ impl Application {
             WaitStatus::Exited(_, exit_status) => {
                 println!("Process exited with status: {}", exit_status);
             }
-            WaitStatus::Stopped(_, Signal::SIGTRAP) => {
-                println!(
-                    "Hit breakpoint at address: {}",
-                    self.inferior_process.get_pc()?
-                );
-            }
+            WaitStatus::Stopped(_, Signal::SIGTRAP) => match stop_reason.trap_type {
+                Some(libsdb::process::TrapType::SoftwareBreakpoint) => {
+                    println!(
+                        "Process stopped at software breakpoint. rip={}",
+                        self.inferior_process.get_pc()?
+                    );
+                }
+                Some(libsdb::process::TrapType::HardwareBreakpoint) => {
+                    let address = self.inferior_process.get_pc()?;
+                    if let HardwareStopPointId::WatchpointId(id) =
+                        self.inferior_process.get_current_hardware_stoppoint()?
+                    {
+                        let index = self
+                            .inferior_process
+                            .watchpoints
+                            .iter()
+                            .find(|wp| wp.id() == id)
+                            .expect("Watchpoint not found");
+                        println!(
+                            "Process stopped at hardware watchpoint. rip={}, data={:#x}, previous_data={:#x}",
+                            address,
+                            index.get_data().unwrap_or(0),
+                            index.get_previous_data().unwrap_or(0)
+                        );
+                    } else {
+                        println!("Process stopped at hardware breakpoint. rip={}", address);
+                    }
+                }
+                Some(libsdb::process::TrapType::SingleStep) => {
+                    println!("Single step");
+                }
+                _ => {
+                    println!("Process stopped at unknown trap type.");
+                }
+            },
             WaitStatus::Stopped(_, signal) => {
                 println!("Process stopped by signal: {}", signal);
             }
@@ -222,15 +251,8 @@ impl Application {
                 &mut self.inferior_process,
             ),
             CommandCategory::Step => {
-                self.inferior_process.single_step()?;
-                if self.inferior_process.get_state() == libsdb::process::ProcessHandleState::Stopped
-                {
-                    command::disassemble_command::print_disassembly(
-                        &self.inferior_process,
-                        1,
-                        self.inferior_process.get_pc().ok(),
-                    )?;
-                }
+                let stop_reason = self.inferior_process.single_step()?;
+                self.handle_stop_reason(stop_reason)?;
                 Ok(())
             }
             CommandCategory::Memory(cmd) => {
