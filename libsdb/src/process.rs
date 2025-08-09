@@ -299,14 +299,10 @@ impl Process {
         return &self.registers;
     }
 
-    pub fn get_trap_reason(&self) -> Result<Option<TrapType>> {
+    pub fn get_trap_reason(&self, _signal: &Signal) -> Result<Option<TrapType>> {
         assert!(
             self.is_attached,
             "Process must be attached to get trap reason"
-        );
-        assert!(
-            self.state == ProcessHandleState::Stopped,
-            "Process must be stopped to get trap reason"
         );
         let siginfo = nix::sys::ptrace::getsiginfo(self.pid)?;
         match siginfo.si_code {
@@ -317,12 +313,24 @@ impl Process {
         }
     }
 
+    fn construct_stop_reason(&mut self, wait_status: WaitStatus) -> Result<StopReason> {
+        let trap_type = if let WaitStatus::Stopped(_, signal) = &wait_status {
+            self.get_trap_reason(signal)?
+        } else {
+            None
+        };
+        Ok(StopReason {
+            wait_status,
+            trap_type,
+        })
+    }
+
     /// Waits for the process to stop or exit. This function blocks until the process undergoes a state change.
     pub fn wait_on_signal(&mut self, options: Option<WaitPidFlag>) -> Result<StopReason> {
-        let wait_status: WaitStatus =
-            waitpid(self.pid, options).context("Failed to wait for process")?;
-        let mut trap_type: Option<TrapType> = None;
-        match &wait_status {
+        let stop_reason = self.construct_stop_reason(
+            waitpid(self.pid, options).context("Failed to wait for process")?,
+        )?;
+        match &stop_reason.wait_status {
             WaitStatus::Exited(_, _) => {
                 self.state = ProcessHandleState::Exited;
             }
@@ -340,9 +348,8 @@ impl Process {
         if self.is_attached && self.state == ProcessHandleState::Stopped {
             self.read_all_registers()
                 .context("Failed to read registers after waiting for process")?;
-            trap_type = self.get_trap_reason()?;
         }
-        if let WaitStatus::Stopped(_, Signal::SIGTRAP) = wait_status {
+        if let WaitStatus::Stopped(_, Signal::SIGTRAP) = stop_reason.wait_status {
             // When the process stops due to a SIGTRAP, it is likely due to a breakpoint or single-step.
             let instruction_begin = self.get_pc()? - VirtAddress::new(1usize);
             if self
@@ -353,7 +360,7 @@ impl Process {
             {
                 // If the breakpoint is enabled at the instruction address, we need to set the PC to the instruction address.
                 self.set_pc(instruction_begin)?;
-            } else if trap_type == Some(TrapType::HardwareBreakpoint) {
+            } else if stop_reason.trap_type == Some(TrapType::HardwareBreakpoint) {
                 if let HardwareStopPointId::WatchpointId(watchpoint_id) =
                     self.get_current_hardware_stoppoint()?
                 {
@@ -366,10 +373,7 @@ impl Process {
                 }
             }
         }
-        Ok(StopReason {
-            wait_status,
-            trap_type,
-        })
+        Ok(stop_reason)
     }
 
     /// Resumes the execution of the process being debugged.
