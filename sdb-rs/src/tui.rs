@@ -222,6 +222,11 @@ impl Application {
                 Ok(())
             }
             CommandCategory::Run | CommandCategory::Continue => {
+                if self.inferior_process.get_state() == libsdb::process::ProcessHandleState::Exited
+                {
+                    println!("Process has exited. Restarting...");
+                    self.inferior_process.restart_process()?;
+                }
                 self.inferior_process.resume_process().unwrap_or_else(|e| {
                     // Not a hard error, just print and continue
                     println!("Failed to resume process: {}", e);

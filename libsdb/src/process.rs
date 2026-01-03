@@ -88,6 +88,8 @@ pub struct Process {
     read_port: Option<pipe_channel::ReadPort>,
     is_attached: bool,
     registers: Registers,
+    executable_path: Option<PathBuf>,
+    args: Option<String>,
     pub breakpoints: Vec<Breakpoint>,
     pub watchpoints: Vec<Watchpoint>,
 }
@@ -103,6 +105,8 @@ impl Process {
             read_port: None,
             is_attached: true,
             registers: Registers::new(),
+            executable_path: None,
+            args: None,
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
         };
@@ -130,6 +134,8 @@ impl Process {
                     read_port: None,
                     is_attached: debug_process_being_launched,
                     registers: Registers::new(),
+                    executable_path: Some(executable_path.clone()),
+                    args: args.clone(),
                     breakpoints: Vec::new(),
                     watchpoints: Vec::new(),
                 };
@@ -374,6 +380,26 @@ impl Process {
             }
         }
         Ok(stop_reason)
+    }
+
+    pub fn restart_process(&mut self) -> Result<()> {
+        debug_assert!(
+            self.state == ProcessHandleState::Exited,
+            "Process must be exited to restart"
+        );
+        debug_assert!(
+            self.executable_path.is_some(),
+            "Executable path must be set to restart process"
+        );
+        *self = Process::launch(
+            self.executable_path
+                .as_ref()
+                .expect("Executable path must be set to restart process"),
+            self.args.clone(),
+            true,
+            None, /*No stdout replacement */
+        )?;
+        Ok(())
     }
 
     /// Resumes the execution of the process being debugged.
