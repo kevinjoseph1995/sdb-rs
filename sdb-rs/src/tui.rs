@@ -11,7 +11,10 @@ use rustyline::{
 };
 /////////////////////////////////////////
 use crate::command::{self, Command, CommandCategory, get_completions, get_description_for_help};
-use libsdb::process::{HardwareStopPointId, Process, StopReason};
+use libsdb::{
+    Sysno,
+    process::{HardwareStopPointId, Process, StopReason},
+};
 /////////////////////////////////////////
 
 pub struct Application {
@@ -176,6 +179,37 @@ impl Application {
                 Some(libsdb::process::TrapType::SingleStep) => {
                     println!("Single step");
                 }
+                Some(libsdb::process::TrapType::Syscall) => {
+                    if let Some(syscall_info) = stop_reason.syscall_info {
+                        let syscall = Sysno::from(syscall_info.number as i32);
+
+                        if syscall_info.entry {
+                            let formatted_args = match syscall_info.metadata {
+                                libsdb::process::SyscallMetadata::EntryArgs(args) => {
+                                    let arg_strs: Vec<String> =
+                                        args.iter().map(|arg| format!("0x{:x}", arg)).collect();
+                                    arg_strs.join(", ")
+                                }
+                                _ => panic!("Expected EntryArgs metadata on syscall entry"),
+                            };
+                            println!(
+                                "Process stopped at syscall entry: {} (number={}) with args: ({})",
+                                syscall, syscall_info.number, formatted_args
+                            );
+                        } else {
+                            let return_value = match syscall_info.metadata {
+                                libsdb::process::SyscallMetadata::ExitReturnValue(retval) => retval,
+                                _ => panic!("Expected ExitReturnValue metadata on syscall exit"),
+                            };
+                            println!(
+                                "Process stopped at syscall exit: {} (number={}) with return value: {}",
+                                syscall, syscall_info.number, return_value
+                            );
+                        }
+                    } else {
+                        println!("Process stopped at syscall (no info available)");
+                    }
+                }
                 _ => {
                     println!("Process stopped at unknown trap type.");
                 }
@@ -273,6 +307,9 @@ impl Application {
                     command.args,
                     &mut self.inferior_process,
                 ),
+            CommandCategory::Catchpoint(catchpoint_command_category) => {
+                catchpoint_command_category.handle_command(command.args, &mut self.inferior_process)
+            }
         }
     }
 

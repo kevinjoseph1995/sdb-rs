@@ -4,11 +4,13 @@ use std::iter::Peekable;
 use anyhow::{Ok, Result};
 /////////////////////////////////////////
 pub mod breakpoint_command;
+pub mod catchpoint_command;
 pub mod disassemble_command;
 pub mod memory_command;
 pub mod register_command;
 /////////////////////////////////////////
 use breakpoint_command::BreakpointCommandCategory;
+use catchpoint_command::{CatchpointCategory, SyscallCommandCategory};
 use memory_command::MemoryCommandCategory;
 use register_command::RegisterCommandCategory;
 /////////////////////////////////////////
@@ -70,10 +72,13 @@ pub enum CommandCategory {
     Memory(MemoryCommandCategory),
     Disassemble,
     Watchpoint(WatchpointCommandCategory),
+    Catchpoint(CatchpointCategory),
 }
 
 use BreakpointCommandCategory::*;
+use CatchpointCategory::*;
 use CommandCategory::*;
+use SyscallCommandCategory::*;
 
 use crate::command::breakpoint_command::WatchpointCommandCategory;
 
@@ -304,6 +309,38 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         None,
         []
     ),
+    cmd!(
+        ["catchpoint"],
+        "Catchpoint operations",
+        [cmd!(
+            ["syscalls", "s"],
+            "Catch syscalls",
+            [
+                cmd!(
+                    ["none"],
+                    "Disable syscall catching",
+                    [],
+                    Some(Catchpoint(Syscalls(Clear))),
+                    None,
+                    []
+                ),
+                cmd!(
+                    ["all"],
+                    "Catch all syscalls",
+                    [],
+                    Some(Catchpoint(Syscalls(All))),
+                    None,
+                    []
+                ),
+            ],
+            Some(Catchpoint(Syscalls(Specific))),
+            Some(&["none", "all", "[syscall_name | syscall_number]"]),
+            []
+        ),],
+        None,
+        None,
+        []
+    ),
 ];
 
 const HELP_COMMAND_METADATA: CommandMetadata = CommandMetadata {
@@ -479,7 +516,9 @@ fn validate_parse_chain(parse_chain: &[ParseChainNode]) -> Result<()> {
         return Err(anyhow::anyhow!("Parse chain is empty"));
     }
     let terminal_parse_node = parse_chain.last().unwrap();
-    if !terminal_parse_node.metadata.subcommands.is_empty() {
+    if !terminal_parse_node.metadata.subcommands.is_empty()
+        && terminal_parse_node.metadata.category.is_none()
+    {
         return Err(anyhow::anyhow!(
             "Incomplete command: expected subcommand for '{}'",
             terminal_parse_node.metadata.name

@@ -25,6 +25,7 @@ use nix::unistd::ForkResult;
 use nix::unistd::dup2_stdout;
 use nix::unistd::execvp;
 use nix::unistd::fork;
+use syscalls::Sysno;
 /////////////////////////////////////////
 use crate::pipe_channel;
 use crate::register_info;
@@ -59,12 +60,47 @@ pub enum TrapType {
     SoftwareBreakpoint,
     HardwareBreakpoint,
     SingleStep,
+    Syscall,
+}
+
+#[derive(Debug, Clone)]
+pub enum SyscallCatchPolicyMode {
+    None,             // No syscalls are caught
+    All,              // All syscalls are caught
+    Some(Vec<Sysno>), // Only the specified syscalls are caught
+}
+
+impl PartialEq for SyscallCatchPolicyMode {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SyscallCatchPolicyMode::None, SyscallCatchPolicyMode::None) => true,
+            (SyscallCatchPolicyMode::All, SyscallCatchPolicyMode::All) => true,
+            (SyscallCatchPolicyMode::Some(a), SyscallCatchPolicyMode::Some(b)) => {
+                a.len() == b.len() && a.iter().all(|item| b.contains(item))
+            }
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum SyscallMetadata {
+    EntryArgs([u64; 6]),
+    ExitReturnValue(i64),
+}
+
+#[derive(Debug)]
+pub struct SyscallInformation {
+    pub number: u16,
+    pub entry: bool,
+    pub metadata: SyscallMetadata,
 }
 
 #[derive(Debug)]
 pub struct StopReason {
     pub wait_status: WaitStatus,
     pub trap_type: Option<TrapType>,
+    pub syscall_info: Option<SyscallInformation>,
 }
 
 impl From<char> for ProcessState {
@@ -90,11 +126,19 @@ pub struct Process {
     registers: Registers,
     executable_path: Option<PathBuf>,
     args: Option<String>,
+    syscall_catch_policy: SyscallCatchPolicyMode,
+    expecting_syscall_exit: bool,
     pub breakpoints: Vec<Breakpoint>,
     pub watchpoints: Vec<Watchpoint>,
 }
 
 impl Process {
+    fn set_ptrace_options(pid: Pid) -> Result<()> {
+        nix::sys::ptrace::setoptions(pid, nix::sys::ptrace::Options::PTRACE_O_TRACESYSGOOD)
+            .context("Failed to set ptrace options")?;
+        Ok(())
+    }
+
     /// Attaches to an existing process for debugging.
     pub fn attach(pid: Pid) -> Result<Self> {
         attach(pid).context("Failed to attach to process")?; // The tracee is sent a SIGSTOP, but will not necessarily have stopped by the completion of this call.
@@ -107,10 +151,13 @@ impl Process {
             registers: Registers::new(),
             executable_path: None,
             args: None,
+            syscall_catch_policy: SyscallCatchPolicyMode::None,
+            expecting_syscall_exit: false,
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
         };
         let _stop_reason = child_process_handle.wait_on_signal(None)?;
+        Self::set_ptrace_options(pid)?;
         Ok(child_process_handle)
     }
 
@@ -135,7 +182,9 @@ impl Process {
                     is_attached: debug_process_being_launched,
                     registers: Registers::new(),
                     executable_path: Some(executable_path.clone()),
+                    syscall_catch_policy: SyscallCatchPolicyMode::None,
                     args: args.clone(),
+                    expecting_syscall_exit: false,
                     breakpoints: Vec::new(),
                     watchpoints: Vec::new(),
                 };
@@ -174,6 +223,7 @@ impl Process {
                         }
                         _ => {}
                     }
+                    Self::set_ptrace_options(child_process_handle.pid)?;
                 }
                 child_process_handle.read_port = Some(read_port);
                 Ok(child_process_handle)
@@ -305,12 +355,13 @@ impl Process {
         return &self.registers;
     }
 
-    pub fn get_trap_reason(&self, _signal: &Signal) -> Result<Option<TrapType>> {
+    pub fn get_trap_reason(&self) -> Result<Option<TrapType>> {
         assert!(
             self.is_attached,
             "Process must be attached to get trap reason"
         );
         let siginfo = nix::sys::ptrace::getsiginfo(self.pid)?;
+
         match siginfo.si_code {
             TRAP_TRACE => Ok(Some(TrapType::SingleStep)),
             SI_KERNEL => Ok(Some(TrapType::SoftwareBreakpoint)), // Linux kernel uses SI_KERNEL for software breakpoints
@@ -320,15 +371,119 @@ impl Process {
     }
 
     fn construct_stop_reason(&mut self, wait_status: WaitStatus) -> Result<StopReason> {
-        let trap_type = if let WaitStatus::Stopped(_, signal) = &wait_status {
-            self.get_trap_reason(signal)?
+        let trap_type = if let WaitStatus::Stopped(_pid, _signal) = &wait_status {
+            self.get_trap_reason()?
         } else {
             None
         };
         Ok(StopReason {
             wait_status,
             trap_type,
+            syscall_info: None, // Syscall information handling can be added here later
         })
+    }
+
+    pub fn set_syscall_catch_policy(&mut self, policy: SyscallCatchPolicyMode) {
+        self.syscall_catch_policy = policy;
+    }
+
+    fn augment_stop_reason_with_syscall_info(
+        &mut self,
+        mut stop_reason: StopReason,
+    ) -> Result<StopReason> {
+        if let WaitStatus::PtraceSyscall(_pid) = stop_reason.wait_status {
+            stop_reason.trap_type = Some(TrapType::Syscall);
+            stop_reason.wait_status = WaitStatus::Stopped(self.pid, Signal::SIGTRAP); // Convert to Stopped status for consistency
+            let id = match self
+                .registers
+                .get_register_value(register_info::RegisterId::orig_rax)?
+            {
+                RegisterValue::U64(value) => value as u16,
+                _ => {
+                    return Err(anyhow!("Unexpected register value type for orig_rax",));
+                }
+            };
+            if self.expecting_syscall_exit {
+                // Handle syscall exit
+                let return_value: i64 = match self
+                    .registers
+                    .get_register_value(register_info::RegisterId::rax)?
+                {
+                    RegisterValue::U64(u64_value) => i64::from_le_bytes(u64_value.to_le_bytes()),
+                    _ => {
+                        return Err(anyhow!("Unexpected register value type for rax",));
+                    }
+                };
+                stop_reason.syscall_info = Some(SyscallInformation {
+                    number: id,
+                    entry: false,
+                    metadata: SyscallMetadata::ExitReturnValue(return_value),
+                });
+                self.expecting_syscall_exit = false;
+            } else {
+                // Handle syscall entry
+                self.expecting_syscall_exit = true;
+                // https://man7.org/linux/man-pages/man2/syscall.2.html
+                // See the system call interface for x86_64 Linux for argument registers
+                // Arch/ABI      arg1  arg2  arg3  arg4  arg5  arg6  arg7
+                // x86-64        rdi   rsi   rdx   r10   r8    r9    -
+                const ARG_REGISTERS: [register_info::RegisterId; 6] = [
+                    register_info::RegisterId::rdi,
+                    register_info::RegisterId::rsi,
+                    register_info::RegisterId::rdx,
+                    register_info::RegisterId::r10,
+                    register_info::RegisterId::r8,
+                    register_info::RegisterId::r9,
+                ];
+                let mut args: [u64; 6] = [0; 6];
+                for (i, reg_id) in ARG_REGISTERS.iter().enumerate() {
+                    args[i] = match self.registers.get_register_value(*reg_id)? {
+                        RegisterValue::U64(value) => value,
+                        _ => {
+                            return Err(anyhow!(
+                                "Unexpected register value type for syscall argument register: {:?}",
+                                reg_id
+                            ));
+                        }
+                    };
+                }
+                stop_reason.syscall_info = Some(SyscallInformation {
+                    number: id,
+                    entry: true,
+                    metadata: SyscallMetadata::EntryArgs(args),
+                });
+            }
+        } else {
+            // Not a syscall stop
+            self.expecting_syscall_exit = false; // Reset the flag if we are not in a syscall stop
+        }
+        Ok(stop_reason)
+    }
+
+    fn maybe_resume_from_syscall_stop(&mut self, stop_reason: StopReason) -> Result<StopReason> {
+        debug_assert!(
+            self.is_attached,
+            "Process must be attached to resume from syscall stop"
+        );
+        debug_assert!(
+            self.state == ProcessHandleState::Stopped,
+            "Process must be stopped to resume from syscall stop"
+        );
+        match (&self.syscall_catch_policy, &stop_reason.syscall_info) {
+            (SyscallCatchPolicyMode::Some(to_catch), Some(syscall_info)) => {
+                if !to_catch.contains(&(Sysno::from(syscall_info.number as i32))) {
+                    // Resume the process if we are not catching this syscall
+                    self.resume_process()
+                        .context("Failed to resume process from syscall stop")?;
+                    // Wait for the next stop
+                    return self.wait_on_signal(None); // This is a recursive call
+                }
+            }
+            _ => {
+                // No-op
+            }
+        }
+        Ok(stop_reason)
     }
 
     /// Waits for the process to stop or exit. This function blocks until the process undergoes a state change.
@@ -343,7 +498,7 @@ impl Process {
             WaitStatus::Signaled(_pid, _signal, _) => {
                 self.state = ProcessHandleState::Terminated;
             }
-            WaitStatus::Stopped(_pid, _signal) => {
+            WaitStatus::Stopped(_, _) | WaitStatus::PtraceSyscall(_) => {
                 self.state = ProcessHandleState::Stopped;
             }
             WaitStatus::Continued(_) => {
@@ -355,6 +510,7 @@ impl Process {
             self.read_all_registers()
                 .context("Failed to read registers after waiting for process")?;
         }
+        let mut stop_reason = self.augment_stop_reason_with_syscall_info(stop_reason)?;
         if let WaitStatus::Stopped(_, Signal::SIGTRAP) = stop_reason.wait_status {
             // When the process stops due to a SIGTRAP, it is likely due to a breakpoint or single-step.
             let instruction_begin = self.get_pc()? - VirtAddress::new(1usize);
@@ -377,6 +533,8 @@ impl Process {
                         .expect("Watchpoint not found");
                     self.update_watchpoint_data(index)?;
                 }
+            } else if stop_reason.trap_type == Some(TrapType::Syscall) {
+                stop_reason = self.maybe_resume_from_syscall_stop(stop_reason)?;
             }
         }
         Ok(stop_reason)
@@ -391,6 +549,7 @@ impl Process {
             self.executable_path.is_some(),
             "Executable path must be set to restart process"
         );
+        let old_syscall_policy = self.syscall_catch_policy.clone();
         *self = Process::launch(
             self.executable_path
                 .as_ref()
@@ -399,6 +558,7 @@ impl Process {
             true,
             None, /*No stdout replacement */
         )?;
+        self.syscall_catch_policy = old_syscall_policy;
         Ok(())
     }
 
@@ -422,9 +582,16 @@ impl Process {
                 .context("Failed to re-enable breakpoint after stepping")?;
         }
 
-        if let Err(e) = nix::sys::ptrace::cont(self.pid, None) {
-            eprintln!("Failed to resume process: {}", e);
-            return Err(e.into());
+        if self.syscall_catch_policy == SyscallCatchPolicyMode::None {
+            if let Err(e) = nix::sys::ptrace::cont(self.pid, None) {
+                eprintln!("Failed to resume process: {}", e);
+                return Err(e.into());
+            }
+        } else {
+            if let Err(e) = nix::sys::ptrace::syscall(self.pid, None) {
+                eprintln!("Failed to resume process with syscall tracing: {}", e);
+                return Err(e.into());
+            }
         }
         self.state = ProcessHandleState::Running;
         Ok(())

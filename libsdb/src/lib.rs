@@ -4,3 +4,5 @@ pub mod process;
 pub mod register_info;
 
 pub type Pid = nix::unistd::Pid;
+
+pub use syscalls::Sysno;
