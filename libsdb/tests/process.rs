@@ -748,3 +748,89 @@ fn test_watchpoints() {
         output
     );
 }
+
+#[test]
+fn test_syscall_catchpoint() {
+    let test_binary_path = PathBuf::from(
+        build_test_binary("anti_debugger", &PathBuf::from_iter(["..", "tools"]))
+            .expect("Failed to build test binary"),
+    );
+    let (_read_port, write_port) =
+        create_pipe_channel(true).expect("Failed to create pipe channel");
+    let mut target_process = Process::launch(
+        &test_binary_path,
+        None,
+        true,
+        Some(write_port.into_internal_fd()),
+    )
+    .expect("Process failed to launch");
+
+    assert!(
+        get_process_state(target_process.pid).expect("Failed to get process state")
+            == ProcessState::TracingStopped,
+    );
+
+    target_process.set_syscall_catch_policy(libsdb::process::SyscallCatchPolicyMode::Some(vec![
+        libsdb::Sysno::write,
+    ]));
+
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    let stop_reason = target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+
+    assert!(
+        stop_reason.syscall_info.is_some(),
+        "Expected to stop due to syscall, but got: {:?}",
+        stop_reason
+    );
+    assert_eq!(
+        stop_reason
+            .trap_type
+            .expect("Expected trap_type to be some"),
+        libsdb::process::TrapType::Syscall
+    );
+    let syscall_info = stop_reason.syscall_info.unwrap();
+    assert_eq!(
+        syscall_info.number,
+        libsdb::Sysno::write as u16,
+        "Expected to catch write syscall, but caught syscall number: {}",
+        syscall_info.number
+    );
+    assert!(
+        syscall_info.entry == true,
+        "Expected to stop on syscall entry"
+    );
+
+    target_process
+        .resume_process()
+        .expect("Failed to resume process");
+    let stop_reason = target_process
+        .wait_on_signal(None)
+        .expect("Failed to wait for process");
+    assert_eq!(
+        stop_reason
+            .trap_type
+            .as_ref()
+            .expect("Expected trap_type to be some"),
+        &libsdb::process::TrapType::Syscall
+    );
+    assert!(
+        stop_reason.syscall_info.is_some(),
+        "Expected to stop due to syscall, but got: {:?}",
+        stop_reason
+    );
+    let syscall_info = stop_reason.syscall_info.unwrap();
+    assert_eq!(
+        syscall_info.number,
+        libsdb::Sysno::write as u16,
+        "Expected to catch write syscall, but caught syscall number: {}",
+        syscall_info.number
+    );
+    assert!(
+        syscall_info.entry == false,
+        "Expected to stop on syscall exit"
+    );
+}
