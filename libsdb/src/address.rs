@@ -42,8 +42,13 @@ impl VirtAddress {
         }
     }
 
-    pub fn to_file_address<'a>(&self, _elf: &'a Elf) -> Result<FileAddress<'a>> {
-        todo!()
+    pub fn to_file_address<'a>(&self, elf: &'a Elf) -> Option<FileAddress<'a>> {
+        if let Some(_section) = elf.get_section_containing_virtual_address(&self) {
+            let load_bias = elf.load_bias.expect("load_bias is expected to be set");
+            Some(FileAddress::new(elf, self.address - load_bias.address))
+        } else {
+            None
+        }
     }
 }
 
@@ -96,7 +101,7 @@ impl Into<usize> for VirtAddress {
 }
 
 impl<'a> FileAddress<'a> {
-    fn new(elf_handle: &'a Elf, address: usize) -> FileAddress<'a> {
+    pub fn new(elf_handle: &'a Elf, address: usize) -> FileAddress<'a> {
         FileAddress {
             elf_handle,
             address,
@@ -107,8 +112,16 @@ impl<'a> FileAddress<'a> {
         self.address
     }
 
-    pub fn to_virt_address(&self) -> Result<VirtAddress> {
-        todo!()
+    pub fn to_virt_address(&self) -> Option<VirtAddress> {
+        if let Some(_section) = self.elf_handle.get_section_containing_file_address(&self) {
+            let load_bias = self
+                .elf_handle
+                .load_bias
+                .expect("load_bias expected to be set");
+            Some(VirtAddress::new(self.address + load_bias.address))
+        } else {
+            None
+        }
     }
 }
 

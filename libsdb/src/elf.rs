@@ -5,6 +5,8 @@ use anyhow::Result;
 use memmap::{Mmap, MmapOptions};
 use std::path::{Path, PathBuf};
 
+use crate::address::{FileAddress, VirtAddress};
+
 /*
 ASCII diagram adapted from: Figure 11-1: The layout of an ELF file of Building a Debugger
 
@@ -76,6 +78,7 @@ pub struct Elf {
     section_headers: Vec<Elf64_Shdr>,
     /// A map from section names to their index in the `section_headers` vector, for quick lookup.
     section_map: std::collections::HashMap<String, usize>,
+    pub load_bias: Option<VirtAddress>,
 }
 
 impl Elf {
@@ -108,6 +111,48 @@ impl Elf {
             mmap,
             section_headers,
             section_map,
+            load_bias: None,
+        })
+    }
+
+    fn notify_loaded(&mut self, load_bias: VirtAddress) {
+        self.load_bias = Some(load_bias);
+    }
+
+    pub fn get_section_start_address<'a>(&'a self, section_name: &str) -> Option<FileAddress<'a>> {
+        if let Some(section) = self.get_section_header_by_name(section_name) {
+            Some(FileAddress::new(&self, section.sh_addr as usize))
+        } else {
+            None
+        }
+    }
+
+    pub fn get_section_containing_file_address(
+        &self,
+        file_address: &FileAddress,
+    ) -> Option<&Elf64_Shdr> {
+        let elf_handle_pointer = file_address.elf_handle as *const Elf;
+        let self_ptr = self as *const Elf;
+        if self_ptr != elf_handle_pointer {
+            return None;
+        }
+        self.section_headers.iter().find(|sh_header| {
+            sh_header.sh_addr as usize <= file_address.address
+                && file_address.address < (sh_header.sh_addr + sh_header.sh_size) as usize
+        })
+    }
+
+    pub fn get_section_containing_virtual_address(
+        &self,
+        virt_address: &VirtAddress,
+    ) -> Option<&Elf64_Shdr> {
+        self.section_headers.iter().find(|sh_header| {
+            let load_bias = self
+                .load_bias
+                .expect("It is expected that load_bias is set");
+            sh_header.sh_addr as usize + load_bias.address <= virt_address.address
+                && virt_address.address
+                    < (load_bias.address + (sh_header.sh_addr + sh_header.sh_size) as usize)
         })
     }
 
