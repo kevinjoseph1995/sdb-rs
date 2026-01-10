@@ -1,3 +1,4 @@
+pub mod address;
 pub mod disassembler;
 pub mod elf;
 pub mod pipe_channel;

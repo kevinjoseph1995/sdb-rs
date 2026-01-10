@@ -1,6 +1,5 @@
 /////////////////////////////////////////
 use std::ffi::CString;
-use std::fmt::Display;
 use std::path::PathBuf;
 /////////////////////////////////////////
 use anyhow::{Context, Result, anyhow};
@@ -27,6 +26,7 @@ use nix::unistd::execvp;
 use nix::unistd::fork;
 use syscalls::Sysno;
 /////////////////////////////////////////
+use crate::address::VirtAddress;
 use crate::pipe_channel;
 use crate::register_info;
 use crate::register_info::RegisterFormat;
@@ -1308,85 +1308,10 @@ pub fn get_process_state(pid: Pid) -> Result<ProcessState> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VirtAddress {
-    address: usize,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopPointMode {
     ReadWrite,
     Write,
     Execute,
-}
-
-impl VirtAddress {
-    pub fn new(address: usize) -> Self {
-        VirtAddress { address }
-    }
-
-    pub fn get(self) -> usize {
-        self.address
-    }
-
-    /// Returns the next page boundary address after this address.
-    /// Example 4095 -> 4096
-    /// Example 4096 -> 8192
-    /// Example 8192 -> 12288
-    /// Example 0 -> 4096
-    pub fn next_page_boundary(&self) -> Self {
-        const PAGE_SIZE: usize = 0x1000; // Assume 4 KiB page size
-        VirtAddress {
-            address: (self.address + PAGE_SIZE) & !0xFFF,
-        }
-    }
-}
-
-impl std::ops::Add<VirtAddress> for VirtAddress {
-    type Output = Self;
-
-    fn add(self, rhs: VirtAddress) -> Self::Output {
-        VirtAddress::new(self.address + rhs.address)
-    }
-}
-
-impl std::ops::Add<usize> for VirtAddress {
-    type Output = VirtAddress;
-
-    fn add(self, rhs: usize) -> Self::Output {
-        VirtAddress::new(self.address + rhs)
-    }
-}
-
-impl std::ops::Sub<VirtAddress> for VirtAddress {
-    type Output = Self;
-
-    fn sub(self, rhs: VirtAddress) -> Self::Output {
-        VirtAddress::new(self.address - rhs.address)
-    }
-}
-
-impl PartialOrd for VirtAddress {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.address.partial_cmp(&other.address)
-    }
-}
-
-impl Display for VirtAddress {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "0x{:x}", self.address)
-    }
-}
-
-impl From<usize> for VirtAddress {
-    fn from(address: usize) -> Self {
-        VirtAddress::new(address)
-    }
-}
-
-impl Into<usize> for VirtAddress {
-    fn into(self) -> usize {
-        self.address
-    }
 }
 
 pub struct Registers {
