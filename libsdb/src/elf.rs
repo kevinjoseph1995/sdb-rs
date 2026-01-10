@@ -5,6 +5,33 @@ use anyhow::Result;
 use memmap::{Mmap, MmapOptions};
 use std::path::{Path, PathBuf};
 
+/*
+ASCII diagram adapted from: Figure 11-1: The layout of an ELF file of Building a Debugger
+
+                 +----------------------+
+                 |      ELF Header      |
+                 +----------------------+
+                 |   Program Headers    |
++----------------+----------------------+----------------+
+|  Linking view  |        Data          | Execution view |
+|                |                      |                |
+|  +----------+  |                      |  +----------+  |
+|  | Section 1|  |                      |  | Segment 1 |  |
+|  +----------+  |                      |  +----------+  |
+|                |                      |                |
+|  +----------+  |                      |  +----------+  |
+|  | Section 2|  |                      |  | Segment 2 |  |
+|  +----------+  |                      |  +----------+  |
+|                |                      |                |
+|  +----------+  |                      |  +----------+  |
+|  | Section 3|  |                      |  | Segment 3 |  |
+|  +----------+  |                      |  +----------+  |
+|                |                      |                |
++----------------+----------------------+----------------+
+                 |   Section Headers    |
+                 +----------------------+
+ */
+
 #[repr(C)]
 pub struct Elf64_Ehdr {
     pub e_ident: [u8; 16],
@@ -44,6 +71,8 @@ struct Elf {
     mmap: Mmap,
     header: Elf64_Ehdr,
     section_headers: Vec<Elf64_Shdr>,
+    /// A map from section names to their index in the `section_headers` vector, for quick lookup.
+    section_map: std::collections::HashMap<String, usize>,
 }
 
 impl Elf {
@@ -68,13 +97,149 @@ impl Elf {
         // SAFETY: We have verified that the file is large enough to contain an ELF header, so this should be "OK".
         let header = unsafe { std::ptr::read_unaligned(mmap.as_ptr() as *const Elf64_Ehdr) };
         let section_headers = Self::parse_section_headers(&mmap, &header)?;
+        let section_map = Self::build_section_map(&mmap, &header, &section_headers)?;
         Ok(Self {
             header,
             path: path_buf,
             file_handle,
             mmap,
             section_headers,
+            section_map,
         })
+    }
+
+    fn build_section_map(
+        mmaped_file: &Mmap,
+        header: &Elf64_Ehdr,
+        section_headers: &[Elf64_Shdr],
+    ) -> Result<std::collections::HashMap<String, usize>> {
+        let mut section_map = std::collections::HashMap::new();
+        for (index, section_header) in section_headers.iter().enumerate() {
+            let name = Self::section_name_internal(
+                mmaped_file,
+                section_headers,
+                header,
+                section_header.sh_name as usize,
+            )?;
+            if let Some(existing_index) = section_map.insert(name.to_string(), index) {
+                anyhow::bail!(
+                    "Duplicate section name found: {} (indices {} and {})",
+                    name,
+                    existing_index,
+                    index
+                );
+            }
+        }
+        Ok(section_map)
+    }
+
+    fn get_section_header_by_name(&self, name: &str) -> Option<&Elf64_Shdr> {
+        if let Some(&index) = self.section_map.get(name) {
+            Some(
+                self.section_headers
+                    .get(index)
+                    .expect("Section index out of bounds"),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn get_section_content_by_name(&self, section_name: &str) -> Option<&[u8]> {
+        if let Some(section_header) = self.get_section_header_by_name(section_name) {
+            let offset = section_header.sh_offset as usize;
+            let size = section_header.sh_size as usize;
+            if offset
+                .checked_add(size)
+                .map_or(true, |end| end > self.mmap.len())
+            {
+                panic!(
+                    "Section '{}' content exceeds file size (offset: {}, size: {})",
+                    section_name, offset, size
+                );
+            }
+            Some(&self.mmap[offset..offset + size])
+        } else {
+            // Section not found.
+            None
+        }
+    }
+
+    fn section_name(&self, sh_name: usize) -> Result<&str> {
+        Self::section_name_internal(&self.mmap, &self.section_headers, &self.header, sh_name)
+    }
+
+    fn get_string(&self, string_offset: usize) -> Option<&str> {
+        if let Some(section_header) = self
+            .get_section_header_by_name(".strtab")
+            .or(self.get_section_header_by_name(".dynstr"))
+        {
+            let string_table_offset = section_header.sh_offset as usize;
+            let string_table_size = section_header.sh_size as usize;
+            let table_end = string_table_offset
+                .checked_add(string_table_size)
+                .expect("String table size overflows");
+            if table_end > self.mmap.len() {
+                panic!(
+                    "String table exceeds file size (offset: {}, size: {})",
+                    string_table_offset, string_table_size
+                );
+            }
+            if string_offset >= string_table_size {
+                panic!(
+                    "String offset {} is out of bounds for string table of size {}",
+                    string_offset, string_table_size
+                );
+            }
+            let table = &self.mmap[string_table_offset..table_end];
+            let null_pos = table[string_offset..]
+                .iter()
+                .position(|&byte| byte == 0)
+                .expect("String is not null-terminated");
+            let cstr = std::ffi::CStr::from_bytes_with_nul(
+                &table[string_offset..string_offset + null_pos + 1],
+            )
+            .expect("Invalid string bytes (not null-terminated)");
+            Some(cstr.to_str().expect("Invalid UTF-8 in string table"))
+        } else {
+            // No string table found, so we can't resolve the string.
+            return None;
+        }
+    }
+
+    fn section_name_internal<'a>(
+        mmaped_file: &'a Mmap,
+        section_headers: &[Elf64_Shdr],
+        elf_header: &Elf64_Ehdr,
+        sh_name: usize,
+    ) -> Result<&'a str> {
+        let shstrndx = elf_header.e_shstrndx as usize;
+        if shstrndx >= section_headers.len() {
+            anyhow::bail!("Section name string table index out of range");
+        }
+        let string_table_section_header = &section_headers[shstrndx];
+        let string_table_offset = string_table_section_header.sh_offset as usize;
+        let string_table_size = string_table_section_header.sh_size as usize;
+        let table_end = string_table_offset
+            .checked_add(string_table_size)
+            .ok_or_else(|| anyhow::anyhow!("Section name string table overflows"))?;
+        if table_end > mmaped_file.len() {
+            anyhow::bail!("Section name string table exceeds file size");
+        }
+        if sh_name >= string_table_size {
+            anyhow::bail!("Section name offset out of range");
+        }
+        let table = &mmaped_file[string_table_offset..table_end];
+        let name_bytes = &table[sh_name..];
+        let nul_pos = name_bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .ok_or_else(|| anyhow::anyhow!("Section name is not null-terminated"))?;
+        let cstr = std::ffi::CStr::from_bytes_with_nul(&name_bytes[..=nul_pos])
+            .map_err(|err| anyhow::anyhow!("Invalid section name bytes: {}", err))?;
+        Ok(cstr
+            .to_str()
+            .map_err(|err| anyhow::anyhow!("Invalid UTF-8 in section name: {}", err))?)
     }
 
     fn parse_section_headers(mmaped_file: &Mmap, header: &Elf64_Ehdr) -> Result<Vec<Elf64_Shdr>> {
@@ -150,19 +315,41 @@ mod tests {
             test_binary::build_test_binary("anti_debugger", &PathBuf::from_iter(["..", "tools"]))
                 .expect("Failed to build test binary"),
         );
+        // Use the `elf` crate to parse the same file and compare the results to our implementation.
+        let file_content_slice =
+            std::fs::read(&test_binary_path).expect("Failed to read test binary");
+        let reference_elf =
+            elf::ElfBytes::<elf::endian::AnyEndian>::minimal_parse(file_content_slice.as_slice())
+                .expect("Failed to parse ELF file");
+
         let elf = Elf::new(&test_binary_path).expect("Failed to create ELF object");
         assert_eq!(elf.path, test_binary_path);
         assert!(elf.mmap.len() > 0);
-        assert_eq!(elf.header.e_ident[..4], [0x7F, b'E', b'L', b'F']);
-
-        let file_data = std::fs::read(test_binary_path).expect("Could not read file.");
-
-        let elf_file = elf::ElfBytes::<elf::endian::AnyEndian>::minimal_parse(file_data.as_slice())
-            .expect("Failed to parse ELF file");
-        let section_headers = elf_file
+        ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // Header validation: Compare the ELF header from our implementation to the one from the `elf` crate.
+        // Not all fields are compared here, just some basic sanity checks to ensure that we are parsing the header correctly.
+        let reference_header = reference_elf.ehdr;
+        assert_eq!(reference_header.e_ehsize, elf.header.e_ehsize);
+        assert_eq!(reference_header.e_phentsize, elf.header.e_phentsize);
+        assert_eq!(reference_header.e_phnum, elf.header.e_phnum);
+        assert_eq!(reference_header.e_shentsize, elf.header.e_shentsize);
+        assert_eq!(reference_header.e_shnum, elf.header.e_shnum);
+        assert_eq!(reference_header.e_shoff, elf.header.e_shoff);
+        ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+        // Section header validation: Compare the section headers from our implementation to the ones from the `elf` crate.
+        let section_headers = reference_elf
             .section_headers()
             .expect("Failed to get section headers from ELF file");
         assert_eq!(section_headers.len(), elf.section_headers.len());
+
+        let section_name_string_table = reference_elf
+            .section_data_as_strtab(
+                &section_headers
+                    .get(reference_header.e_shstrndx as usize)
+                    .expect("Failed to get section header string table"),
+            )
+            .expect("Failed to get section name string table");
+
         for section_header in section_headers {
             let matching_section_header = elf
                 .section_headers
@@ -184,6 +371,15 @@ mod tests {
                 matching_section_header.sh_entsize,
                 section_header.sh_entsize
             );
+            // Validate that the section name is correctly parsed from the string table.
+            let expected_name = section_name_string_table
+                .get(section_header.sh_name as usize)
+                .expect("Failed to get section name from string table");
+            let actual_name = elf
+                .section_name(section_header.sh_name as usize)
+                .expect("Failed to get section name");
+            assert_eq!(expected_name, actual_name);
         }
+        ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
     }
 }
