@@ -9,8 +9,9 @@ use test_binary::build_test_binary;
 /////////////////////////////////////////
 use libsdb::{
     Pid,
+    address::VirtAddress,
     pipe_channel::{ChannelPort, create_pipe_channel},
-    process::{Process, ProcessState, VirtAddress, get_process_state, process_with_pid_exists},
+    process::{Process, ProcessState, get_process_state, process_with_pid_exists},
     register_info::{self, RegisterValue},
 };
 /////////////////////////////////////////
