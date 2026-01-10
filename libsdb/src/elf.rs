@@ -33,6 +33,7 @@ ASCII diagram adapted from: Figure 11-1: The layout of an ELF file of Building a
  */
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct Elf64_Ehdr {
     pub e_ident: [u8; 16],
     pub e_type: u16,
@@ -51,6 +52,7 @@ pub struct Elf64_Ehdr {
 }
 
 /// Section header
+#[derive(Debug)]
 #[repr(C)]
 pub struct Elf64_Shdr {
     pub sh_name: u32,
@@ -65,7 +67,8 @@ pub struct Elf64_Shdr {
     pub sh_entsize: u64,
 }
 
-struct Elf {
+#[derive(Debug)]
+pub struct Elf {
     path: PathBuf,
     file_handle: std::fs::File,
     mmap: Mmap,

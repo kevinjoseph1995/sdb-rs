@@ -2,7 +2,8 @@
 use anyhow::{Context, Ok, Result};
 /////////////////////////////////////////
 use super::CommandMetadata;
-use libsdb::process::{Process, StopPointMode, VirtAddress};
+use libsdb::address::VirtAddress;
+use libsdb::process::{Process, StopPointMode};
 /////////////////////////////////////////
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -2,7 +2,8 @@ use crate::command::{CommandCategory, ParsedOption};
 
 use super::Command;
 use anyhow::{Ok, Result};
-use libsdb::{process::Process, process::VirtAddress};
+use libsdb::address::VirtAddress;
+use libsdb::process::Process;
 
 pub fn print_disassembly(
     process: &Process,

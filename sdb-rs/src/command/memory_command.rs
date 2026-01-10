@@ -1,5 +1,5 @@
 use anyhow::Result;
-use libsdb::process::VirtAddress;
+use libsdb::address::VirtAddress;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum MemoryCommandCategory {
