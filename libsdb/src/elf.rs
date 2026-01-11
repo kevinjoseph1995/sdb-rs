@@ -3,7 +3,10 @@
 
 use anyhow::Result;
 use memmap::{Mmap, MmapOptions};
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::{CStr, CString},
+    path::{Path, PathBuf},
+};
 
 use crate::address::{FileAddress, VirtAddress};
 
@@ -90,7 +93,7 @@ pub struct Elf {
     header: Elf64_Ehdr,
     section_headers: Vec<Elf64_Shdr>,
     /// A map from section names to their index in the `section_headers` vector, for quick lookup.
-    section_map: std::collections::HashMap<String, usize>,
+    section_map: std::collections::HashMap<CString, usize>,
     symbol_table: Vec<Elf64_Sym>,
     pub load_bias: Option<VirtAddress>,
 }
@@ -133,18 +136,18 @@ impl Elf {
 
     fn parse_symbol_table(
         mmaped_file: &Mmap,
-        section_map: &std::collections::HashMap<String, usize>,
+        section_map: &std::collections::HashMap<CString, usize>,
         section_headers: &[Elf64_Shdr],
     ) -> Result<Vec<Elf64_Sym>> {
         let symbol_table_section_header = match Self::get_section_header_by_name_internal(
             section_map,
             section_headers,
-            ".symtab",
+            CStr::from_bytes_with_nul(b".symtab\0").unwrap(),
         )
         .or(Self::get_section_header_by_name_internal(
             section_map,
             section_headers,
-            ".dynsym",
+            CStr::from_bytes_with_nul(b".dynsym\0").unwrap(),
         )) {
             Some(header) => header,
             None => return Ok(Vec::new()), // No symbol table found, so we return an empty vector.
@@ -198,7 +201,7 @@ impl Elf {
         self.load_bias = Some(load_bias);
     }
 
-    pub fn get_section_start_address<'a>(&'a self, section_name: &str) -> Option<FileAddress<'a>> {
+    pub fn get_section_start_address<'a>(&'a self, section_name: &CStr) -> Option<FileAddress<'a>> {
         if let Some(section) = self.get_section_header_by_name(section_name) {
             Some(FileAddress::new(&self, section.sh_addr as usize))
         } else {
@@ -239,7 +242,7 @@ impl Elf {
         mmaped_file: &Mmap,
         header: &Elf64_Ehdr,
         section_headers: &[Elf64_Shdr],
-    ) -> Result<std::collections::HashMap<String, usize>> {
+    ) -> Result<std::collections::HashMap<CString, usize>> {
         let mut section_map = std::collections::HashMap::new();
         for (index, section_header) in section_headers.iter().enumerate() {
             let name = Self::section_name_internal(
@@ -248,10 +251,10 @@ impl Elf {
                 header,
                 section_header.sh_name as usize,
             )?;
-            if let Some(existing_index) = section_map.insert(name.to_string(), index) {
+            if let Some(existing_index) = section_map.insert(name.to_owned(), index) {
                 anyhow::bail!(
                     "Duplicate section name found: {} (indices {} and {})",
-                    name,
+                    name.to_string_lossy(),
                     existing_index,
                     index
                 );
@@ -261,9 +264,9 @@ impl Elf {
     }
 
     fn get_section_header_by_name_internal<'a>(
-        section_map: &std::collections::HashMap<String, usize>,
+        section_map: &std::collections::HashMap<CString, usize>,
         section_headers: &'a [Elf64_Shdr],
-        name: &str,
+        name: &CStr,
     ) -> Option<&'a Elf64_Shdr> {
         if let Some(&index) = section_map.get(name) {
             Some(
@@ -276,11 +279,11 @@ impl Elf {
         }
     }
 
-    pub fn get_section_header_by_name(&self, name: &str) -> Option<&Elf64_Shdr> {
+    pub fn get_section_header_by_name(&self, name: &CStr) -> Option<&Elf64_Shdr> {
         Self::get_section_header_by_name_internal(&self.section_map, &self.section_headers, name)
     }
 
-    fn get_section_content_by_name(&self, section_name: &str) -> Option<&[u8]> {
+    fn get_section_content_by_name(&self, section_name: &CStr) -> Option<&[u8]> {
         if let Some(section_header) = self.get_section_header_by_name(section_name) {
             let offset = section_header.sh_offset as usize;
             let size = section_header.sh_size as usize;
@@ -290,7 +293,9 @@ impl Elf {
             {
                 panic!(
                     "Section '{}' content exceeds file size (offset: {}, size: {})",
-                    section_name, offset, size
+                    section_name.to_string_lossy(),
+                    offset,
+                    size
                 );
             }
             Some(&self.mmap[offset..offset + size])
@@ -300,14 +305,14 @@ impl Elf {
         }
     }
 
-    fn section_name(&self, sh_name: usize) -> Result<&str> {
+    fn section_name(&self, sh_name: usize) -> Result<&CStr> {
         Self::section_name_internal(&self.mmap, &self.section_headers, &self.header, sh_name)
     }
 
     fn get_string(&self, string_offset: usize) -> Option<&str> {
         if let Some(section_header) = self
-            .get_section_header_by_name(".strtab")
-            .or(self.get_section_header_by_name(".dynstr"))
+            .get_section_header_by_name(CStr::from_bytes_with_nul(b".strtab\0").unwrap())
+            .or(self.get_section_header_by_name(CStr::from_bytes_with_nul(b".dynstr\0").unwrap()))
         {
             let string_table_offset = section_header.sh_offset as usize;
             let string_table_size = section_header.sh_size as usize;
@@ -347,7 +352,7 @@ impl Elf {
         section_headers: &[Elf64_Shdr],
         elf_header: &Elf64_Ehdr,
         sh_name: usize,
-    ) -> Result<&'a str> {
+    ) -> Result<&'a CStr> {
         let shstrndx = elf_header.e_shstrndx as usize;
         if shstrndx >= section_headers.len() {
             anyhow::bail!("Section name string table index out of range");
@@ -370,11 +375,8 @@ impl Elf {
             .iter()
             .position(|&byte| byte == 0)
             .ok_or_else(|| anyhow::anyhow!("Section name is not null-terminated"))?;
-        let cstr = std::ffi::CStr::from_bytes_with_nul(&name_bytes[..=nul_pos])
-            .map_err(|err| anyhow::anyhow!("Invalid section name bytes: {}", err))?;
-        Ok(cstr
-            .to_str()
-            .map_err(|err| anyhow::anyhow!("Invalid UTF-8 in section name: {}", err))?)
+        Ok(std::ffi::CStr::from_bytes_with_nul(&name_bytes[..=nul_pos])
+            .map_err(|err| anyhow::anyhow!("Invalid section name bytes: {}", err))?)
     }
 
     fn parse_section_headers(mmaped_file: &Mmap, header: &Elf64_Ehdr) -> Result<Vec<Elf64_Shdr>> {
@@ -512,7 +514,9 @@ mod tests {
                 .expect("Failed to get section name from string table");
             let actual_name = elf
                 .section_name(section_header.sh_name as usize)
-                .expect("Failed to get section name");
+                .expect("Failed to get section name")
+                .to_str()
+                .expect("Invalid UTF-8 in section name");
             assert_eq!(expected_name, actual_name);
         }
         ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
