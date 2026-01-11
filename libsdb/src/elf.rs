@@ -66,7 +66,20 @@ pub struct Elf64_Shdr {
     pub sh_link: u32,
     pub sh_info: u32,
     pub sh_addralign: u64,
+    /// For sections that contain fixed-size entries, this field gives the size of each entry. Otherwise, it should be 0.
     pub sh_entsize: u64,
+}
+
+/// Symbol table entry
+#[derive(Debug)]
+#[repr(C)]
+pub struct Elf64_Sym {
+    pub st_name: u32,
+    pub st_info: u8,
+    pub st_other: u8,
+    pub st_shndx: u16,
+    pub st_value: u64,
+    pub st_size: u64,
 }
 
 #[derive(Debug)]
@@ -78,6 +91,7 @@ pub struct Elf {
     section_headers: Vec<Elf64_Shdr>,
     /// A map from section names to their index in the `section_headers` vector, for quick lookup.
     section_map: std::collections::HashMap<String, usize>,
+    symbol_table: Vec<Elf64_Sym>,
     pub load_bias: Option<VirtAddress>,
 }
 
@@ -104,6 +118,7 @@ impl Elf {
         let header = unsafe { std::ptr::read_unaligned(mmap.as_ptr() as *const Elf64_Ehdr) };
         let section_headers = Self::parse_section_headers(&mmap, &header)?;
         let section_map = Self::build_section_map(&mmap, &header, &section_headers)?;
+        let symbol_table = Self::parse_symbol_table(&mmap, &section_map, &section_headers)?;
         Ok(Self {
             header,
             path: path_buf,
@@ -111,8 +126,72 @@ impl Elf {
             mmap,
             section_headers,
             section_map,
+            symbol_table,
             load_bias: None,
         })
+    }
+
+    fn parse_symbol_table(
+        mmaped_file: &Mmap,
+        section_map: &std::collections::HashMap<String, usize>,
+        section_headers: &[Elf64_Shdr],
+    ) -> Result<Vec<Elf64_Sym>> {
+        let symbol_table_section_header = match Self::get_section_header_by_name_internal(
+            section_map,
+            section_headers,
+            ".symtab",
+        )
+        .or(Self::get_section_header_by_name_internal(
+            section_map,
+            section_headers,
+            ".dynsym",
+        )) {
+            Some(header) => header,
+            None => return Ok(Vec::new()), // No symbol table found, so we return an empty vector.
+        };
+
+        if symbol_table_section_header.sh_offset + symbol_table_section_header.sh_size
+            > mmaped_file.len() as u64
+        {
+            anyhow::bail!(
+                "Symbol table section exceeds file size (offset: {}, size: {})",
+                symbol_table_section_header.sh_offset,
+                symbol_table_section_header.sh_size
+            );
+        }
+        const SYMBOL_TABLE_ENTRY_SIZE: usize = std::mem::size_of::<Elf64_Sym>();
+        assert!(
+            symbol_table_section_header.sh_entsize as usize == SYMBOL_TABLE_ENTRY_SIZE,
+            "Expected symbol table entry size to be {}, but got {}",
+            SYMBOL_TABLE_ENTRY_SIZE,
+            symbol_table_section_header.sh_entsize
+        );
+
+        let number_of_entries = symbol_table_section_header
+            .sh_size
+            .checked_div(symbol_table_section_header.sh_entsize)
+            .expect("symbol_table_section_header.sh_entsize must be non-zero");
+        let mut symbol_table: Vec<Elf64_Sym> = Vec::with_capacity(number_of_entries as usize);
+
+        for i in 0..number_of_entries {
+            let entry_offset = symbol_table_section_header
+                .sh_offset
+                .checked_add(
+                    i.checked_mul(SYMBOL_TABLE_ENTRY_SIZE as u64)
+                        .expect("Entry offset calculation overflow"),
+                )
+                .expect("Entry offset calculation overflow");
+            symbol_table.push(
+                // SAFETY: We have verified that the entry is within the bounds of the file, so this should be "OK".
+                unsafe {
+                    std::ptr::read_unaligned(
+                        mmaped_file.as_ptr().add(entry_offset as usize) as *const Elf64_Sym
+                    )
+                },
+            );
+        }
+
+        Ok(symbol_table)
     }
 
     fn notify_loaded(&mut self, load_bias: VirtAddress) {
@@ -181,16 +260,24 @@ impl Elf {
         Ok(section_map)
     }
 
-    fn get_section_header_by_name(&self, name: &str) -> Option<&Elf64_Shdr> {
-        if let Some(&index) = self.section_map.get(name) {
+    fn get_section_header_by_name_internal<'a>(
+        section_map: &std::collections::HashMap<String, usize>,
+        section_headers: &'a [Elf64_Shdr],
+        name: &str,
+    ) -> Option<&'a Elf64_Shdr> {
+        if let Some(&index) = section_map.get(name) {
             Some(
-                self.section_headers
+                section_headers
                     .get(index)
                     .expect("Section index out of bounds"),
             )
         } else {
             None
         }
+    }
+
+    pub fn get_section_header_by_name(&self, name: &str) -> Option<&Elf64_Shdr> {
+        Self::get_section_header_by_name_internal(&self.section_map, &self.section_headers, name)
     }
 
     fn get_section_content_by_name(&self, section_name: &str) -> Option<&[u8]> {
@@ -429,5 +516,82 @@ mod tests {
             assert_eq!(expected_name, actual_name);
         }
         ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+    }
+
+    #[test]
+    fn test_symbol_table_parsing() {
+        // Pick a test binary that is known to be an ELF file.
+        let test_binary_path = PathBuf::from(
+            test_binary::build_test_binary("anti_debugger", &PathBuf::from_iter(["..", "tools"]))
+                .expect("Failed to build test binary"),
+        );
+        // Use the `elf` crate to parse the same file and compare the results to our implementation.
+        let file_content_slice =
+            std::fs::read(&test_binary_path).expect("Failed to read test binary");
+        let reference_elf =
+            elf::ElfBytes::<elf::endian::AnyEndian>::minimal_parse(file_content_slice.as_slice())
+                .expect("Failed to parse ELF file");
+
+        let elf = Elf::new(&test_binary_path).expect("Failed to create ELF object");
+
+        // Get symbol table from reference implementation
+        let (reference_symtab, reference_strtab) = reference_elf
+            .symbol_table()
+            .expect("Failed to get symbol table from reference ELF")
+            .expect("No symbol table found in reference ELF");
+
+        // Our implementation should have parsed the same number of symbols
+        assert_eq!(
+            reference_symtab.len(),
+            elf.symbol_table.len(),
+            "Symbol table length mismatch"
+        );
+
+        // Compare each symbol entry
+        for (index, reference_sym) in reference_symtab.iter().enumerate() {
+            let our_sym = &elf.symbol_table[index];
+
+            assert_eq!(
+                our_sym.st_name, reference_sym.st_name,
+                "Symbol {} st_name mismatch",
+                index
+            );
+            assert_eq!(
+                our_sym.st_info, reference_sym.st_info,
+                "Symbol {} st_info mismatch",
+                index
+            );
+            assert_eq!(
+                our_sym.st_other, reference_sym.st_other,
+                "Symbol {} st_other mismatch",
+                index
+            );
+            assert_eq!(
+                our_sym.st_shndx, reference_sym.st_shndx,
+                "Symbol {} st_shndx mismatch",
+                index
+            );
+            assert_eq!(
+                our_sym.st_value, reference_sym.st_value,
+                "Symbol {} st_value mismatch",
+                index
+            );
+            assert_eq!(
+                our_sym.st_size, reference_sym.st_size,
+                "Symbol {} st_size mismatch",
+                index
+            );
+
+            // Also verify we can resolve symbol names correctly if st_name is non-zero
+            if reference_sym.st_name != 0 {
+                let expected_name = reference_strtab
+                    .get(reference_sym.st_name as usize)
+                    .expect("Failed to get symbol name from reference string table");
+                let actual_name = elf
+                    .get_string(reference_sym.st_name as usize)
+                    .expect("Failed to get symbol name from our implementation");
+                assert_eq!(expected_name, actual_name, "Symbol {} name mismatch", index);
+            }
+        }
     }
 }
