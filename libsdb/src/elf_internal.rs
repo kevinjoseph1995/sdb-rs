@@ -131,6 +131,8 @@ pub struct Elf {
 }
 
 impl Elf {
+    // ==================== Construction ====================
+
     pub fn new(path: &Path) -> Result<Self> {
         let path_buf = path.to_path_buf();
         let file_size = std::fs::metadata(&path_buf)?.len();
@@ -173,63 +175,218 @@ impl Elf {
         Ok(elf)
     }
 
-    fn build_symbol_name_map(
-        symbol_table: &[Elf64_Sym],
-        elf: &Elf,
-    ) -> Result<(
-        std::collections::HashMap<CString, Vec<usize>>,
-        std::collections::BTreeMap<RawAddressRange, usize>,
-    )> {
-        let mut symbol_name_map: std::collections::HashMap<CString, Vec<usize>> =
-            std::collections::HashMap::new();
-        let mut symbol_address_range_map: std::collections::BTreeMap<RawAddressRange, usize> =
-            std::collections::BTreeMap::new();
-        for (index, symbol) in symbol_table.iter().enumerate() {
-            //// symbol_name_map population
-            let mangled_name_cstr = match elf.get_string(symbol.st_name as usize) {
-                Some(n) => n,
-                None => continue,
-            };
-            symbol_name_map
-                .entry(mangled_name_cstr.to_owned())
-                .or_insert_with(Vec::new)
-                .push(index);
-            if let Ok(mangled_name) = mangled_name_cstr.to_str() {
-                if let Ok(rustc_demangled_name) = rustc_demangle::try_demangle(mangled_name) {
-                    let demangled_cstring = CString::new(rustc_demangled_name.to_string())
-                        .context("Failed to create CString from demangled Rust name")?;
-                    symbol_name_map
-                        .entry(demangled_cstring)
-                        .or_insert_with(Vec::new)
-                        .push(index);
-                } else if let Ok(cpp_demangled_name) = cpp_demangle::Symbol::new(mangled_name) {
-                    if let Ok(demangled_cstring) = cpp_demangled_name.demangle() {
-                        symbol_name_map
-                            .entry(
-                                CString::new(demangled_cstring)
-                                    .context("Failed to create CString from demangled C++ name")?,
-                            )
-                            .or_insert_with(Vec::new)
-                            .push(index);
-                    }
-                }
-            }
+    fn notify_loaded(&mut self, load_bias: VirtAddress) {
+        self.load_bias = Some(load_bias);
+    }
 
-            //// symbol_address_range_map population
-            // Note: #define ELF64_ST_TYPE(i)   ((i)&0xf) | See: https://refspecs.linuxbase.org/elf/gabi4+/ch4.symtab.html
-            let st_type: u8 = symbol.st_info & 0x0F;
-            if (symbol.st_value != 0) && (symbol.st_name != 0) && (st_type != elf::abi::STT_TLS) {
-                let address_range = RawAddressRange {
-                    start: symbol.st_value as usize,
-                    end: symbol.st_value.checked_add(symbol.st_size).ok_or_else(|| {
-                        anyhow::anyhow!("Symbol size overflow for symbol at index {}", index)
-                    })? as usize,
+    // ==================== Section Parsing (private) ====================
+
+    fn parse_section_headers(mmaped_file: &Mmap, header: &Elf64_Ehdr) -> Result<Vec<Elf64_Shdr>> {
+        const SECTION_HEADER_SIZE: usize = std::mem::size_of::<Elf64_Shdr>();
+        let file_len = mmaped_file.len();
+        if header.e_shoff > usize::MAX as u64 {
+            anyhow::bail!("Section headers offset exceeds addressable memory");
+        }
+        let num_of_sections = {
+            if header.e_shnum == 0 && header.e_shentsize != 0 {
+                // Special case for when the file has 0xff00 or more sections.
+                // In this case, the actual number of sections is stored in the sh_size field of the first section header.
+                let section_headers_offset = header.e_shoff as usize;
+                if section_headers_offset
+                    .checked_add(SECTION_HEADER_SIZE)
+                    .map_or(true, |end| end > file_len)
+                {
+                    anyhow::bail!("Section header exceeds file size");
+                }
+                let first_section_header_ptr = unsafe {
+                    mmaped_file.as_ptr().add(section_headers_offset) as *const Elf64_Shdr
                 };
-                symbol_address_range_map.insert(address_range, index);
+                // SAFETY: We have verified that the section header is within
+                // the bounds of the file, so this should be "OK".
+                let first_section_header =
+                    unsafe { std::ptr::read_unaligned(first_section_header_ptr) };
+                if first_section_header.sh_size > usize::MAX as u64 {
+                    anyhow::bail!("Section count exceeds addressable memory");
+                }
+                first_section_header.sh_size as usize
+            } else {
+                header.e_shnum as usize
+            }
+        };
+
+        let section_headers_offset = header.e_shoff as usize;
+        let section_headers_size = num_of_sections
+            .checked_mul(SECTION_HEADER_SIZE)
+            .ok_or_else(|| anyhow::anyhow!("Section headers size overflows"))?;
+        if section_headers_offset
+            .checked_add(section_headers_size)
+            .map_or(true, |end| end > file_len)
+        {
+            anyhow::bail!("Section headers exceed file size");
+        }
+
+        let section_headers_ptr =
+            unsafe { mmaped_file.as_ptr().add(section_headers_offset) as *const Elf64_Shdr };
+
+        let mut section_headers = Vec::with_capacity(num_of_sections);
+        unsafe {
+            // SAFETY: The mmap is validated to cover the entire section header table,
+            // and Elf64_Shdr is a plain data structure, so a byte-wise copy is OK.
+            std::ptr::copy_nonoverlapping(
+                section_headers_ptr as *const u8,
+                section_headers.as_mut_ptr() as *mut u8,
+                section_headers_size,
+            );
+            section_headers.set_len(num_of_sections);
+        }
+        Ok(section_headers)
+    }
+
+    fn build_section_map(
+        mmaped_file: &Mmap,
+        header: &Elf64_Ehdr,
+        section_headers: &[Elf64_Shdr],
+    ) -> Result<std::collections::HashMap<CString, usize>> {
+        let mut section_map = std::collections::HashMap::new();
+        for (index, section_header) in section_headers.iter().enumerate() {
+            let name = Self::section_name_internal(
+                mmaped_file,
+                section_headers,
+                header,
+                section_header.sh_name as usize,
+            )?;
+            if let Some(existing_index) = section_map.insert(name.to_owned(), index) {
+                anyhow::bail!(
+                    "Duplicate section name found: {} (indices {} and {})",
+                    name.to_string_lossy(),
+                    existing_index,
+                    index
+                );
             }
         }
-        Ok((symbol_name_map, symbol_address_range_map))
+        Ok(section_map)
     }
+
+    // ==================== Section Accessors (public) ====================
+
+    pub fn get_section_header_by_name(&self, name: &CStr) -> Option<&Elf64_Shdr> {
+        Self::get_section_header_by_name_internal(&self.section_map, &self.section_headers, name)
+    }
+
+    pub fn get_section_start_address<'a>(&'a self, section_name: &CStr) -> Option<FileAddress<'a>> {
+        if let Some(section) = self.get_section_header_by_name(section_name) {
+            Some(FileAddress::new(&self, section.sh_addr as usize))
+        } else {
+            None
+        }
+    }
+
+    pub fn get_section_containing_file_address(
+        &self,
+        file_address: &FileAddress,
+    ) -> Option<&Elf64_Shdr> {
+        let elf_handle_pointer = file_address.elf_handle as *const Elf;
+        let self_ptr = self as *const Elf;
+        if self_ptr != elf_handle_pointer {
+            return None;
+        }
+        self.section_headers.iter().find(|sh_header| {
+            sh_header.sh_addr as usize <= file_address.address
+                && file_address.address < (sh_header.sh_addr + sh_header.sh_size) as usize
+        })
+    }
+
+    pub fn get_section_containing_virtual_address(
+        &self,
+        virt_address: &VirtAddress,
+    ) -> Option<&Elf64_Shdr> {
+        self.section_headers.iter().find(|sh_header| {
+            let load_bias = self
+                .load_bias
+                .expect("It is expected that load_bias is set");
+            sh_header.sh_addr as usize + load_bias.address <= virt_address.address
+                && virt_address.address
+                    < (load_bias.address + (sh_header.sh_addr + sh_header.sh_size) as usize)
+        })
+    }
+
+    // ==================== Section Helpers (private) ====================
+
+    fn get_section_header_by_name_internal<'a>(
+        section_map: &std::collections::HashMap<CString, usize>,
+        section_headers: &'a [Elf64_Shdr],
+        name: &CStr,
+    ) -> Option<&'a Elf64_Shdr> {
+        if let Some(&index) = section_map.get(name) {
+            Some(
+                section_headers
+                    .get(index)
+                    .expect("Section index out of bounds"),
+            )
+        } else {
+            None
+        }
+    }
+
+    fn get_section_content_by_name(&self, section_name: &CStr) -> Option<&[u8]> {
+        if let Some(section_header) = self.get_section_header_by_name(section_name) {
+            let offset = section_header.sh_offset as usize;
+            let size = section_header.sh_size as usize;
+            if offset
+                .checked_add(size)
+                .map_or(true, |end| end > self.mmap.len())
+            {
+                panic!(
+                    "Section '{}' content exceeds file size (offset: {}, size: {})",
+                    section_name.to_string_lossy(),
+                    offset,
+                    size
+                );
+            }
+            Some(&self.mmap[offset..offset + size])
+        } else {
+            // Section not found.
+            None
+        }
+    }
+
+    fn section_name(&self, sh_name: usize) -> Result<&CStr> {
+        Self::section_name_internal(&self.mmap, &self.section_headers, &self.header, sh_name)
+    }
+
+    fn section_name_internal<'a>(
+        mmaped_file: &'a Mmap,
+        section_headers: &[Elf64_Shdr],
+        elf_header: &Elf64_Ehdr,
+        sh_name: usize,
+    ) -> Result<&'a CStr> {
+        let shstrndx = elf_header.e_shstrndx as usize;
+        if shstrndx >= section_headers.len() {
+            anyhow::bail!("Section name string table index out of range");
+        }
+        let string_table_section_header = &section_headers[shstrndx];
+        let string_table_offset = string_table_section_header.sh_offset as usize;
+        let string_table_size = string_table_section_header.sh_size as usize;
+        let table_end = string_table_offset
+            .checked_add(string_table_size)
+            .ok_or_else(|| anyhow::anyhow!("Section name string table overflows"))?;
+        if table_end > mmaped_file.len() {
+            anyhow::bail!("Section name string table exceeds file size");
+        }
+        if sh_name >= string_table_size {
+            anyhow::bail!("Section name offset out of range");
+        }
+        let table = &mmaped_file[string_table_offset..table_end];
+        let name_bytes = &table[sh_name..];
+        let nul_pos = name_bytes
+            .iter()
+            .position(|&byte| byte == 0)
+            .ok_or_else(|| anyhow::anyhow!("Section name is not null-terminated"))?;
+        Ok(std::ffi::CStr::from_bytes_with_nul(&name_bytes[..=nul_pos])
+            .map_err(|err| anyhow::anyhow!("Invalid section name bytes: {}", err))?)
+    }
+
+    // ==================== Symbol Table Parsing (private) ====================
 
     fn parse_symbol_table(
         mmaped_file: &Mmap,
@@ -294,32 +451,65 @@ impl Elf {
         Ok(symbol_table)
     }
 
-    fn notify_loaded(&mut self, load_bias: VirtAddress) {
-        self.load_bias = Some(load_bias);
+    fn build_symbol_name_map(
+        symbol_table: &[Elf64_Sym],
+        elf: &Elf,
+    ) -> Result<(
+        std::collections::HashMap<CString, Vec<usize>>,
+        std::collections::BTreeMap<RawAddressRange, usize>,
+    )> {
+        let mut symbol_name_map: std::collections::HashMap<CString, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut symbol_address_range_map: std::collections::BTreeMap<RawAddressRange, usize> =
+            std::collections::BTreeMap::new();
+        for (index, symbol) in symbol_table.iter().enumerate() {
+            //// symbol_name_map population
+            let mangled_name_cstr = match elf.get_string(symbol.st_name as usize) {
+                Some(n) => n,
+                None => continue,
+            };
+            symbol_name_map
+                .entry(mangled_name_cstr.to_owned())
+                .or_insert_with(Vec::new)
+                .push(index);
+            if let Ok(mangled_name) = mangled_name_cstr.to_str() {
+                if let Ok(rustc_demangled_name) = rustc_demangle::try_demangle(mangled_name) {
+                    let demangled_cstring = CString::new(rustc_demangled_name.to_string())
+                        .context("Failed to create CString from demangled Rust name")?;
+                    symbol_name_map
+                        .entry(demangled_cstring)
+                        .or_insert_with(Vec::new)
+                        .push(index);
+                } else if let Ok(cpp_demangled_name) = cpp_demangle::Symbol::new(mangled_name) {
+                    if let Ok(demangled_cstring) = cpp_demangled_name.demangle() {
+                        symbol_name_map
+                            .entry(
+                                CString::new(demangled_cstring)
+                                    .context("Failed to create CString from demangled C++ name")?,
+                            )
+                            .or_insert_with(Vec::new)
+                            .push(index);
+                    }
+                }
+            }
+
+            //// symbol_address_range_map population
+            // Note: #define ELF64_ST_TYPE(i)   ((i)&0xf) | See: https://refspecs.linuxbase.org/elf/gabi4+/ch4.symtab.html
+            let st_type: u8 = symbol.st_info & 0x0F;
+            if (symbol.st_value != 0) && (symbol.st_name != 0) && (st_type != elf::abi::STT_TLS) {
+                let address_range = RawAddressRange {
+                    start: symbol.st_value as usize,
+                    end: symbol.st_value.checked_add(symbol.st_size).ok_or_else(|| {
+                        anyhow::anyhow!("Symbol size overflow for symbol at index {}", index)
+                    })? as usize,
+                };
+                symbol_address_range_map.insert(address_range, index);
+            }
+        }
+        Ok((symbol_name_map, symbol_address_range_map))
     }
 
-    pub fn get_section_start_address<'a>(&'a self, section_name: &CStr) -> Option<FileAddress<'a>> {
-        if let Some(section) = self.get_section_header_by_name(section_name) {
-            Some(FileAddress::new(&self, section.sh_addr as usize))
-        } else {
-            None
-        }
-    }
-
-    pub fn get_section_containing_file_address(
-        &self,
-        file_address: &FileAddress,
-    ) -> Option<&Elf64_Shdr> {
-        let elf_handle_pointer = file_address.elf_handle as *const Elf;
-        let self_ptr = self as *const Elf;
-        if self_ptr != elf_handle_pointer {
-            return None;
-        }
-        self.section_headers.iter().find(|sh_header| {
-            sh_header.sh_addr as usize <= file_address.address
-                && file_address.address < (sh_header.sh_addr + sh_header.sh_size) as usize
-        })
-    }
+    // ==================== Symbol Accessors (public) ====================
 
     pub fn get_symbols_with_name(&self, name: &CStr) -> Vec<&Elf64_Sym> {
         self.symbol_name_map
@@ -362,90 +552,7 @@ impl Elf {
         None
     }
 
-    pub fn get_section_containing_virtual_address(
-        &self,
-        virt_address: &VirtAddress,
-    ) -> Option<&Elf64_Shdr> {
-        self.section_headers.iter().find(|sh_header| {
-            let load_bias = self
-                .load_bias
-                .expect("It is expected that load_bias is set");
-            sh_header.sh_addr as usize + load_bias.address <= virt_address.address
-                && virt_address.address
-                    < (load_bias.address + (sh_header.sh_addr + sh_header.sh_size) as usize)
-        })
-    }
-
-    fn build_section_map(
-        mmaped_file: &Mmap,
-        header: &Elf64_Ehdr,
-        section_headers: &[Elf64_Shdr],
-    ) -> Result<std::collections::HashMap<CString, usize>> {
-        let mut section_map = std::collections::HashMap::new();
-        for (index, section_header) in section_headers.iter().enumerate() {
-            let name = Self::section_name_internal(
-                mmaped_file,
-                section_headers,
-                header,
-                section_header.sh_name as usize,
-            )?;
-            if let Some(existing_index) = section_map.insert(name.to_owned(), index) {
-                anyhow::bail!(
-                    "Duplicate section name found: {} (indices {} and {})",
-                    name.to_string_lossy(),
-                    existing_index,
-                    index
-                );
-            }
-        }
-        Ok(section_map)
-    }
-
-    fn get_section_header_by_name_internal<'a>(
-        section_map: &std::collections::HashMap<CString, usize>,
-        section_headers: &'a [Elf64_Shdr],
-        name: &CStr,
-    ) -> Option<&'a Elf64_Shdr> {
-        if let Some(&index) = section_map.get(name) {
-            Some(
-                section_headers
-                    .get(index)
-                    .expect("Section index out of bounds"),
-            )
-        } else {
-            None
-        }
-    }
-
-    pub fn get_section_header_by_name(&self, name: &CStr) -> Option<&Elf64_Shdr> {
-        Self::get_section_header_by_name_internal(&self.section_map, &self.section_headers, name)
-    }
-
-    fn get_section_content_by_name(&self, section_name: &CStr) -> Option<&[u8]> {
-        if let Some(section_header) = self.get_section_header_by_name(section_name) {
-            let offset = section_header.sh_offset as usize;
-            let size = section_header.sh_size as usize;
-            if offset
-                .checked_add(size)
-                .map_or(true, |end| end > self.mmap.len())
-            {
-                panic!(
-                    "Section '{}' content exceeds file size (offset: {}, size: {})",
-                    section_name.to_string_lossy(),
-                    offset,
-                    size
-                );
-            }
-            Some(&self.mmap[offset..offset + size])
-        } else {
-            // Section not found.
-            None
-        }
-    }
-
-    fn section_name(&self, sh_name: usize) -> Result<&CStr> {
-        Self::section_name_internal(&self.mmap, &self.section_headers, &self.header, sh_name)
-    }
+    // ==================== String Table Helpers (private) ====================
 
     fn get_string(&self, string_offset: usize) -> Option<&CStr> {
         if let Some(section_header) = self
@@ -483,99 +590,6 @@ impl Elf {
             // No string table found, so we can't resolve the string.
             return None;
         }
-    }
-
-    fn section_name_internal<'a>(
-        mmaped_file: &'a Mmap,
-        section_headers: &[Elf64_Shdr],
-        elf_header: &Elf64_Ehdr,
-        sh_name: usize,
-    ) -> Result<&'a CStr> {
-        let shstrndx = elf_header.e_shstrndx as usize;
-        if shstrndx >= section_headers.len() {
-            anyhow::bail!("Section name string table index out of range");
-        }
-        let string_table_section_header = &section_headers[shstrndx];
-        let string_table_offset = string_table_section_header.sh_offset as usize;
-        let string_table_size = string_table_section_header.sh_size as usize;
-        let table_end = string_table_offset
-            .checked_add(string_table_size)
-            .ok_or_else(|| anyhow::anyhow!("Section name string table overflows"))?;
-        if table_end > mmaped_file.len() {
-            anyhow::bail!("Section name string table exceeds file size");
-        }
-        if sh_name >= string_table_size {
-            anyhow::bail!("Section name offset out of range");
-        }
-        let table = &mmaped_file[string_table_offset..table_end];
-        let name_bytes = &table[sh_name..];
-        let nul_pos = name_bytes
-            .iter()
-            .position(|&byte| byte == 0)
-            .ok_or_else(|| anyhow::anyhow!("Section name is not null-terminated"))?;
-        Ok(std::ffi::CStr::from_bytes_with_nul(&name_bytes[..=nul_pos])
-            .map_err(|err| anyhow::anyhow!("Invalid section name bytes: {}", err))?)
-    }
-
-    fn parse_section_headers(mmaped_file: &Mmap, header: &Elf64_Ehdr) -> Result<Vec<Elf64_Shdr>> {
-        const SECTION_HEADER_SIZE: usize = std::mem::size_of::<Elf64_Shdr>();
-        let file_len = mmaped_file.len();
-        if header.e_shoff > usize::MAX as u64 {
-            anyhow::bail!("Section headers offset exceeds addressable memory");
-        }
-        let num_of_sections = {
-            if header.e_shnum == 0 && header.e_shentsize != 0 {
-                // Special case for when the file has 0xff00 or more sections.
-                // In this case, the actual number of sections is stored in the sh_size field of the first section header.
-                let section_headers_offset = header.e_shoff as usize;
-                if section_headers_offset
-                    .checked_add(SECTION_HEADER_SIZE)
-                    .map_or(true, |end| end > file_len)
-                {
-                    anyhow::bail!("Section header exceeds file size");
-                }
-                let first_section_header_ptr = unsafe {
-                    mmaped_file.as_ptr().add(section_headers_offset) as *const Elf64_Shdr
-                };
-                // SAFETY: We have verified that the section header is within
-                // the bounds of the file, so this should be "OK".
-                let first_section_header =
-                    unsafe { std::ptr::read_unaligned(first_section_header_ptr) };
-                if first_section_header.sh_size > usize::MAX as u64 {
-                    anyhow::bail!("Section count exceeds addressable memory");
-                }
-                first_section_header.sh_size as usize
-            } else {
-                header.e_shnum as usize
-            }
-        };
-
-        let section_headers_offset = header.e_shoff as usize;
-        let section_headers_size = num_of_sections
-            .checked_mul(SECTION_HEADER_SIZE)
-            .ok_or_else(|| anyhow::anyhow!("Section headers size overflows"))?;
-        if section_headers_offset
-            .checked_add(section_headers_size)
-            .map_or(true, |end| end > file_len)
-        {
-            anyhow::bail!("Section headers exceed file size");
-        }
-
-        let section_headers_ptr =
-            unsafe { mmaped_file.as_ptr().add(section_headers_offset) as *const Elf64_Shdr };
-
-        let mut section_headers = Vec::with_capacity(num_of_sections);
-        unsafe {
-            // SAFETY: The mmap is validated to cover the entire section header table,
-            // and Elf64_Shdr is a plain data structure, so a byte-wise copy is OK.
-            std::ptr::copy_nonoverlapping(
-                section_headers_ptr as *const u8,
-                section_headers.as_mut_ptr() as *mut u8,
-                section_headers_size,
-            );
-            section_headers.set_len(num_of_sections);
-        }
-        Ok(section_headers)
     }
 }
 
