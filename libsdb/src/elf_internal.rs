@@ -1,7 +1,7 @@
 // Intentionally not using a crate for this. This is more in line with how the book does it,
 // and we can always refactor to use a crate later if we want to add more features.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use memmap::{Mmap, MmapOptions};
 use std::{
     ffi::{CStr, CString},
@@ -86,6 +86,34 @@ pub struct Elf64_Sym {
 }
 
 #[derive(Debug)]
+struct RawAddressRange {
+    // Inclusive start
+    start: usize,
+    //  Exclusive end
+    end: usize,
+}
+
+impl PartialEq for RawAddressRange {
+    fn eq(&self, other: &Self) -> bool {
+        self.start == other.start
+    }
+}
+
+impl Eq for RawAddressRange {}
+
+impl PartialOrd for RawAddressRange {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RawAddressRange {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.start.cmp(&other.start)
+    }
+}
+
+#[derive(Debug)]
 pub struct Elf {
     path: PathBuf,
     file_handle: std::fs::File,
@@ -94,7 +122,11 @@ pub struct Elf {
     section_headers: Vec<Elf64_Shdr>,
     /// A map from section names to their index in the `section_headers` vector, for quick lookup.
     section_map: std::collections::HashMap<CString, usize>,
+    /// The symbol table entries parsed from the ELF file.
     symbol_table: Vec<Elf64_Sym>,
+    /// A map from symbol names to their indices in the `symbol_table` vector, for quick lookup.
+    symbol_name_map: std::collections::HashMap<CString, Vec<usize>>,
+    symbol_address_range_map: std::collections::BTreeMap<RawAddressRange, usize>,
     pub load_bias: Option<VirtAddress>,
 }
 
@@ -122,7 +154,7 @@ impl Elf {
         let section_headers = Self::parse_section_headers(&mmap, &header)?;
         let section_map = Self::build_section_map(&mmap, &header, &section_headers)?;
         let symbol_table = Self::parse_symbol_table(&mmap, &section_map, &section_headers)?;
-        Ok(Self {
+        let mut elf = Self {
             header,
             path: path_buf,
             file_handle,
@@ -130,8 +162,73 @@ impl Elf {
             section_headers,
             section_map,
             symbol_table,
+            symbol_name_map: std::collections::HashMap::new(),
+            symbol_address_range_map: std::collections::BTreeMap::new(),
             load_bias: None,
-        })
+        };
+        let (symbol_name_map, symbol_address_range_map) =
+            Self::build_symbol_name_map(&elf.symbol_table, &elf)?;
+        elf.symbol_name_map = symbol_name_map;
+        elf.symbol_address_range_map = symbol_address_range_map;
+        Ok(elf)
+    }
+
+    fn build_symbol_name_map(
+        symbol_table: &[Elf64_Sym],
+        elf: &Elf,
+    ) -> Result<(
+        std::collections::HashMap<CString, Vec<usize>>,
+        std::collections::BTreeMap<RawAddressRange, usize>,
+    )> {
+        let mut symbol_name_map: std::collections::HashMap<CString, Vec<usize>> =
+            std::collections::HashMap::new();
+        let mut symbol_address_range_map: std::collections::BTreeMap<RawAddressRange, usize> =
+            std::collections::BTreeMap::new();
+        for (index, symbol) in symbol_table.iter().enumerate() {
+            //// symbol_name_map population
+            let mangled_name_cstr = match elf.get_string(symbol.st_name as usize) {
+                Some(n) => n,
+                None => continue,
+            };
+            symbol_name_map
+                .entry(mangled_name_cstr.to_owned())
+                .or_insert_with(Vec::new)
+                .push(index);
+            if let Ok(mangled_name) = mangled_name_cstr.to_str() {
+                if let Ok(rustc_demangled_name) = rustc_demangle::try_demangle(mangled_name) {
+                    let demangled_cstring = CString::new(rustc_demangled_name.to_string())
+                        .context("Failed to create CString from demangled Rust name")?;
+                    symbol_name_map
+                        .entry(demangled_cstring)
+                        .or_insert_with(Vec::new)
+                        .push(index);
+                } else if let Ok(cpp_demangled_name) = cpp_demangle::Symbol::new(mangled_name) {
+                    if let Ok(demangled_cstring) = cpp_demangled_name.demangle() {
+                        symbol_name_map
+                            .entry(
+                                CString::new(demangled_cstring)
+                                    .context("Failed to create CString from demangled C++ name")?,
+                            )
+                            .or_insert_with(Vec::new)
+                            .push(index);
+                    }
+                }
+            }
+
+            //// symbol_address_range_map population
+            // Note: #define ELF64_ST_TYPE(i)   ((i)&0xf) | See: https://refspecs.linuxbase.org/elf/gabi4+/ch4.symtab.html
+            let st_type: u8 = symbol.st_info & 0x0F;
+            if (symbol.st_value != 0) && (symbol.st_name != 0) && (st_type != elf::abi::STT_TLS) {
+                let address_range = RawAddressRange {
+                    start: symbol.st_value as usize,
+                    end: symbol.st_value.checked_add(symbol.st_size).ok_or_else(|| {
+                        anyhow::anyhow!("Symbol size overflow for symbol at index {}", index)
+                    })? as usize,
+                };
+                symbol_address_range_map.insert(address_range, index);
+            }
+        }
+        Ok((symbol_name_map, symbol_address_range_map))
     }
 
     fn parse_symbol_table(
@@ -224,6 +321,47 @@ impl Elf {
         })
     }
 
+    pub fn get_symbols_with_name(&self, name: &CStr) -> Vec<&Elf64_Sym> {
+        self.symbol_name_map
+            .get(name)
+            .map_or(Vec::new(), |indices| {
+                indices
+                    .iter()
+                    .filter_map(|&index| self.symbol_table.get(index))
+                    .collect()
+            })
+    }
+
+    pub fn get_symbol_at_address(&self, file_address: FileAddress) -> Option<&Elf64_Sym> {
+        let address_range = RawAddressRange {
+            start: file_address.address,
+            end: 0usize, // end is not used for lookup in this case
+        };
+        self.symbol_address_range_map
+            .get(&address_range)
+            .and_then(|&index| self.symbol_table.get(index))
+    }
+
+    pub fn get_symbol_containing_address(&self, file_address: FileAddress) -> Option<&Elf64_Sym> {
+        let query = RawAddressRange {
+            start: file_address.address,
+            end: 0,
+        };
+
+        // Find the symbol with the largest start address <= query address
+        let mut candidate_range = self.symbol_address_range_map.range(..=query);
+        loop {
+            if let Some((r, index)) = candidate_range.next_back() {
+                if file_address.address < r.end {
+                    return Some(&self.symbol_table[*index]);
+                }
+            } else {
+                break;
+            }
+        }
+        None
+    }
+
     pub fn get_section_containing_virtual_address(
         &self,
         virt_address: &VirtAddress,
@@ -309,7 +447,7 @@ impl Elf {
         Self::section_name_internal(&self.mmap, &self.section_headers, &self.header, sh_name)
     }
 
-    fn get_string(&self, string_offset: usize) -> Option<&str> {
+    fn get_string(&self, string_offset: usize) -> Option<&CStr> {
         if let Some(section_header) = self
             .get_section_header_by_name(CStr::from_bytes_with_nul(b".strtab\0").unwrap())
             .or(self.get_section_header_by_name(CStr::from_bytes_with_nul(b".dynstr\0").unwrap()))
@@ -339,8 +477,8 @@ impl Elf {
             let cstr = std::ffi::CStr::from_bytes_with_nul(
                 &table[string_offset..string_offset + null_pos + 1],
             )
-            .expect("Invalid string bytes (not null-terminated)");
-            Some(cstr.to_str().expect("Invalid UTF-8 in string table"))
+            .expect("Invalid string bytes");
+            Some(cstr)
         } else {
             // No string table found, so we can't resolve the string.
             return None;
@@ -594,7 +732,69 @@ mod tests {
                 let actual_name = elf
                     .get_string(reference_sym.st_name as usize)
                     .expect("Failed to get symbol name from our implementation");
-                assert_eq!(expected_name, actual_name, "Symbol {} name mismatch", index);
+                assert_eq!(
+                    expected_name,
+                    actual_name.to_str().expect("Invalid UTF-8 in symbol name"),
+                    "Symbol {} name mismatch",
+                    index
+                );
+                let symbols_with_name = elf.get_symbols_with_name(actual_name);
+                assert!(
+                    symbols_with_name
+                        .iter()
+                        .any(|&s| s.st_value == our_sym.st_value),
+                    "Failed to find symbol by name for symbol {}",
+                    index
+                );
+                // If this symbol has a address, verify it is in the address range map
+                if reference_sym.st_value != 0
+                    && reference_sym.st_size != 0
+                    && reference_sym.st_symtype() != elf::abi::STT_TLS
+                {
+                    let file_address = FileAddress::new(&elf, reference_sym.st_value as usize);
+                    let symbol_at_address = elf
+                        .get_symbol_at_address(file_address)
+                        .expect("Failed to get symbol at address");
+                    assert_eq!(
+                        symbol_at_address.st_value, our_sym.st_value,
+                        "Symbol at address mismatch for symbol {}",
+                        index
+                    );
+                    let symbol_containing_address = elf
+                        .get_symbol_containing_address(file_address)
+                        .expect("Failed to get symbol containing address");
+                    assert_eq!(
+                        symbol_containing_address.st_value, our_sym.st_value,
+                        "Symbol containing address mismatch for symbol {}",
+                        index
+                    );
+                    let file_address_in_range = FileAddress::new(
+                        &elf,
+                        reference_sym
+                            .st_value
+                            .checked_add(reference_sym.st_size / 2)
+                            .expect("Address overflow") as usize,
+                    );
+                    let symbol_containing_address = elf
+                        .get_symbol_containing_address(file_address_in_range)
+                        .expect("Failed to get symbol containing address in range");
+                    assert!(
+                        (symbol_containing_address.st_value as usize)
+                            <= file_address_in_range.address
+                    );
+                    if symbol_containing_address.st_size > 0 {
+                        assert!(
+                            (symbol_containing_address.st_value as usize
+                                + symbol_containing_address.st_size as usize)
+                                > file_address_in_range.address,
+                            "Symbol containing address in range mismatch for. {} <= {}| st_vale={} st_size={}",
+                            symbol_containing_address.st_value + symbol_containing_address.st_size,
+                            file_address_in_range.address,
+                            symbol_containing_address.st_value,
+                            symbol_containing_address.st_size
+                        );
+                    }
+                }
             }
         }
     }
