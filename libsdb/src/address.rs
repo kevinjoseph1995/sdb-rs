@@ -1,8 +1,6 @@
 use std::fmt::Display;
 
-use anyhow::Result;
-
-use crate::elf::Elf;
+use crate::elf_internal::Elf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtAddress {
