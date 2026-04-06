@@ -2,6 +2,7 @@
 name = "sdb-rs"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [[bin]]
 name = "sdb"
@@ -17,3 +18,4 @@ libsdb = { path = "../libsdb" }
 nix = "0.30.1"
 ptrie = "0.7.2"
 rustyline = { version = "15.0.0", features = ["custom-bindings", "derive", "with-file-history"] }
+elf = "0.8.0"
