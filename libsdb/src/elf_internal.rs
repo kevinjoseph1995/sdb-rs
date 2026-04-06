@@ -21,15 +21,15 @@ ASCII diagram adapted from: Figure 11-1: The layout of an ELF file of Building a
 |  Linking view  |        Data          | Execution view |
 |                |                      |                |
 |  +----------+  |                      |  +----------+  |
-|  | Section 1|  |                      |  | Segment 1 |  |
+|  | Section 1|  |                      |  | Segment 1 | |
 |  +----------+  |                      |  +----------+  |
 |                |                      |                |
 |  +----------+  |                      |  +----------+  |
-|  | Section 2|  |                      |  | Segment 2 |  |
+|  | Section 2|  |                      |  | Segment 2 | |
 |  +----------+  |                      |  +----------+  |
 |                |                      |                |
 |  +----------+  |                      |  +----------+  |
-|  | Section 3|  |                      |  | Segment 3 |  |
+|  | Section 3|  |                      |  | Segment 3 | |
 |  +----------+  |                      |  +----------+  |
 |                |                      |                |
 +----------------+----------------------+----------------+
@@ -40,20 +40,20 @@ ASCII diagram adapted from: Figure 11-1: The layout of an ELF file of Building a
 #[repr(C)]
 #[derive(Debug)]
 pub struct Elf64_Ehdr {
-    pub e_ident: [u8; 16],
-    pub e_type: u16,
-    pub e_machine: u16,
-    pub e_version: u32,
-    pub e_entry: u64,
-    pub e_phoff: u64,
-    pub e_shoff: u64,
-    pub e_flags: u32,
-    pub e_ehsize: u16,
-    pub e_phentsize: u16,
-    pub e_phnum: u16,
-    pub e_shentsize: u16,
-    pub e_shnum: u16,
-    pub e_shstrndx: u16,
+    pub e_ident: [u8; 16], // ELF magic number
+    pub e_type: u16,       // Executable, shared lib, relocatable, core
+    pub e_machine: u16,    // Architecture
+    pub e_version: u32,    // Version must be 1
+    pub e_entry: u64,      // Entry point virtual address
+    pub e_phoff: u64,      // Program header table file offset
+    pub e_shoff: u64,      // Section header table file offset
+    pub e_flags: u32,      // Processor specific flags
+    pub e_ehsize: u16,     // Elf header size
+    pub e_phentsize: u16,  // Program header size
+    pub e_phnum: u16,      // Number of program headers
+    pub e_shentsize: u16,  // Section header size
+    pub e_shnum: u16,      // Number of section headers
+    pub e_shstrndx: u16,   // Section that holds the string table
 }
 
 /// Section header
@@ -118,7 +118,7 @@ pub struct Elf {
     path: PathBuf,
     file_handle: std::fs::File,
     mmap: Mmap,
-    header: Elf64_Ehdr,
+    pub header: Elf64_Ehdr,
     section_headers: Vec<Elf64_Shdr>,
     /// A map from section names to their index in the `section_headers` vector, for quick lookup.
     section_map: std::collections::HashMap<CString, usize>,
@@ -175,7 +175,7 @@ impl Elf {
         Ok(elf)
     }
 
-    fn notify_loaded(&mut self, load_bias: VirtAddress) {
+    pub fn notify_loaded(&mut self, load_bias: VirtAddress) {
         self.load_bias = Some(load_bias);
     }
 
@@ -554,7 +554,7 @@ impl Elf {
 
     // ==================== String Table Helpers (private) ====================
 
-    fn get_string(&self, string_offset: usize) -> Option<&CStr> {
+    pub fn get_string(&self, string_offset: usize) -> Option<&CStr> {
         if let Some(section_header) = self
             .get_section_header_by_name(CStr::from_bytes_with_nul(b".strtab\0").unwrap())
             .or(self.get_section_header_by_name(CStr::from_bytes_with_nul(b".dynstr\0").unwrap()))

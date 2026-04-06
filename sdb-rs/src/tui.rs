@@ -1,26 +1,27 @@
 /////////////////////////////////////////
 use std::{borrow::Cow, path::PathBuf};
 /////////////////////////////////////////
-use anyhow::Result;
+use anyhow::{Context, Result};
 use colored::Colorize;
-use ctrlc::Signal;
+use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 use rustyline::{
-    Config, Context, Helper, completion::Completer, highlight::Highlighter, hint::Hinter,
+    Config, Helper, completion::Completer, highlight::Highlighter, hint::Hinter,
     history::DefaultHistory, validate::Validator,
 };
 /////////////////////////////////////////
 use crate::command::{self, Command, CommandCategory, get_completions, get_description_for_help};
 use libsdb::{
     Sysno,
-    process::{HardwareStopPointId, Process, StopReason},
+    process::{HardwareStopPointId, StopReason},
+    target::Target,
 };
 /////////////////////////////////////////
 
 pub struct Application {
     history_file: PathBuf,
     loop_running: bool,
-    inferior_process: Process,
+    target: Target,
 }
 
 struct CustomHelper {
@@ -40,7 +41,7 @@ impl Highlighter for CustomHelper {
 
 impl Hinter for CustomHelper {
     type Hint = String;
-    fn hint(&self, line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<Self::Hint> {
+    fn hint(&self, line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
         let (parse_nodes, remaining_tokens) = crate::command::try_traverse_command_tree(line);
         if !remaining_tokens.is_empty() {
             // If there are remaining tokens, we can't provide a hint
@@ -106,7 +107,7 @@ impl Completer for CustomHelper {
         &self,
         line: &str,
         pos: usize,
-        _ctx: &Context<'_>,
+        _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
         let candidates = get_completions(line)
             .iter()
@@ -124,7 +125,7 @@ impl Completer for CustomHelper {
 impl Helper for CustomHelper {}
 
 impl Application {
-    pub fn new(inferior_process: Process) -> Self {
+    pub fn new(target: Target) -> Self {
         Self {
             history_file: {
                 match dirs::cache_dir() {
@@ -132,7 +133,7 @@ impl Application {
                     None => PathBuf::from(".").join(".sdb_history"),
                 }
             },
-            inferior_process,
+            target,
             loop_running: true,
         }
     }
@@ -143,77 +144,101 @@ impl Application {
         Ok(())
     }
 
+    // https://elixir.bootlin.com/linux/v4.5/source/include/uapi/linux/elf.h#L131
+    // #define ELF_ST_TYPE(x) (((unsigned int) x) & 0xf)
+    fn get_function_name_at(&self, pc: libsdb::address::VirtAddress) -> Result<Option<String>> {
+        let file_addr = pc
+            .to_file_address(&self.target.elf)
+            .ok_or_else(|| anyhow::anyhow!("Failed to convert to file address"))?;
+        self.target
+            .elf
+            .get_symbol_at_address(file_addr)
+            .filter(|sym| sym.st_info & 0xf == elf::abi::STT_FUNC)
+            .map(|sym| -> Result<String> {
+                Ok(self
+                    .target
+                    .elf
+                    .get_string(sym.st_name as usize)
+                    .context("Failed to get symbol name")?
+                    .to_str()?
+                    .to_string())
+            })
+            .transpose()
+    }
+
     fn handle_stop_reason(&self, stop_reason: StopReason) -> Result<()> {
         match stop_reason.wait_status {
             WaitStatus::Exited(_, exit_status) => {
                 println!("Process exited with status: {}", exit_status);
             }
-            WaitStatus::Stopped(_, Signal::SIGTRAP) => match stop_reason.trap_type {
-                Some(libsdb::process::TrapType::SoftwareBreakpoint) => {
-                    println!(
-                        "Process stopped at software breakpoint. rip={}",
-                        self.inferior_process.get_pc()?
-                    );
-                }
-                Some(libsdb::process::TrapType::HardwareBreakpoint) => {
-                    let address = self.inferior_process.get_pc()?;
-                    if let HardwareStopPointId::WatchpointId(id) =
-                        self.inferior_process.get_current_hardware_stoppoint()?
-                    {
-                        let index = self
-                            .inferior_process
-                            .watchpoints
-                            .iter()
-                            .find(|wp| wp.id() == id)
-                            .expect("Watchpoint not found");
-                        println!(
-                            "Process stopped at hardware watchpoint. rip={}, data={:#x}, previous_data={:#x}",
-                            address,
-                            index.get_data().unwrap_or(0),
-                            index.get_previous_data().unwrap_or(0)
-                        );
-                    } else {
-                        println!("Process stopped at hardware breakpoint. rip={}", address);
-                    }
-                }
-                Some(libsdb::process::TrapType::SingleStep) => {
-                    println!("Single step");
-                }
-                Some(libsdb::process::TrapType::Syscall) => {
-                    if let Some(syscall_info) = stop_reason.syscall_info {
-                        let syscall = Sysno::from(syscall_info.number as i32);
+            WaitStatus::Stopped(_, Signal::SIGTRAP) => {
+                let pc = self.target.process.get_pc()?;
+                let func_info = self
+                    .get_function_name_at(pc)?
+                    .map(|name| format!(" in {name}"))
+                    .unwrap_or_default();
 
-                        if syscall_info.entry {
-                            let formatted_args = match syscall_info.metadata {
-                                libsdb::process::SyscallMetadata::EntryArgs(args) => {
-                                    let arg_strs: Vec<String> =
-                                        args.iter().map(|arg| format!("0x{:x}", arg)).collect();
-                                    arg_strs.join(", ")
-                                }
-                                _ => panic!("Expected EntryArgs metadata on syscall entry"),
-                            };
+                match stop_reason.trap_type {
+                    Some(libsdb::process::TrapType::SoftwareBreakpoint) => {
+                        println!("Process stopped at software breakpoint{}. rip={}", func_info, pc);
+                    }
+                    Some(libsdb::process::TrapType::HardwareBreakpoint) => {
+                        if let HardwareStopPointId::WatchpointId(id) =
+                            self.target.process.get_current_hardware_stoppoint()?
+                        {
+                            let wp = self
+                                .target
+                                .process
+                                .watchpoints
+                                .iter()
+                                .find(|wp| wp.id() == id)
+                                .expect("Watchpoint not found");
                             println!(
-                                "Process stopped at syscall entry: {} (number={}) with args: ({})",
-                                syscall, syscall_info.number, formatted_args
+                                "Process stopped at hardware watchpoint{}. rip={}, data={:#x}, previous_data={:#x}",
+                                func_info, pc, wp.get_data().unwrap_or(0), wp.get_previous_data().unwrap_or(0)
                             );
                         } else {
-                            let return_value = match syscall_info.metadata {
-                                libsdb::process::SyscallMetadata::ExitReturnValue(retval) => retval,
-                                _ => panic!("Expected ExitReturnValue metadata on syscall exit"),
+                            println!("Process stopped at hardware breakpoint{}. rip={}", func_info, pc);
+                        }
+                    }
+                    Some(libsdb::process::TrapType::SingleStep) => {
+                        println!("Single step{}", func_info);
+                    }
+                    Some(libsdb::process::TrapType::Syscall) => {
+                        let Some(info) = stop_reason.syscall_info else {
+                            println!("Process stopped at syscall (no info available)");
+                            return Ok(());
+                        };
+                        let syscall = Sysno::from(info.number as i32);
+                        if info.entry {
+                            let libsdb::process::SyscallMetadata::EntryArgs(args) = info.metadata
+                            else {
+                                panic!("Expected EntryArgs metadata on syscall entry")
+                            };
+                            let formatted_args = args
+                                .iter()
+                                .map(|a| format!("0x{:x}", a))
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            println!(
+                                "Process stopped at syscall entry: {} (number={}) with args: ({})",
+                                syscall, info.number, formatted_args
+                            );
+                        } else {
+                            let libsdb::process::SyscallMetadata::ExitReturnValue(retval) =
+                                info.metadata
+                            else {
+                                panic!("Expected ExitReturnValue metadata on syscall exit")
                             };
                             println!(
                                 "Process stopped at syscall exit: {} (number={}) with return value: {}",
-                                syscall, syscall_info.number, return_value
+                                syscall, info.number, retval
                             );
                         }
-                    } else {
-                        println!("Process stopped at syscall (no info available)");
                     }
+                    _ => println!("Process stopped at unknown trap type."),
                 }
-                _ => {
-                    println!("Process stopped at unknown trap type.");
-                }
-            },
+            }
             WaitStatus::Stopped(_, signal) => {
                 println!("Process stopped by signal: {}", signal);
             }
@@ -230,11 +255,11 @@ impl Application {
                 println!("Unhandled wait status: {:?}", stop_reason.wait_status);
             }
         }
-        if self.inferior_process.get_state() == libsdb::process::ProcessHandleState::Stopped {
+        if self.target.process.get_state() == libsdb::process::ProcessHandleState::Stopped {
             command::disassemble_command::print_disassembly(
-                &self.inferior_process,
+                &self.target.process,
                 1,
-                self.inferior_process.get_pc().ok(),
+                self.target.process.get_pc().ok(),
             )?;
         }
         Ok(())
@@ -256,21 +281,21 @@ impl Application {
                 Ok(())
             }
             CommandCategory::Run | CommandCategory::Continue => {
-                if self.inferior_process.get_state() == libsdb::process::ProcessHandleState::Exited
-                {
+                if self.target.process.get_state() == libsdb::process::ProcessHandleState::Exited {
                     println!("Process has exited. Restarting...");
-                    self.inferior_process.restart_process()?;
+                    self.target.process.restart_process()?;
                 }
-                self.inferior_process.resume_process().unwrap_or_else(|e| {
+                self.target.process.resume_process().unwrap_or_else(|e| {
                     // Not a hard error, just print and continue
                     println!("Failed to resume process: {}", e);
                 });
-                let stop_reason = self.inferior_process.wait_on_signal(None)?;
+                let stop_reason = self.target.process.wait_on_signal(None)?;
                 self.handle_stop_reason(stop_reason)?;
                 Ok(())
             }
             CommandCategory::DumpChildOutput => {
-                self.inferior_process
+                self.target
+                    .process
                     .print_child_output()
                     .unwrap_or_else(|e| {
                         // Not a hard error, just print and continue
@@ -282,33 +307,32 @@ impl Application {
             CommandCategory::Register(cmd) => cmd.handle_command(
                 last_in_chain.metadata,
                 command.args,
-                &mut self.inferior_process,
+                &mut self.target.process,
             ),
             CommandCategory::Breakpoint(cmd) => cmd.handle_command(
                 &last_in_chain.metadata,
                 command.args,
-                &mut self.inferior_process,
+                &mut self.target.process,
             ),
             CommandCategory::Step => {
-                let stop_reason = self.inferior_process.single_step()?;
+                let stop_reason = self.target.process.single_step()?;
                 self.handle_stop_reason(stop_reason)?;
                 Ok(())
             }
             CommandCategory::Memory(cmd) => {
-                cmd.handle_command(command.args, &mut self.inferior_process)
+                cmd.handle_command(command.args, &mut self.target.process)
             }
-            CommandCategory::Disassemble => crate::command::disassemble_command::handle_command(
-                &command,
-                &self.inferior_process,
-            ),
+            CommandCategory::Disassemble => {
+                crate::command::disassemble_command::handle_command(&command, &self.target.process)
+            }
             CommandCategory::Watchpoint(watchpoint_command_category) => watchpoint_command_category
                 .handle_command(
                     &last_in_chain.metadata,
                     command.args,
-                    &mut self.inferior_process,
+                    &mut self.target.process,
                 ),
             CommandCategory::Catchpoint(catchpoint_command_category) => {
-                catchpoint_command_category.handle_command(command.args, &mut self.inferior_process)
+                catchpoint_command_category.handle_command(command.args, &mut self.target.process)
             }
         }
     }
@@ -346,7 +370,7 @@ impl Application {
                     last_line = line; // Store the last line for potential reuse
                 }
                 Err(rustyline::error::ReadlineError::Interrupted) => {
-                    self.inferior_process.stop_process()?;
+                    self.target.process.stop_process()?;
                 }
                 Err(rustyline::error::ReadlineError::Eof) => {
                     println!("Ctrl-D pressed, exiting...");

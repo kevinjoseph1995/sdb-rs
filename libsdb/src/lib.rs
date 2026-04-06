@@ -4,6 +4,7 @@ pub mod elf_internal;
 pub mod pipe_channel;
 pub mod process;
 pub mod register_info;
+pub mod target;
 
 pub type Pid = nix::unistd::Pid;
 

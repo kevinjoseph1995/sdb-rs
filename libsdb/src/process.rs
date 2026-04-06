@@ -1,9 +1,13 @@
+use std::collections::HashMap;
 /////////////////////////////////////////
 use std::ffi::CString;
+use std::path::Path;
 use std::path::PathBuf;
+use std::u64;
 /////////////////////////////////////////
 use anyhow::{Context, Result, anyhow};
 use core::panic;
+use libc::AT_NULL;
 use libc::SI_KERNEL;
 use libc::TRAP_HWBKPT;
 use libc::TRAP_TRACE;
@@ -165,7 +169,7 @@ impl Process {
     /// This function forks the current process and sets up the child process for debugging.
     /// It enables tracing for the child process and loads the executable into it.
     pub fn launch(
-        executable_path: &PathBuf,
+        executable_path: &Path,
         args: Option<String>,
         debug_process_being_launched: bool,
         stdout_replacement: Option<std::os::fd::OwnedFd>,
@@ -181,7 +185,7 @@ impl Process {
                     read_port: None,
                     is_attached: debug_process_being_launched,
                     registers: Registers::new(),
-                    executable_path: Some(executable_path.clone()),
+                    executable_path: Some(executable_path.to_path_buf()),
                     syscall_catch_policy: SyscallCatchPolicyMode::None,
                     args: args.clone(),
                     expecting_syscall_exit: false,
@@ -1210,6 +1214,26 @@ impl Process {
         self.disable_watchpoint_at_index(index)?;
         Ok(())
     }
+
+    pub fn get_auxv(&self) -> Result<HashMap<i32, u64>> {
+        let contents = std::fs::read(format!("/proc/{}/auxv", self.pid.as_raw()))?;
+        let mut iter = contents.chunks_exact(8);
+        let read_u64 = |chunk: &[u8]| u64::from_le_bytes(chunk.try_into().unwrap());
+
+        let mut map = HashMap::new();
+        loop {
+            let key = read_u64(iter.next().ok_or_else(|| anyhow!("auxv missing AT_NULL"))?);
+            if key == AT_NULL as u64 {
+                break;
+            }
+            let val = read_u64(
+                iter.next()
+                    .ok_or_else(|| anyhow!("auxv entry missing value"))?,
+            );
+            map.insert(key as i32, val);
+        }
+        Ok(map)
+    }
 }
 
 impl Drop for Process {
@@ -1239,7 +1263,7 @@ impl Drop for Process {
 /// Sets up the child process for debugging. This function is called in the child process after a fork.
 /// It enables tracing for the child process and loads the executable into it. It also passes the arguments to the executable.
 fn setup_child_process(
-    executable_path: &PathBuf,
+    executable_path: &Path,
     args: Option<String>,
     attach_for_debugging: bool,
 ) -> Result<()> {
