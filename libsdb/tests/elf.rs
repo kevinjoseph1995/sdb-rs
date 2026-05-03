@@ -1,8 +1,5 @@
-use libsdb::elf_internal::Elf;
-use std::{
-    ffi::{CStr, CString},
-    path::PathBuf,
-};
+use libsdb::elf::Elf;
+use std::path::PathBuf;
 use test_binary::build_test_binary;
 
 #[test]

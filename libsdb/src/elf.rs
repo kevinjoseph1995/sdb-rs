@@ -115,8 +115,8 @@ impl Ord for RawAddressRange {
 
 #[derive(Debug)]
 pub struct Elf {
-    path: PathBuf,
-    file_handle: std::fs::File,
+    _path: PathBuf,
+    _file_handle: std::fs::File,
     mmap: Mmap,
     pub header: Elf64_Ehdr,
     section_headers: Vec<Elf64_Shdr>,
@@ -158,8 +158,8 @@ impl Elf {
         let symbol_table = Self::parse_symbol_table(&mmap, &section_map, &section_headers)?;
         let mut elf = Self {
             header,
-            path: path_buf,
-            file_handle,
+            _path: path_buf,
+            _file_handle: file_handle,
             mmap,
             section_headers,
             section_map,
@@ -328,7 +328,7 @@ impl Elf {
         }
     }
 
-    fn get_section_content_by_name(&self, section_name: &CStr) -> Option<&[u8]> {
+    pub fn get_section_content_by_name(&self, section_name: &CStr) -> Option<&[u8]> {
         if let Some(section_header) = self.get_section_header_by_name(section_name) {
             let offset = section_header.sh_offset as usize;
             let size = section_header.sh_size as usize;
@@ -350,7 +350,7 @@ impl Elf {
         }
     }
 
-    fn section_name(&self, sh_name: usize) -> Result<&CStr> {
+    pub fn section_name(&self, sh_name: usize) -> Result<&CStr> {
         Self::section_name_internal(&self.mmap, &self.section_headers, &self.header, sh_name)
     }
 
@@ -612,7 +612,7 @@ mod tests {
                 .expect("Failed to parse ELF file");
 
         let elf = Elf::new(&test_binary_path).expect("Failed to create ELF object");
-        assert_eq!(elf.path, test_binary_path);
+        assert_eq!(elf._path, test_binary_path);
         assert!(elf.mmap.len() > 0);
         ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Header validation: Compare the ELF header from our implementation to the one from the `elf` crate.

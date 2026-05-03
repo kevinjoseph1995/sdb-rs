@@ -21,6 +21,7 @@
           git
           cmake
           pkg-config
+          libdwarf
         ];
         shellHook = ''
           echo "Welcome to the sdb-rs Development Environment"

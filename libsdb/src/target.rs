@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use crate::{address::VirtAddress, elf_internal::Elf, process::Process};
+use crate::{address::VirtAddress, elf::Elf, process::Process};
 use anyhow::{Context, Result};
 use libc::AT_ENTRY;
 
