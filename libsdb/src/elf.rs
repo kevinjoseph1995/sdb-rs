@@ -115,7 +115,7 @@ impl Ord for RawAddressRange {
 
 #[derive(Debug)]
 pub struct Elf {
-    _path: PathBuf,
+    pub path: PathBuf,
     _file_handle: std::fs::File,
     mmap: Mmap,
     pub header: Elf64_Ehdr,
@@ -158,7 +158,7 @@ impl Elf {
         let symbol_table = Self::parse_symbol_table(&mmap, &section_map, &section_headers)?;
         let mut elf = Self {
             header,
-            _path: path_buf,
+            path: path_buf,
             _file_handle: file_handle,
             mmap,
             section_headers,
@@ -612,7 +612,7 @@ mod tests {
                 .expect("Failed to parse ELF file");
 
         let elf = Elf::new(&test_binary_path).expect("Failed to create ELF object");
-        assert_eq!(elf._path, test_binary_path);
+        assert_eq!(elf.path, test_binary_path);
         assert!(elf.mmap.len() > 0);
         ///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
         // Header validation: Compare the ELF header from our implementation to the one from the `elf` crate.

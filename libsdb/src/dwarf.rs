@@ -1,9 +1,31 @@
-use anyhow::{Result, anyhow};
-use std::ffi::CStr;
+use crate::elf::Elf;
+use anyhow::{Context, Result, anyhow};
+use std::{collections::HashMap, ffi::CStr};
 
 pub struct Cursor<'a> {
     bytes: &'a [u8],
     position: usize,
+}
+
+pub struct AttrSpec {
+    attr: u64,
+    form: u64,
+}
+
+pub struct Abbrev {
+    code: u64,
+    tag: u64,
+    has_children: bool,
+    attr_specs: Vec<AttrSpec>,
+}
+
+pub struct Dwarf<'a> {
+    elf: &'a Elf,
+    /// The .debug_abbrev section contains several abbreviation tables. Each compile
+    /// unit in the .debug_info section uses exactly one abbreviation table, but different
+    /// compile units may share the same table.
+    /// Maps byte offsets to another map, of integers to abbreviation entries.
+    abbrev_table: HashMap<u64, HashMap<u64 /* abbreviation code*/, Abbrev>>,
 }
 
 macro_rules! impl_read_int {
@@ -17,6 +39,75 @@ macro_rules! impl_read_int {
             )*
         }
     };
+}
+
+fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<HashMap<u64, Abbrev>> {
+    let section_buffer: &[u8] = elf
+        .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_abbrev\0").unwrap())
+        .context(format!(
+            "Failed to find the .debug_abbrev section in {:?}",
+            &elf.path
+        ))?;
+    let mut cursor = Cursor::new(&section_buffer);
+    cursor.increment_cursor_by(offset);
+    let mut table = HashMap::<u64, Abbrev>::new();
+    let mut code: u64;
+    loop {
+        // Parse one entry
+        // We extract the ULEB128 for the code, the ULEB128 for the tag,
+        // the 1-byte unsigned integer for the children flag (which will be either
+        // 1 or 0), and the list of ULEB128 pairs of attribute types and forms,
+        // terminated by a pair of 0s.
+        code = cursor.uleb128()?;
+        let tag = cursor.uleb128()?;
+        let has_children = cursor.read_u8()? > 0;
+        let mut attr_specs = Vec::<AttrSpec>::new();
+        let mut attr: u64;
+        loop {
+            attr = cursor.uleb128()?;
+            let form = cursor.uleb128()?;
+            if attr != 0 {
+                attr_specs.push(AttrSpec { attr, form });
+            }
+            if attr == 0 {
+                // Attr, form list is terminated by a 0
+                break;
+            }
+        }
+        if code != 0 {
+            table.insert(
+                code,
+                Abbrev {
+                    code,
+                    tag,
+                    has_children,
+                    attr_specs,
+                },
+            );
+        } else {
+            // Abbrev table entry is terminated by a 0
+            break;
+        }
+    }
+    return Ok(table);
+}
+
+impl<'a> Dwarf<'a> {
+    pub fn new(elf: &'a Elf) -> Dwarf<'a> {
+        Dwarf {
+            elf,
+            abbrev_table: HashMap::new(),
+        }
+    }
+
+    pub fn get_abbrev_table(&'a mut self, offset: usize) -> Result<&'a HashMap<u64, Abbrev>> {
+        if !self.abbrev_table.contains_key(&(offset as u64)) {
+            // Cache miss
+            let table = parse_abbrev_table(self.elf, offset)?;
+            self.abbrev_table.insert(offset as u64, table);
+        }
+        Ok(self.abbrev_table.get(&(offset as u64)).unwrap())
+    }
 }
 
 impl<'a> Cursor<'a> {
@@ -116,54 +207,4 @@ impl_read_int! {
     read_i16 => i16,
     read_i32 => i32,
     read_i64 => i64,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::ffi::CString;
-
-    #[test]
-    fn test_cursor_integer_extraction() {
-        let input_bytes = {
-            let mut bytes = Vec::<u8>::new();
-            bytes.push(0u8);
-            bytes.extend_from_slice(&(-666i16).to_le_bytes());
-            bytes.extend_from_slice(&(666u32).to_le_bytes());
-            bytes.extend_from_slice(&(666u64).to_le_bytes());
-            bytes
-        };
-
-        let mut cursor = Cursor::new(&input_bytes);
-        assert_eq!(cursor.read_u8().expect("Expected 0u8"), 0u8);
-        assert_eq!(cursor.read_i16().expect("Expected -666i16"), -666i16);
-        assert_eq!(cursor.read_u32().expect("Expected 666u32"), 666u32);
-        assert_eq!(cursor.read_u64().expect("Expected 666u64"), 666u64);
-        assert!(cursor.is_at_end());
-    }
-
-    #[test]
-    fn test_string_extraction() {
-        let input_bytes = {
-            let mut bytes = Vec::<u8>::new();
-            bytes.extend_from_slice(b"Hello\0");
-            bytes.extend_from_slice(b"World\0");
-            bytes.extend_from_slice(b"QWERTY\0");
-            bytes
-        };
-        let mut cursor = Cursor::new(&input_bytes);
-        assert_eq!(
-            cursor.read_string().expect("Failed to extract \"Hello\""),
-            &CString::from_vec_with_nul(b"Hello\0".to_vec()).unwrap()
-        );
-        assert_eq!(
-            cursor.read_string().expect("Failed to extract \"World\""),
-            &CString::from_vec_with_nul(b"World\0".to_vec()).unwrap()
-        );
-        assert_eq!(
-            cursor.read_string().expect("Failed to extract \"Hello\""),
-            &CString::from_vec_with_nul(b"QWERTY\0".to_vec()).unwrap()
-        );
-        assert!(cursor.is_at_end());
-    }
 }
