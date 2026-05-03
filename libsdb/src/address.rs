@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::elf_internal::Elf;
+use crate::elf::Elf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VirtAddress {
