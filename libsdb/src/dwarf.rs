@@ -19,13 +19,16 @@ pub struct Abbrev {
     attr_specs: Vec<AttrSpec>,
 }
 
-pub struct Dwarf<'a> {
-    elf: &'a Elf,
+pub struct Dwarf<'elf> {
+    elf: &'elf Elf,
     /// The .debug_abbrev section contains several abbreviation tables. Each compile
     /// unit in the .debug_info section uses exactly one abbreviation table, but different
     /// compile units may share the same table.
     /// Maps byte offsets to another map, of integers to abbreviation entries.
     abbrev_table: HashMap<u64, HashMap<u64 /* abbreviation code*/, Abbrev>>,
+
+    /// Information for each compile unit involved in the compilation of the program.
+    compile_units: Vec<CompileUnit<'elf>>,
 }
 
 macro_rules! impl_read_int {
@@ -92,15 +95,62 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<HashMap<u64, Abbrev>> 
     return Ok(table);
 }
 
-impl<'a> Dwarf<'a> {
-    pub fn new(elf: &'a Elf) -> Dwarf<'a> {
-        Dwarf {
+fn parse_compile_unit<'elf>(cursor: &mut Cursor<'elf>) -> Result<CompileUnit<'elf>> {
+    let start = cursor.position;
+    let mut size: u32 = cursor
+        .read_u32()
+        .context("Failed to read size when trying to parse compile unit")?;
+    let version: u16 = cursor
+        .read_u16()
+        .context("Failed to read version when trying to parse compile unit")?;
+    let abbrev: u32 = cursor
+        .read_u32()
+        .context("Failed to read abbrev when trying to parse compile unit")?;
+    let address_size: u8 = cursor
+        .read_u8()
+        .context("Failed to read address size when trying to parse compile unit")?;
+    if size == 0xffffffff {
+        return Err(anyhow!("Only DWARF32 is supported"));
+    }
+    if version != 4 {
+        return Err(anyhow!("Only DWARF version 4 is supported"));
+    }
+    if address_size != 8 {
+        return Err(anyhow!("Invalid address size for DWARF"));
+    }
+    // "because the reported size in the compile unit header doesn’t include the size field itself"
+    size += std::mem::size_of::<u32>() as u32;
+    let compile_unit_data: &'elf [u8] = &cursor.bytes[start..start + size as usize];
+    cursor.increment_cursor_by(size as usize);
+    Ok(CompileUnit {
+        abbrev_offset: abbrev as u64,
+        data: compile_unit_data,
+    })
+}
+
+fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
+    let debug_info_data = elf
+        .get_section_content_by_name(&CStr::from_bytes_with_nul(b".debug_info\0")?)
+        .context("Failed to find .debug_info section")?;
+    let mut cursor = Cursor::new(debug_info_data);
+    let mut compile_units = Vec::new();
+    while !cursor.is_at_end() {
+        compile_units.push(parse_compile_unit(&mut cursor)?);
+    }
+    Ok(compile_units)
+}
+
+impl<'elf> Dwarf<'elf> {
+    pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
+        let compile_units = parse_compile_units(elf)?;
+        Ok(Dwarf {
             elf,
             abbrev_table: HashMap::new(),
-        }
+            compile_units,
+        })
     }
 
-    pub fn get_abbrev_table(&'a mut self, offset: usize) -> Result<&'a HashMap<u64, Abbrev>> {
+    pub fn get_abbrev_table(&mut self, offset: usize) -> Result<&HashMap<u64, Abbrev>> {
         if !self.abbrev_table.contains_key(&(offset as u64)) {
             // Cache miss
             let table = parse_abbrev_table(self.elf, offset)?;
@@ -207,4 +257,25 @@ impl_read_int! {
     read_i16 => i16,
     read_i32 => i32,
     read_i64 => i64,
+}
+
+struct CompileUnit<'elf> {
+    abbrev_offset: u64,
+    data: &'elf [u8],
+}
+
+impl<'elf> CompileUnit<'elf> {
+    pub fn new(data: &'elf [u8], abbrev_offset: u64) -> CompileUnit<'elf> {
+        CompileUnit {
+            abbrev_offset,
+            data,
+        }
+    }
+
+    pub fn get_abbrev_table<'d>(
+        &self,
+        dwarf: &'d mut Dwarf<'elf>,
+    ) -> Result<&'d HashMap<u64 /* abbreviation code*/, Abbrev>> {
+        dwarf.get_abbrev_table(self.abbrev_offset as usize)
+    }
 }
