@@ -1,11 +1,7 @@
+use crate::cursor::Cursor;
 use crate::elf::Elf;
 use anyhow::{Context, Result, anyhow};
 use std::{collections::HashMap, ffi::CStr};
-
-pub struct Cursor<'a> {
-    bytes: &'a [u8],
-    position: usize,
-}
 
 pub struct AttrSpec {
     attr: u64,
@@ -19,32 +15,46 @@ pub struct Abbrev {
     attr_specs: Vec<AttrSpec>,
 }
 
-pub struct Dwarf<'elf> {
-    elf: &'elf Elf,
-    /// The .debug_abbrev section contains several abbreviation tables. Each compile
-    /// unit in the .debug_info section uses exactly one abbreviation table, but different
-    /// compile units may share the same table.
-    /// Maps byte offsets to another map, of integers to abbreviation entries.
-    abbrev_table: HashMap<u64, HashMap<u64 /* abbreviation code*/, Abbrev>>,
+/// The .debug_abbrev section contains several abbreviation tables. Each compile
+/// unit in the .debug_info section uses exactly one abbreviation table, but different
+/// compile units may share the same table.
+/// Maps byte offsets to another map, of integers to abbreviation entries.
+type AbbrevTable = HashMap<u64 /* abbreviation code*/, Abbrev>;
+struct AbbrevTableCache<'a> {
+    elf: &'a Elf,
+    tables: HashMap<usize /*offset into the .debug_abbrev section*/, AbbrevTable>,
+}
 
-    /// Information for each compile unit involved in the compilation of the program.
+struct CompileUnit<'elf> {
+    abbrev_offset: usize,
+    data: &'elf [u8],
+}
+
+struct Dwarf<'elf> {
+    elf: &'elf Elf,
     compile_units: Vec<CompileUnit<'elf>>,
 }
 
-macro_rules! impl_read_int {
-    ($($method:ident => $ty:ty),* $(,)?) => {
-        impl<'a> Cursor<'a> {
-            $(
-                pub fn $method(&mut self) -> Result<$ty> {
-                    self.read_bytes::<{ std::mem::size_of::<$ty>() }>()
-                        .map(<$ty>::from_le_bytes)
-                }
-            )*
-        }
-    };
+///  Debugging Information Entry
+struct DiePayload<'a, 'b> {
+    /// This is the offset into the .debug_info section
+    position: usize,
+    /// This is the offset of either a sibling or child of this DIE
+    next: usize,
+    /// The compile unit that owns this Die
+    compile_unit: &'a CompileUnit<'a>,
+    /// abbrev entry for this DIE
+    abbrev: &'b Abbrev,
+    /// Locations into the .debug_info section where the attrs live.
+    attr_locations: Vec<usize>,
 }
 
-fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<HashMap<u64, Abbrev>> {
+enum Die<'a, 'b> {
+    Null(usize),
+    NonNull(DiePayload<'a, 'b>),
+}
+
+fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
     let section_buffer: &[u8] = elf
         .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_abbrev\0").unwrap())
         .context(format!(
@@ -96,7 +106,7 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<HashMap<u64, Abbrev>> 
 }
 
 fn parse_compile_unit<'elf>(cursor: &mut Cursor<'elf>) -> Result<CompileUnit<'elf>> {
-    let start = cursor.position;
+    let start = cursor.position();
     let mut size: u32 = cursor
         .read_u32()
         .context("Failed to read size when trying to parse compile unit")?;
@@ -123,7 +133,7 @@ fn parse_compile_unit<'elf>(cursor: &mut Cursor<'elf>) -> Result<CompileUnit<'el
     let compile_unit_data: &'elf [u8] = &cursor.bytes[start..start + size as usize];
     cursor.increment_cursor_by(size as usize);
     Ok(CompileUnit {
-        abbrev_offset: abbrev as u64,
+        abbrev_offset: abbrev as usize,
         data: compile_unit_data,
     })
 }
@@ -140,142 +150,64 @@ fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
     Ok(compile_units)
 }
 
-impl<'elf> Dwarf<'elf> {
-    pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
-        let compile_units = parse_compile_units(elf)?;
+impl<'a> Dwarf<'a> {
+    pub fn new<'elf, 'b>(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
         Ok(Dwarf {
             elf,
-            abbrev_table: HashMap::new(),
-            compile_units,
+            compile_units: parse_compile_units(elf)?,
         })
     }
+}
 
-    pub fn get_abbrev_table(&mut self, offset: usize) -> Result<&HashMap<u64, Abbrev>> {
-        if !self.abbrev_table.contains_key(&(offset as u64)) {
+impl<'elf> AbbrevTableCache<'elf> {
+    pub fn get_table_at_offset(&mut self, offset: usize) -> Result<&AbbrevTable> {
+        if !self.tables.contains_key(&offset) {
             // Cache miss
-            let table = parse_abbrev_table(self.elf, offset)?;
-            self.abbrev_table.insert(offset as u64, table);
+            self.tables
+                .insert(offset, parse_abbrev_table(self.elf, offset)?);
         }
-        Ok(self.abbrev_table.get(&(offset as u64)).unwrap())
+        Ok(self.tables.get(&offset).unwrap())
     }
-}
-
-impl<'a> Cursor<'a> {
-    pub fn new<'b>(bytes: &'b [u8]) -> Cursor<'b> {
-        Cursor { bytes, position: 0 }
-    }
-
-    fn increment_cursor_by(&mut self, n: usize) {
-        self.position += n;
-    }
-
-    pub fn is_at_end(&self) -> bool {
-        return self.position >= self.bytes.len();
-    }
-
-    fn read_bytes<const N: usize>(&mut self) -> Result<[u8; N]> {
-        let end = self.position + N;
-        if end > self.bytes.len() {
-            return Err(anyhow!("DWARF cursor error, reached end of stream"));
-        }
-        let bytes = self.bytes[self.position..end].try_into().unwrap();
-        self.increment_cursor_by(N);
-        Ok(bytes)
-    }
-
-    pub fn read_string(&mut self) -> Result<&CStr> {
-        if self.is_at_end() {
-            return Err(anyhow!(
-                "DWARF cursor error, failed to read string already at the end of the stream"
-            ));
-        }
-        let old_position = self.position;
-        let null_byte_position: usize = match self.bytes[self.position..]
-            .iter()
-            .position(|byte| *byte == 0u8)
-        {
-            Some(pos) => pos,
-            None => {
-                return Err(anyhow!(
-                    "DWARF curosor error, failed to find null terminator. Failed to parse string"
-                ));
-            }
-        };
-        self.increment_cursor_by(null_byte_position + 1);
-        // SAFETY: We've already found our null-terminator at this point. No point in scanning through our stream again
-        Ok(unsafe {
-            CStr::from_bytes_with_nul_unchecked(
-                &self.bytes[old_position..=old_position + null_byte_position],
-            )
-        })
-    }
-
-    /// Unsigned Little Endian Base 128
-    pub fn uleb128(&mut self) -> Result<u64> {
-        let mut result: u64 = 0;
-        let mut shift = 0;
-        loop {
-            let byte = self.read_u8()?;
-            let value_bits = byte & 0b0111_1111;
-            result |= (value_bits as u64) << shift;
-            shift += 7;
-            let has_more_bits = byte & 0b1000_0000 > 0;
-            if !has_more_bits {
-                break;
-            }
-        }
-        Ok(result)
-    }
-    /// Little Endian Base 128
-    pub fn sleb128(&mut self) -> Result<i64> {
-        let mut result: u64 = 0;
-        let mut shift = 0;
-        let mut byte: u8;
-        loop {
-            byte = self.read_u8()?;
-            let value_bits = byte & 0b0111_1111;
-            result |= (value_bits as u64) << shift;
-            shift += 7;
-            let has_more_bits = byte & 0b1000_0000 > 0;
-            if !has_more_bits {
-                break;
-            }
-        }
-        if shift < std::mem::size_of_val(&result) * 8 && byte & 0b0100_0000 > 0 {
-            result |= !0u64 << shift;
-        }
-        Ok(result as i64)
-    }
-}
-
-impl_read_int! {
-    read_u8  => u8,
-    read_u16 => u16,
-    read_u32 => u32,
-    read_u64 => u64,
-    read_i8  => i8,
-    read_i16 => i16,
-    read_i32 => i32,
-    read_i64 => i64,
-}
-
-struct CompileUnit<'elf> {
-    abbrev_offset: u64,
-    data: &'elf [u8],
 }
 
 impl<'elf> CompileUnit<'elf> {
-    pub fn new(data: &'elf [u8], abbrev_offset: u64) -> CompileUnit<'elf> {
-        CompileUnit {
-            abbrev_offset,
-            data,
-        }
+    pub fn root<'a, 'b>(
+        &'a self,
+        abbrev_table_cache: &'b mut AbbrevTableCache,
+    ) -> Result<Die<'a, 'b>> {
+        // Compile unit header size
+        const HEADER_SIZE: usize = 11;
+        let mut cursor = Cursor::new(&self.data[HEADER_SIZE..]);
+        return parse_die(&mut cursor, &self, abbrev_table_cache);
     }
+}
 
-    pub fn get_abbrev_table<'d>(
-        &self,
-        dwarf: &'d mut Dwarf<'elf>,
-    ) -> Result<&'d HashMap<u64 /* abbreviation code*/, Abbrev>> {
-        dwarf.get_abbrev_table(self.abbrev_offset as usize)
+fn parse_die<'a, 'b>(
+    cursor: &mut Cursor,
+    compile_unit: &'a CompileUnit,
+    abbrev_table_cache: &'b mut AbbrevTableCache,
+) -> Result<Die<'a, 'b>> {
+    let position = cursor.position();
+    let abbrev_code = cursor.uleb128()?;
+    if abbrev_code == 0 {
+        return Ok(Die::Null(position));
     }
+    let abbrev_table = abbrev_table_cache.get_table_at_offset(compile_unit.abbrev_offset)?;
+    let abbrev: &Abbrev = abbrev_table
+        .get(&abbrev_code)
+        .context("Failed to get abbrev entry from CU's abbrev_table")?;
+    let mut attr_locations = Vec::new();
+    attr_locations.reserve(abbrev.attr_specs.len());
+    for attr in &abbrev.attr_specs {
+        attr_locations.push(cursor.position());
+        cursor.skip_form(attr.form);
+    }
+    let next = cursor.position();
+    return Ok(Die::NonNull(DiePayload {
+        position,
+        next,
+        compile_unit,
+        abbrev,
+        attr_locations,
+    }));
 }

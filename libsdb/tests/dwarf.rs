@@ -1,6 +1,6 @@
 use std::ffi::CString;
 
-use libsdb::dwarf::Cursor;
+use libsdb::cursor::Cursor;
 
 // uleb128 tests
 
