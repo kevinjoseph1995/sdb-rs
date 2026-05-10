@@ -1,6 +1,11 @@
-use std::ffi::CString;
+use std::{ffi::CString, path::PathBuf};
 
-use libsdb::cursor::Cursor;
+use libsdb::{
+    cursor::Cursor,
+    dwarf::{AbbrevTableCache, Dwarf},
+    elf::Elf,
+};
+use test_binary::TestBinary;
 
 // uleb128 tests
 
@@ -174,4 +179,55 @@ fn test_string_extraction() {
         &CString::from_vec_with_nul(b"QWERTY\0".to_vec()).unwrap()
     );
     assert!(cursor.is_at_end());
+}
+
+fn gimli_compile_unit_count(path: &PathBuf) -> usize {
+    let data = std::fs::read(path).unwrap();
+    let obj = object::File::parse(&*data).unwrap();
+    let endian = if obj.is_little_endian() {
+        gimli::RunTimeEndian::Little
+    } else {
+        gimli::RunTimeEndian::Big
+    };
+    use object::Object as _;
+    let load =
+        |id: gimli::SectionId| -> Result<gimli::EndianSlice<gimli::RunTimeEndian>, gimli::Error> {
+            let data = obj
+                .section_by_name(id.name())
+                .and_then(|s| {
+                    use object::ObjectSection as _;
+                    s.data().ok()
+                })
+                .unwrap_or(&[]);
+            Ok(gimli::EndianSlice::new(data, endian))
+        };
+    let gimli_dwarf = gimli::Dwarf::load(load).unwrap();
+    let mut units = gimli_dwarf.units();
+    let mut count = 0;
+    while units.next().unwrap().is_some() {
+        count += 1;
+    }
+    count
+}
+
+#[test]
+fn test_dwarf_die_tree_traversal() {
+    let test_executable = PathBuf::from(
+        TestBinary::relative_to_parent(
+            "hello_sdb",
+            &PathBuf::from_iter(["..", "tools", "hello_sdb", "Cargo.toml"]),
+        )
+        .with_profile("dev")
+        .build()
+        .expect("Failed to build test binary"),
+    );
+    let elf = Elf::new(&test_executable).expect("Failed to create Elf object");
+    let _abbrev_table = AbbrevTableCache::new(&elf);
+    let dwarf = Dwarf::new(&elf).expect("Failed to parse Dwarf object");
+
+    // validate the number of compile units with an independent implementation.
+    assert_eq!(
+        dwarf.compile_units.len(),
+        gimli_compile_unit_count(&test_executable)
+    );
 }

@@ -19,20 +19,20 @@ pub struct Abbrev {
 /// unit in the .debug_info section uses exactly one abbreviation table, but different
 /// compile units may share the same table.
 /// Maps byte offsets to another map, of integers to abbreviation entries.
-type AbbrevTable = HashMap<u64 /* abbreviation code*/, Abbrev>;
-struct AbbrevTableCache<'a> {
+pub type AbbrevTable = HashMap<u64 /* abbreviation code*/, Abbrev>;
+pub struct AbbrevTableCache<'a> {
     elf: &'a Elf,
     tables: HashMap<usize /*offset into the .debug_abbrev section*/, AbbrevTable>,
 }
 
-struct CompileUnit<'elf> {
+pub struct CompileUnit<'elf> {
     abbrev_offset: usize,
     data: &'elf [u8],
 }
 
-struct Dwarf<'elf> {
+pub struct Dwarf<'elf> {
     elf: &'elf Elf,
-    compile_units: Vec<CompileUnit<'elf>>,
+    pub compile_units: Vec<CompileUnit<'elf>>,
 }
 
 ///  Debugging Information Entry
@@ -47,6 +47,8 @@ struct DiePayload<'a, 'b> {
     abbrev: &'b Abbrev,
     /// Locations into the .debug_info section where the attrs live.
     attr_locations: Vec<usize>,
+    /// Abbrev table
+    abbrev_table: &'b AbbrevTable,
 }
 
 enum Die<'a, 'b> {
@@ -130,8 +132,9 @@ fn parse_compile_unit<'elf>(cursor: &mut Cursor<'elf>) -> Result<CompileUnit<'el
     }
     // "because the reported size in the compile unit header doesn’t include the size field itself"
     size += std::mem::size_of::<u32>() as u32;
-    let compile_unit_data: &'elf [u8] = &cursor.bytes[start..start + size as usize];
-    cursor.increment_cursor_by(size as usize);
+    let end = start + size as usize;
+    let compile_unit_data: &'elf [u8] = &cursor.bytes[start..end];
+    cursor.increment_cursor_by(end - cursor.position());
     Ok(CompileUnit {
         abbrev_offset: abbrev as usize,
         data: compile_unit_data,
@@ -160,6 +163,13 @@ impl<'a> Dwarf<'a> {
 }
 
 impl<'elf> AbbrevTableCache<'elf> {
+    pub fn new(elf: &'elf Elf) -> AbbrevTableCache<'elf> {
+        AbbrevTableCache {
+            elf,
+            tables: HashMap::new(),
+        }
+    }
+
     pub fn get_table_at_offset(&mut self, offset: usize) -> Result<&AbbrevTable> {
         if !self.tables.contains_key(&offset) {
             // Cache miss
@@ -182,17 +192,16 @@ impl<'elf> CompileUnit<'elf> {
     }
 }
 
-fn parse_die<'a, 'b>(
+fn parse_die_raw<'a, 'b>(
     cursor: &mut Cursor,
     compile_unit: &'a CompileUnit,
-    abbrev_table_cache: &'b mut AbbrevTableCache,
+    abbrev_table: &'b AbbrevTable,
 ) -> Result<Die<'a, 'b>> {
     let position = cursor.position();
     let abbrev_code = cursor.uleb128()?;
     if abbrev_code == 0 {
         return Ok(Die::Null(position));
     }
-    let abbrev_table = abbrev_table_cache.get_table_at_offset(compile_unit.abbrev_offset)?;
     let abbrev: &Abbrev = abbrev_table
         .get(&abbrev_code)
         .context("Failed to get abbrev entry from CU's abbrev_table")?;
@@ -200,14 +209,111 @@ fn parse_die<'a, 'b>(
     attr_locations.reserve(abbrev.attr_specs.len());
     for attr in &abbrev.attr_specs {
         attr_locations.push(cursor.position());
-        cursor.skip_form(attr.form);
+        cursor.skip_form(attr.form)?;
     }
     let next = cursor.position();
-    return Ok(Die::NonNull(DiePayload {
+    Ok(Die::NonNull(DiePayload {
         position,
         next,
         compile_unit,
         abbrev,
         attr_locations,
-    }));
+        abbrev_table,
+    }))
+}
+
+fn parse_die<'a, 'b>(
+    cursor: &mut Cursor,
+    compile_unit: &'a CompileUnit,
+    abbrev_table_cache: &'b mut AbbrevTableCache,
+) -> Result<Die<'a, 'b>> {
+    let abbrev_table = abbrev_table_cache.get_table_at_offset(compile_unit.abbrev_offset)?;
+    parse_die_raw(cursor, compile_unit, abbrev_table)
+}
+
+fn skip_children(cursor: &mut Cursor, abbrev_table: &AbbrevTable) -> Result<()> {
+    loop {
+        let code = cursor.uleb128()?;
+        if code == 0 {
+            return Ok(());
+        }
+        let abbrev = abbrev_table
+            .get(&code)
+            .ok_or_else(|| anyhow!("Unknown abbreviation code: {}", code))?;
+        for attr in &abbrev.attr_specs {
+            cursor.skip_form(attr.form)?;
+        }
+        if abbrev.has_children {
+            skip_children(cursor, abbrev_table)?;
+        }
+    }
+}
+
+struct DieChildrenIter<'a, 'b> {
+    compile_unit: &'a CompileUnit<'a>,
+    abbrev_table: &'b AbbrevTable,
+    current_offset: usize,
+    done: bool,
+}
+
+impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
+    type Item = Result<Die<'a, 'b>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        const HEADER_SIZE: usize = 11;
+        let die_data = &self.compile_unit.data[HEADER_SIZE..];
+        let mut cursor = Cursor::new(die_data);
+        cursor.increment_cursor_by(self.current_offset);
+
+        match parse_die_raw(&mut cursor, self.compile_unit, self.abbrev_table) {
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+            Ok(Die::Null(_)) => {
+                self.done = true;
+                None
+            }
+            Ok(Die::NonNull(payload)) => {
+                let next_sibling_offset = if payload.abbrev.has_children {
+                    let mut skip_cursor = Cursor::new(die_data);
+                    skip_cursor.increment_cursor_by(payload.next);
+                    match skip_children(&mut skip_cursor, self.abbrev_table) {
+                        Ok(()) => skip_cursor.position(),
+                        Err(e) => {
+                            self.done = true;
+                            return Some(Err(e));
+                        }
+                    }
+                } else {
+                    payload.next
+                };
+                self.current_offset = next_sibling_offset;
+                Some(Ok(Die::NonNull(payload)))
+            }
+        }
+    }
+}
+
+impl<'a, 'b> DiePayload<'a, 'b> {
+    pub fn children(&self) -> DieChildrenIter<'a, 'b> {
+        DieChildrenIter {
+            compile_unit: self.compile_unit,
+            abbrev_table: self.abbrev_table,
+            current_offset: self.next,
+            done: !self.abbrev.has_children,
+        }
+    }
+}
+
+impl<'a, 'b> Die<'a, 'b> {
+    pub fn children(&self) -> Option<DieChildrenIter<'a, 'b>> {
+        match self {
+            Die::Null(_) => None,
+            Die::NonNull(payload) => Some(payload.children()),
+        }
+    }
 }
