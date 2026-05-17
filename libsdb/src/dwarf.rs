@@ -1,4 +1,3 @@
-use crate::cursor;
 use crate::dwarf_constants::DwForm;
 use crate::elf::Elf;
 use crate::{address::FileAddress, cursor::Cursor};
@@ -29,6 +28,9 @@ pub struct AbbrevTableCache<'a> {
 
 pub struct CompileUnit<'elf> {
     abbrev_offset: usize,
+    /// Start offset of this CU within the .debug_info section.
+    /// Used to resolve `DW_FORM_ref_addr` references that point into other CUs.
+    debug_info_offset: usize,
     data: &'elf [u8],
     elf: &'elf Elf,
 }
@@ -145,6 +147,7 @@ fn parse_compile_unit<'elf>(
     cursor.increment_cursor_by(end - cursor.position());
     Ok(CompileUnit {
         abbrev_offset: abbrev as usize,
+        debug_info_offset: start,
         data: compile_unit_data,
         elf,
     })
@@ -162,13 +165,28 @@ fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
     Ok(compile_units)
 }
 
-impl<'a> Dwarf<'a> {
-    pub fn new<'elf, 'b>(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
-        Ok(Dwarf {
-            elf,
-            compile_units: parse_compile_units(elf)?,
-        })
+impl<'elf> Dwarf<'elf> {
+    pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
+        let compile_units = parse_compile_units(elf)?;
+        Ok(Dwarf { elf, compile_units })
     }
+}
+
+fn find_cu_containing<'a, 'elf>(
+    dwarf: &'a Dwarf<'elf>,
+    abs_offset: usize,
+) -> Result<(
+    &'a CompileUnit<'elf>,
+    usize, /*Offset relative to the found CU */
+)> {
+    let cu = dwarf
+        .compile_units
+        .iter()
+        .find(|cu| {
+            abs_offset >= cu.debug_info_offset && abs_offset < cu.debug_info_offset + cu.data.len()
+        })
+        .ok_or_else(|| anyhow!("RefAddr {:#x} not in any compile unit", abs_offset))?;
+    Ok((cu, abs_offset - cu.debug_info_offset))
 }
 
 impl<'elf> AbbrevTableCache<'elf> {
@@ -384,6 +402,77 @@ impl<'elf> Attr<'elf> {
             DwForm::Udata => cursor.uleb128(),
             DwForm::Sdata => Ok(cursor.sleb128()? as u64),
             other => Err(anyhow!("Invalid form for as_int: {:?}", other)),
+        }
+    }
+
+    pub fn as_block(&self) -> Result<&[u8]> {
+        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let size = match self.dw_form()? {
+            DwForm::Block1 => cursor.read_u8()? as usize,
+            DwForm::Block2 => cursor.read_u16()? as usize,
+            DwForm::Block4 => cursor.read_u32()? as usize,
+            DwForm::Block => cursor.uleb128()? as usize,
+            other => {
+                return Err(anyhow!("Invalid form for as_block: {:?}", other));
+            }
+        };
+        let start = self.location_offset + cursor.position();
+        let end = start
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("Block size overflow"))?;
+        let buffer = self
+            .compile_unit
+            .data
+            .get(start..end)
+            .ok_or_else(|| anyhow!("Block extends past compile unit data"))?;
+        Ok(buffer)
+    }
+
+    pub fn as_reference<'b>(
+        &self,
+        dwarf: &'elf Dwarf<'elf>,
+        abbrev_table_cache: &'b mut AbbrevTableCache,
+    ) -> Result<Die<'elf, 'b>> {
+        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let (target_cu, cu_relative_offset): (&'elf CompileUnit<'elf>, usize) =
+            match self.dw_form()? {
+                DwForm::Ref1 => (self.compile_unit, cursor.read_u8()? as usize),
+                DwForm::Ref2 => (self.compile_unit, cursor.read_u16()? as usize),
+                DwForm::Ref4 => (self.compile_unit, cursor.read_u32()? as usize),
+                DwForm::Ref8 => (self.compile_unit, cursor.read_u64()? as usize),
+                DwForm::RefUdata => (self.compile_unit, cursor.uleb128()? as usize),
+                DwForm::RefAddr => {
+                    // Offset in .debug_info
+                    let abs_offset = cursor.read_u32()? as usize;
+                    find_cu_containing(dwarf, abs_offset)?
+                }
+                other => {
+                    return Err(anyhow!("Invalid form for as_reference: {:?}", other));
+                }
+            };
+        let mut reference_cursor = Cursor::new(&target_cu.data[cu_relative_offset..]);
+        parse_die(&mut reference_cursor, target_cu, abbrev_table_cache)
+    }
+
+    pub fn as_string(&'elf self) -> Result<&'elf CStr> {
+        let mut cursor: Cursor<'elf> = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        match self.dw_form()? {
+            DwForm::String => {
+                return cursor.read_string();
+            }
+            DwForm::Strp => {
+                let offset = cursor.read_u32()? as usize;
+                let string_table = self
+                    .compile_unit
+                    .elf
+                    .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_str\0")?)
+                    .ok_or(anyhow!("Failed to find .debug_str section"))?;
+                let mut cursor = Cursor::new(&string_table[offset..]);
+                return cursor.read_string();
+            }
+            other => {
+                return Err(anyhow!("Invalid form for as_string: {:?}", other));
+            }
         }
     }
 }

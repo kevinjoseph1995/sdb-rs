@@ -34,7 +34,7 @@ impl<'a> Cursor<'a> {
         Ok(bytes)
     }
 
-    pub fn read_string(&mut self) -> Result<&CStr> {
+    pub fn read_string(&mut self) -> Result<&'a CStr> {
         if self.is_at_end() {
             return Err(anyhow!(
                 "DWARF cursor error, failed to read string already at the end of the stream"
@@ -107,11 +107,9 @@ impl<'a> Cursor<'a> {
             DwForm::FlagPresent => {} // zero bytes — implicit flag
             DwForm::Data1 | DwForm::Ref1 | DwForm::Flag => self.increment_cursor_by(1),
             DwForm::Data2 | DwForm::Ref2 => self.increment_cursor_by(2),
-            DwForm::Data4
-            | DwForm::Ref4
-            | DwForm::RefAddr
-            | DwForm::SecOffset
-            | DwForm::Strp => self.increment_cursor_by(4),
+            DwForm::Data4 | DwForm::Ref4 | DwForm::RefAddr | DwForm::SecOffset | DwForm::Strp => {
+                self.increment_cursor_by(4)
+            }
             DwForm::Data8 | DwForm::Addr | DwForm::Ref8 | DwForm::RefSig8 => {
                 self.increment_cursor_by(8)
             }
