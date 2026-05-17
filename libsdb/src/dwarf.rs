@@ -1,5 +1,7 @@
-use crate::cursor::Cursor;
+use crate::cursor;
+use crate::dwarf_constants::DwForm;
 use crate::elf::Elf;
+use crate::{address::FileAddress, cursor::Cursor};
 use anyhow::{Context, Result, anyhow};
 use std::{collections::HashMap, ffi::CStr};
 
@@ -28,6 +30,7 @@ pub struct AbbrevTableCache<'a> {
 pub struct CompileUnit<'elf> {
     abbrev_offset: usize,
     data: &'elf [u8],
+    elf: &'elf Elf,
 }
 
 pub struct Dwarf<'elf> {
@@ -54,6 +57,13 @@ pub struct DiePayload<'a, 'b> {
 pub enum Die<'a, 'b> {
     Null(usize),
     NonNull(DiePayload<'a, 'b>),
+}
+
+pub struct Attr<'elf> {
+    form: u64,
+    attr_type: u64,
+    compile_unit: &'elf CompileUnit<'elf>,
+    location_offset: usize, // Offset in compile_unit.data
 }
 
 fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
@@ -102,7 +112,10 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
     return Ok(table);
 }
 
-fn parse_compile_unit<'elf>(cursor: &mut Cursor<'elf>) -> Result<CompileUnit<'elf>> {
+fn parse_compile_unit<'elf>(
+    cursor: &mut Cursor<'elf>,
+    elf: &'elf Elf,
+) -> Result<CompileUnit<'elf>> {
     let start = cursor.position();
     let mut size: u32 = cursor
         .read_u32()
@@ -133,6 +146,7 @@ fn parse_compile_unit<'elf>(cursor: &mut Cursor<'elf>) -> Result<CompileUnit<'el
     Ok(CompileUnit {
         abbrev_offset: abbrev as usize,
         data: compile_unit_data,
+        elf,
     })
 }
 
@@ -143,7 +157,7 @@ fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
     let mut cursor = Cursor::new(debug_info_data);
     let mut compile_units = Vec::new();
     while !cursor.is_at_end() {
-        compile_units.push(parse_compile_unit(&mut cursor)?);
+        compile_units.push(parse_compile_unit(&mut cursor, elf)?);
     }
     Ok(compile_units)
 }
@@ -309,6 +323,67 @@ impl<'a, 'b> Die<'a, 'b> {
         match self {
             Die::Null(_) => None,
             Die::NonNull(payload) => Some(payload.children()),
+        }
+    }
+
+    fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
+        let payload = match &self {
+            Die::Null(_) => return None,
+            Die::NonNull(die_payload) => die_payload,
+        };
+        let specs = &payload.abbrev.attr_specs;
+        for (index, spec) in specs.iter().enumerate() {
+            if spec.attr == attr {
+                return Some(Attr {
+                    form: spec.form,
+                    attr_type: spec.attr,
+                    compile_unit: payload.compile_unit,
+                    location_offset: payload.attr_locations[index],
+                });
+            }
+        }
+        None
+    }
+}
+
+impl<'elf> Attr<'elf> {
+    fn dw_form(&self) -> Result<DwForm> {
+        u8::try_from(self.form)
+            .ok()
+            .and_then(|f| DwForm::try_from(f).ok())
+            .ok_or_else(|| anyhow!("Unrecognized DWARF form: {:#x}", self.form))
+    }
+
+    pub fn as_address(&self) -> Result<FileAddress<'elf>> {
+        if self.dw_form()? != DwForm::Addr {
+            return Err(anyhow!("Invalid attr type. Expected DwForm::Addr"));
+        }
+        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let address = cursor.read_u64().context("Failed to extract u64")? as usize;
+        Ok(FileAddress {
+            elf_handle: self.compile_unit.elf,
+            address,
+        })
+    }
+
+    pub fn as_section_offset(&self) -> Result<u32> {
+        if self.dw_form()? != DwForm::SecOffset {
+            return Err(anyhow!("Invalid attr type. Expected DwForm::SecOffset"));
+        }
+        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        Ok(cursor.read_u32().context("Failed to extract u32")?)
+    }
+
+    pub fn as_int(&self) -> Result<u64> {
+        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        match self.dw_form()? {
+            DwForm::Data1 => Ok(cursor.read_u8()? as u64),
+            DwForm::Data2 => Ok(cursor.read_u16()? as u64),
+            DwForm::Data4 => Ok(cursor.read_u32()? as u64),
+            DwForm::Data8 => cursor.read_u64(),
+            DwForm::Udata => cursor.uleb128(),
+            DwForm::Sdata => Ok(cursor.sleb128()? as u64),
+            other => Err(anyhow!("Invalid form for as_int: {:?}", other)),
         }
     }
 }

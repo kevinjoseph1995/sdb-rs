@@ -9,10 +9,12 @@
 
 #![allow(non_camel_case_types, clippy::upper_case_acronyms)]
 
+use num_enum::TryFromPrimitive;
+
 // ---- DW_TAG ----------------------------------------------------------------
 
 #[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwTag {
     ArrayType = 0x01,
     ClassType = 0x02,
@@ -81,7 +83,7 @@ pub enum DwTag {
 // ---- DW_CHILDREN -----------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwChildren {
     No = 0x00,
     Yes = 0x01,
@@ -90,7 +92,7 @@ pub enum DwChildren {
 // ---- DW_AT -----------------------------------------------------------------
 
 #[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwAt {
     Sibling = 0x01,
     Location = 0x02,
@@ -194,7 +196,7 @@ pub enum DwAt {
 // From DWARF5, but GCC still outputs in DWARF4 mode
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwDefaulted {
     No = 0x00,
     InClass = 0x01,
@@ -204,7 +206,7 @@ pub enum DwDefaulted {
 // ---- DW_FORM ---------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwForm {
     Addr = 0x01,
     Block2 = 0x03,
@@ -236,7 +238,7 @@ pub enum DwForm {
 // ---- DW_OP -----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwOp {
     Addr = 0x03,
     Deref = 0x06,
@@ -399,7 +401,7 @@ pub enum DwOp {
 // ---- DW_ATE ----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwAte {
     Address = 0x01,
     Boolean = 0x02,
@@ -424,7 +426,7 @@ pub enum DwAte {
 // ---- DW_DS -----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwDs {
     Unsigned = 0x01,
     LeadingOverpunch = 0x02,
@@ -436,7 +438,7 @@ pub enum DwDs {
 // ---- DW_END ----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwEnd {
     Default = 0x00,
     Big = 0x01,
@@ -448,7 +450,7 @@ pub enum DwEnd {
 // ---- DW_ACCESS -------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwAccess {
     Public = 0x01,
     Protected = 0x02,
@@ -458,7 +460,7 @@ pub enum DwAccess {
 // ---- DW_VIS ----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwVis {
     Local = 0x01,
     Exported = 0x02,
@@ -468,7 +470,7 @@ pub enum DwVis {
 // ---- DW_VIRTUALITY ---------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwVirtuality {
     None = 0x00,
     Virtual = 0x01,
@@ -478,7 +480,7 @@ pub enum DwVirtuality {
 // ---- DW_LANG ---------------------------------------------------------------
 
 #[repr(u16)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwLang {
     C89 = 0x0001,
     C = 0x0002,
@@ -507,7 +509,7 @@ pub enum DwLang {
 // ---- DW_ADDR ---------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwAddr {
     None = 0x00,
 }
@@ -515,7 +517,7 @@ pub enum DwAddr {
 // ---- DW_ID -----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwId {
     CaseSensitive = 0x00,
     UpCase = 0x01,
@@ -526,7 +528,7 @@ pub enum DwId {
 // ---- DW_CC -----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwCc {
     Normal = 0x01,
     Program = 0x02,
@@ -538,7 +540,7 @@ pub enum DwCc {
 // ---- DW_INL ----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwInl {
     NotInlined = 0x00,
     Inlined = 0x01,
@@ -549,7 +551,7 @@ pub enum DwInl {
 // ---- DW_ORD ----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwOrd {
     RowMajor = 0x00,
     ColMajor = 0x01,
@@ -558,7 +560,7 @@ pub enum DwOrd {
 // ---- DW_DSC ----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwDsc {
     Label = 0x00,
     Range = 0x01,
@@ -567,7 +569,7 @@ pub enum DwDsc {
 // ---- DW_LNS ----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwLns {
     Copy = 0x01,
     AdvancePc = 0x02,
@@ -586,7 +588,7 @@ pub enum DwLns {
 // ---- DW_LNE ----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwLne {
     EndSequence = 0x01,
     SetAddress = 0x02,
@@ -599,7 +601,7 @@ pub enum DwLne {
 // ---- DW_MACINFO ------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwMacinfo {
     Define = 0x01,
     Undef = 0x02,
@@ -611,7 +613,7 @@ pub enum DwMacinfo {
 // ---- DW_CFA ----------------------------------------------------------------
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwCfa {
     AdvanceLoc = 0x40,
     Offset = 0x80,
@@ -647,7 +649,7 @@ pub enum DwCfa {
 // From LSB
 
 #[repr(u8)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, TryFromPrimitive)]
 pub enum DwEhPe {
     Absptr = 0x00,
     Uleb128 = 0x01,
