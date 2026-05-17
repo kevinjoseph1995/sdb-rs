@@ -2,7 +2,7 @@ use std::{ffi::CString, path::PathBuf};
 
 use libsdb::{
     cursor::Cursor,
-    dwarf::{AbbrevTableCache, Dwarf},
+    dwarf::{AbbrevTableCache, Die, Dwarf},
     elf::Elf,
 };
 use test_binary::TestBinary;
@@ -181,7 +181,9 @@ fn test_string_extraction() {
     assert!(cursor.is_at_end());
 }
 
-fn gimli_compile_unit_count(path: &PathBuf) -> usize {
+/// Per-compile-unit child counts at the root DIE, computed independently with gimli.
+/// Returns one entry per compile unit, in the same order gimli enumerates them.
+fn gimli_root_child_counts(path: &PathBuf) -> Vec<usize> {
     let data = std::fs::read(path).unwrap();
     let obj = object::File::parse(&*data).unwrap();
     let endian = if obj.is_little_endian() {
@@ -203,11 +205,19 @@ fn gimli_compile_unit_count(path: &PathBuf) -> usize {
         };
     let gimli_dwarf = gimli::Dwarf::load(load).unwrap();
     let mut units = gimli_dwarf.units();
-    let mut count = 0;
-    while units.next().unwrap().is_some() {
-        count += 1;
+    let mut counts = Vec::new();
+    while let Some(header) = units.next().unwrap() {
+        let unit = gimli_dwarf.unit(header).unwrap();
+        let mut tree = unit.entries_tree(None).unwrap();
+        let root = tree.root().unwrap();
+        let mut children = root.children();
+        let mut count = 0;
+        while children.next().unwrap().is_some() {
+            count += 1;
+        }
+        counts.push(count);
     }
-    count
+    counts
 }
 
 #[test]
@@ -222,12 +232,44 @@ fn test_dwarf_die_tree_traversal() {
         .expect("Failed to build test binary"),
     );
     let elf = Elf::new(&test_executable).expect("Failed to create Elf object");
-    let _abbrev_table = AbbrevTableCache::new(&elf);
+    let mut abbrev_table = AbbrevTableCache::new(&elf);
     let dwarf = Dwarf::new(&elf).expect("Failed to parse Dwarf object");
 
-    // validate the number of compile units with an independent implementation.
-    assert_eq!(
-        dwarf.compile_units.len(),
-        gimli_compile_unit_count(&test_executable)
-    );
+    // validate the number of compile units (and per-unit root-child counts)
+    // against an independent gimli-based implementation.
+    let expected_child_counts = gimli_root_child_counts(&test_executable);
+    assert_eq!(dwarf.compile_units.len(), expected_child_counts.len());
+
+    for (compile_unit, expected) in dwarf.compile_units.iter().zip(expected_child_counts.iter()) {
+        let root = compile_unit
+            .root(&mut abbrev_table)
+            .expect("Failed to get root");
+
+        // The root of a compile unit is always a DW_TAG_compile_unit DIE,
+        // which is non-null and exposes a children iterator.
+        assert!(
+            !matches!(root, Die::Null(_)),
+            "Compile unit root DIE should not be null"
+        );
+        let children = root
+            .children()
+            .expect("Root DIE should expose a children iterator")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("Failed to iterate root DIE children");
+
+        // Every yielded child must itself be a non-null DIE — the iterator
+        // is responsible for stopping at the terminating null entry.
+        for child in &children {
+            assert!(
+                matches!(child, Die::NonNull(_)),
+                "DieChildrenIter must not yield the terminating null DIE"
+            );
+        }
+
+        assert_eq!(
+            children.len(),
+            *expected,
+            "Mismatched direct-child count for a compile unit's root DIE"
+        );
+    }
 }

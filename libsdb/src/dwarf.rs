@@ -36,7 +36,7 @@ pub struct Dwarf<'elf> {
 }
 
 ///  Debugging Information Entry
-struct DiePayload<'a, 'b> {
+pub struct DiePayload<'a, 'b> {
     /// This is the offset into the .debug_info section
     position: usize,
     /// This is the offset of either a sibling or child of this DIE
@@ -51,7 +51,7 @@ struct DiePayload<'a, 'b> {
     abbrev_table: &'b AbbrevTable,
 }
 
-enum Die<'a, 'b> {
+pub enum Die<'a, 'b> {
     Null(usize),
     NonNull(DiePayload<'a, 'b>),
 }
@@ -66,43 +66,38 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
     let mut cursor = Cursor::new(&section_buffer);
     cursor.increment_cursor_by(offset);
     let mut table = HashMap::<u64, Abbrev>::new();
-    let mut code: u64;
     loop {
         // Parse one entry
         // We extract the ULEB128 for the code, the ULEB128 for the tag,
         // the 1-byte unsigned integer for the children flag (which will be either
         // 1 or 0), and the list of ULEB128 pairs of attribute types and forms,
         // terminated by a pair of 0s.
-        code = cursor.uleb128()?;
+        let code = cursor.uleb128()?;
+        if code == 0 {
+            // Abbrev table is terminated by a single 0 byte (code 0).
+            break;
+        }
         let tag = cursor.uleb128()?;
         let has_children = cursor.read_u8()? > 0;
         let mut attr_specs = Vec::<AttrSpec>::new();
-        let mut attr: u64;
         loop {
-            attr = cursor.uleb128()?;
+            let attr = cursor.uleb128()?;
             let form = cursor.uleb128()?;
-            if attr != 0 {
-                attr_specs.push(AttrSpec { attr, form });
-            }
             if attr == 0 {
-                // Attr, form list is terminated by a 0
+                // Attr, form list is terminated by a pair of 0s.
                 break;
             }
+            attr_specs.push(AttrSpec { attr, form });
         }
-        if code != 0 {
-            table.insert(
+        table.insert(
+            code,
+            Abbrev {
                 code,
-                Abbrev {
-                    code,
-                    tag,
-                    has_children,
-                    attr_specs,
-                },
-            );
-        } else {
-            // Abbrev table entry is terminated by a 0
-            break;
-        }
+                tag,
+                has_children,
+                attr_specs,
+            },
+        );
     }
     return Ok(table);
 }
@@ -249,7 +244,7 @@ fn skip_children(cursor: &mut Cursor, abbrev_table: &AbbrevTable) -> Result<()> 
     }
 }
 
-struct DieChildrenIter<'a, 'b> {
+pub struct DieChildrenIter<'a, 'b> {
     compile_unit: &'a CompileUnit<'a>,
     abbrev_table: &'b AbbrevTable,
     current_offset: usize,
