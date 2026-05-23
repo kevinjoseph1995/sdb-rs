@@ -1,8 +1,12 @@
-use crate::dwarf_constants::DwForm;
+use crate::dwarf_constants::{DwAt, DwForm};
 use crate::elf::Elf;
 use crate::{address::FileAddress, cursor::Cursor};
 use anyhow::{Context, Result, anyhow};
 use std::{collections::HashMap, ffi::CStr};
+
+/// Size of the DWARF v4 compile unit header in DWARF32 format:
+/// unit_length (4) + version (2) + debug_abbrev_offset (4) + address_size (1).
+const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 
 pub struct AttrSpec {
     attr: u64,
@@ -42,9 +46,10 @@ pub struct Dwarf<'elf> {
 
 ///  Debugging Information Entry
 pub struct DiePayload<'a, 'b> {
-    /// This is the offset into the .debug_info section
+    /// Offset of the start of this DIE within `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]`.
     position: usize,
-    /// This is the offset of either a sibling or child of this DIE
+    /// Offset (within `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]`) of either the
+    /// next sibling or the first child of this DIE.
     next: usize,
     /// The compile unit that owns this Die
     compile_unit: &'a CompileUnit<'a>,
@@ -57,7 +62,9 @@ pub struct DiePayload<'a, 'b> {
 }
 
 pub enum Die<'a, 'b> {
-    Null(usize),
+    Null(
+        usize, /*Offset of the start of this DIE within `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]` */
+    ),
     NonNull(DiePayload<'a, 'b>),
 }
 
@@ -212,9 +219,7 @@ impl<'elf> CompileUnit<'elf> {
         &'a self,
         abbrev_table_cache: &'b mut AbbrevTableCache,
     ) -> Result<Die<'a, 'b>> {
-        // Compile unit header size
-        const HEADER_SIZE: usize = 11;
-        let mut cursor = Cursor::new(&self.data[HEADER_SIZE..]);
+        let mut cursor = Cursor::new(&self.data[COMPILE_UNIT_HEADER_SIZE..]);
         return parse_die(&mut cursor, &self, abbrev_table_cache);
     }
 }
@@ -278,6 +283,7 @@ fn skip_children(cursor: &mut Cursor, abbrev_table: &AbbrevTable) -> Result<()> 
 
 pub struct DieChildrenIter<'a, 'b> {
     compile_unit: &'a CompileUnit<'a>,
+    dwarf: &'a Dwarf<'a>,
     abbrev_table: &'b AbbrevTable,
     current_offset: usize,
     done: bool,
@@ -290,8 +296,7 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
         if self.done {
             return None;
         }
-        const HEADER_SIZE: usize = 11;
-        let die_data = &self.compile_unit.data[HEADER_SIZE..];
+        let die_data = &self.compile_unit.data[COMPILE_UNIT_HEADER_SIZE..];
         let mut cursor = Cursor::new(die_data);
         cursor.increment_cursor_by(self.current_offset);
 
@@ -305,14 +310,27 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
                 None
             }
             Ok(Die::NonNull(payload)) => {
-                let next_sibling_offset = if payload.abbrev.has_children {
-                    let mut skip_cursor = Cursor::new(die_data);
-                    skip_cursor.increment_cursor_by(payload.next);
-                    match skip_children(&mut skip_cursor, self.abbrev_table) {
-                        Ok(()) => skip_cursor.position(),
-                        Err(e) => {
-                            self.done = true;
-                            return Some(Err(e));
+                let next_sibling_offset: usize = if payload.abbrev.has_children {
+                    if let Some(attr) = payload.get_attr(DwAt::Sibling as u64) {
+                        // DW_AT_sibling is guaranteed to reference a DIE within the
+                        // same CU, so a CU-local form lookup suffices and we avoid
+                        // needing an AbbrevTableCache here.
+                        match attr.as_cu_local_reference_position() {
+                            Ok(pos) => pos,
+                            Err(e) => {
+                                self.done = true;
+                                return Some(Err(e));
+                            }
+                        }
+                    } else {
+                        let mut skip_cursor = Cursor::new(die_data);
+                        skip_cursor.increment_cursor_by(payload.next);
+                        match skip_children(&mut skip_cursor, self.abbrev_table) {
+                            Ok(()) => skip_cursor.position(),
+                            Err(e) => {
+                                self.done = true;
+                                return Some(Err(e));
+                            }
                         }
                     }
                 } else {
@@ -326,21 +344,45 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
 }
 
 impl<'a, 'b> DiePayload<'a, 'b> {
-    pub fn children(&self) -> DieChildrenIter<'a, 'b> {
+    pub fn children(&self, parent_dwarf: &'a Dwarf<'a>) -> DieChildrenIter<'a, 'b> {
         DieChildrenIter {
             compile_unit: self.compile_unit,
+            dwarf: parent_dwarf,
             abbrev_table: self.abbrev_table,
             current_offset: self.next,
             done: !self.abbrev.has_children,
         }
     }
+
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
+        let specs = &self.abbrev.attr_specs;
+        for (index, spec) in specs.iter().enumerate() {
+            if spec.attr == attr {
+                return Some(Attr {
+                    form: spec.form,
+                    attr_type: spec.attr,
+                    compile_unit: self.compile_unit,
+                    location_offset: self.attr_locations[index],
+                });
+            }
+        }
+        None
+    }
 }
 
 impl<'a, 'b> Die<'a, 'b> {
-    pub fn children(&self) -> Option<DieChildrenIter<'a, 'b>> {
+    pub fn children(&self, parent_dwarf: &'a Dwarf<'a>) -> Option<DieChildrenIter<'a, 'b>> {
         match self {
             Die::Null(_) => None,
-            Die::NonNull(payload) => Some(payload.children()),
+            Die::NonNull(payload) => Some(payload.children(parent_dwarf)),
+        }
+    }
+
+    /// Offset of the start of this DIE within `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]`.
+    pub fn position(&self) -> usize {
+        match self {
+            Die::Null(pos) => *pos,
+            Die::NonNull(payload) => payload.position,
         }
     }
 
@@ -349,18 +391,7 @@ impl<'a, 'b> Die<'a, 'b> {
             Die::Null(_) => return None,
             Die::NonNull(die_payload) => die_payload,
         };
-        let specs = &payload.abbrev.attr_specs;
-        for (index, spec) in specs.iter().enumerate() {
-            if spec.attr == attr {
-                return Some(Attr {
-                    form: spec.form,
-                    attr_type: spec.attr,
-                    compile_unit: payload.compile_unit,
-                    location_offset: payload.attr_locations[index],
-                });
-            }
-        }
-        None
+        payload.get_attr(attr)
     }
 }
 
@@ -431,7 +462,7 @@ impl<'elf> Attr<'elf> {
     pub fn as_reference<'b>(
         &self,
         dwarf: &'elf Dwarf<'elf>,
-        abbrev_table_cache: &'b mut AbbrevTableCache,
+        abbrev_cache: &'b mut AbbrevTableCache<'elf>,
     ) -> Result<Die<'elf, 'b>> {
         let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
         let (target_cu, cu_relative_offset): (&'elf CompileUnit<'elf>, usize) =
@@ -450,8 +481,53 @@ impl<'elf> Attr<'elf> {
                     return Err(anyhow!("Invalid form for as_reference: {:?}", other));
                 }
             };
-        let mut reference_cursor = Cursor::new(&target_cu.data[cu_relative_offset..]);
-        parse_die(&mut reference_cursor, target_cu, abbrev_table_cache)
+        // Reference offsets are measured from the start of the CU header, but the
+        // rest of this module uses offsets within `data[COMPILE_UNIT_HEADER_SIZE..]`.
+        // Translate so the parsed DIE's `position` matches that convention.
+        let data_offset = cu_relative_offset
+            .checked_sub(COMPILE_UNIT_HEADER_SIZE)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Reference offset {:#x} points inside the CU header",
+                    cu_relative_offset
+                )
+            })?;
+        // The target CU may use a different abbrev table than `self.compile_unit`
+        // (DW_FORM_ref_addr can cross CU boundaries), so look it up by the target's
+        // abbrev_offset rather than reusing the caller's table.
+        let abbrev_table = abbrev_cache.get_table_at_offset(target_cu.abbrev_offset)?;
+        let mut reference_cursor = Cursor::new(&target_cu.data[COMPILE_UNIT_HEADER_SIZE..]);
+        reference_cursor.increment_cursor_by(data_offset);
+        parse_die_raw(&mut reference_cursor, target_cu, abbrev_table)
+    }
+
+    /// Reads a CU-local reference and returns the target DIE's position within
+    /// `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]`. Rejects `DW_FORM_ref_addr`
+    /// (which may cross CU boundaries) — callers needing that must use
+    /// [`Attr::as_reference`] with an abbrev table cache.
+    pub fn as_cu_local_reference_position(&self) -> Result<usize> {
+        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let cu_relative_offset = match self.dw_form()? {
+            DwForm::Ref1 => cursor.read_u8()? as usize,
+            DwForm::Ref2 => cursor.read_u16()? as usize,
+            DwForm::Ref4 => cursor.read_u32()? as usize,
+            DwForm::Ref8 => cursor.read_u64()? as usize,
+            DwForm::RefUdata => cursor.uleb128()? as usize,
+            other => {
+                return Err(anyhow!(
+                    "Form is not a CU-local reference: {:?}",
+                    other
+                ));
+            }
+        };
+        cu_relative_offset
+            .checked_sub(COMPILE_UNIT_HEADER_SIZE)
+            .ok_or_else(|| {
+                anyhow!(
+                    "Reference offset {:#x} points inside the CU header",
+                    cu_relative_offset
+                )
+            })
     }
 
     pub fn as_string(&'elf self) -> Result<&'elf CStr> {

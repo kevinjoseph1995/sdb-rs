@@ -252,7 +252,7 @@ fn test_dwarf_die_tree_traversal() {
             "Compile unit root DIE should not be null"
         );
         let children = root
-            .children()
+            .children(&dwarf)
             .expect("Root DIE should expose a children iterator")
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to iterate root DIE children");
