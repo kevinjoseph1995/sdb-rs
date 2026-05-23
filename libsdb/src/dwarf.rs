@@ -6,11 +6,20 @@ use std::{collections::HashMap, ffi::CStr};
 
 /// Size of the DWARF v4 compile unit header in DWARF32 format:
 /// unit_length (4) + version (2) + debug_abbrev_offset (4) + address_size (1).
-const COMPILE_UNIT_HEADER_SIZE: usize = 11;
+pub const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 
 pub struct AttrSpec {
     attr: u64,
     form: u64,
+}
+
+impl AttrSpec {
+    pub fn attr(&self) -> u64 {
+        self.attr
+    }
+    pub fn form(&self) -> u64 {
+        self.form
+    }
 }
 
 pub struct Abbrev {
@@ -222,6 +231,16 @@ impl<'elf> AbbrevTableCache<'elf> {
 }
 
 impl<'elf> CompileUnit<'elf> {
+    pub fn debug_info_offset(&self) -> usize {
+        self.debug_info_offset
+    }
+    pub fn data(&self) -> &'elf [u8] {
+        self.data
+    }
+    pub fn abbrev_offset(&self) -> usize {
+        self.abbrev_offset
+    }
+
     pub fn root<'a, 'b>(
         &'a self,
         abbrev_table_cache: &'b mut AbbrevTableCache,
@@ -383,6 +402,26 @@ impl<'a, 'b> DiePayload<'a, 'b> {
         }
         None
     }
+
+    pub fn tag(&self) -> u64 {
+        self.abbrev.tag
+    }
+
+    pub fn has_children(&self) -> bool {
+        self.abbrev.has_children
+    }
+
+    pub fn abbrev_code(&self) -> u64 {
+        self.abbrev.code
+    }
+
+    pub fn attr_specs(&self) -> &[AttrSpec] {
+        &self.abbrev.attr_specs
+    }
+
+    pub fn compile_unit(&self) -> &'a CompileUnit<'a> {
+        self.compile_unit
+    }
 }
 
 impl<'a, 'b> Die<'a, 'b> {
@@ -401,7 +440,21 @@ impl<'a, 'b> Die<'a, 'b> {
         }
     }
 
-    fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
+    pub fn tag(&self) -> Option<u64> {
+        match self {
+            Die::Null(_) => None,
+            Die::NonNull(payload) => Some(payload.tag()),
+        }
+    }
+
+    pub fn has_children(&self) -> bool {
+        match self {
+            Die::Null(_) => false,
+            Die::NonNull(payload) => payload.has_children(),
+        }
+    }
+
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
         let payload = match &self {
             Die::Null(_) => return None,
             Die::NonNull(die_payload) => die_payload,
@@ -411,6 +464,14 @@ impl<'a, 'b> Die<'a, 'b> {
 }
 
 impl<'elf> Attr<'elf> {
+    pub fn form(&self) -> u64 {
+        self.form
+    }
+
+    pub fn attr_type(&self) -> u64 {
+        self.attr_type
+    }
+
     fn dw_form(&self) -> Result<DwForm> {
         u8::try_from(self.form)
             .ok()

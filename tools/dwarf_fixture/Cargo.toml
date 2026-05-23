@@ -1,0 +1,10 @@
+[package]
+name = "dwarf_fixture"
+version = "0.1.0"
+edition = "2024"
+build   = "build.rs"
+
+[build-dependencies]
+cc = "1.2.29"
+
+[dependencies]
