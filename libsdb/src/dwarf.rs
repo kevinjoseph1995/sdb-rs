@@ -32,9 +32,12 @@ pub struct AbbrevTableCache<'a> {
 
 pub struct CompileUnit<'elf> {
     abbrev_offset: usize,
-    /// Start offset of this CU within the .debug_info section.
+    /// Start offset of this CU (including its header) within the .debug_info section.
     /// Used to resolve `DW_FORM_ref_addr` references that point into other CUs.
     debug_info_offset: usize,
+    /// DIE bytes for this CU, with the [`COMPILE_UNIT_HEADER_SIZE`]-byte header
+    /// already stripped. All offsets stored in this module (DIE `position`/`next`,
+    /// `attr_locations`) are indices into this slice.
     data: &'elf [u8],
     elf: &'elf Elf,
 }
@@ -46,25 +49,23 @@ pub struct Dwarf<'elf> {
 
 ///  Debugging Information Entry
 pub struct DiePayload<'a, 'b> {
-    /// Offset of the start of this DIE within `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]`.
+    /// Offset of the start of this DIE within `compile_unit.data`.
     position: usize,
-    /// Offset (within `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]`) of either the
-    /// next sibling or the first child of this DIE.
+    /// Offset (within `compile_unit.data`) of either the next sibling or the
+    /// first child of this DIE.
     next: usize,
     /// The compile unit that owns this Die
     compile_unit: &'a CompileUnit<'a>,
     /// abbrev entry for this DIE
     abbrev: &'b Abbrev,
-    /// Locations into the .debug_info section where the attrs live.
+    /// Offsets within `compile_unit.data` where each attribute's value bytes live.
     attr_locations: Vec<usize>,
     /// Abbrev table
     abbrev_table: &'b AbbrevTable,
 }
 
 pub enum Die<'a, 'b> {
-    Null(
-        usize, /*Offset of the start of this DIE within `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]` */
-    ),
+    Null(usize /* Offset of the start of this DIE within `compile_unit.data` */),
     NonNull(DiePayload<'a, 'b>),
 }
 
@@ -150,7 +151,10 @@ fn parse_compile_unit<'elf>(
     // "because the reported size in the compile unit header doesn’t include the size field itself"
     size += std::mem::size_of::<u32>() as u32;
     let end = start + size as usize;
-    let compile_unit_data: &'elf [u8] = &cursor.bytes[start..end];
+    // `data` is the DIE stream only — the CU header has already been consumed
+    // by the reads above, so we slice from `cursor.position()` (which sits just
+    // past the header) to `end`. This keeps all downstream offsets header-free.
+    let compile_unit_data: &'elf [u8] = &cursor.bytes[cursor.position()..end];
     cursor.increment_cursor_by(end - cursor.position());
     Ok(CompileUnit {
         abbrev_offset: abbrev as usize,
@@ -190,7 +194,10 @@ fn find_cu_containing<'a, 'elf>(
         .compile_units
         .iter()
         .find(|cu| {
-            abs_offset >= cu.debug_info_offset && abs_offset < cu.debug_info_offset + cu.data.len()
+            // `data` no longer includes the CU header, so the CU's footprint
+            // in .debug_info is `[debug_info_offset, debug_info_offset + header + data)`.
+            abs_offset >= cu.debug_info_offset
+                && abs_offset < cu.debug_info_offset + COMPILE_UNIT_HEADER_SIZE + cu.data.len()
         })
         .ok_or_else(|| anyhow!("RefAddr {:#x} not in any compile unit", abs_offset))?;
     Ok((cu, abs_offset - cu.debug_info_offset))
@@ -219,7 +226,7 @@ impl<'elf> CompileUnit<'elf> {
         &'a self,
         abbrev_table_cache: &'b mut AbbrevTableCache,
     ) -> Result<Die<'a, 'b>> {
-        let mut cursor = Cursor::new(&self.data[COMPILE_UNIT_HEADER_SIZE..]);
+        let mut cursor = Cursor::new(self.data);
         return parse_die(&mut cursor, &self, abbrev_table_cache);
     }
 }
@@ -296,7 +303,7 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
         if self.done {
             return None;
         }
-        let die_data = &self.compile_unit.data[COMPILE_UNIT_HEADER_SIZE..];
+        let die_data = self.compile_unit.data;
         let mut cursor = Cursor::new(die_data);
         cursor.increment_cursor_by(self.current_offset);
 
@@ -315,6 +322,14 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
                         // DW_AT_sibling is guaranteed to reference a DIE within the
                         // same CU, so a CU-local form lookup suffices and we avoid
                         // needing an AbbrevTableCache here.
+                        /*
+                        https://dwarfstd.org/doc/DWARF4.pdf Section 2.3
+                        In cases where a producer of debugging information feels that it will be important for consumers
+                        of that information to quickly scan chains of sibling entries, while ignoring the children of
+                        individual siblings, that producer may attach a DW_AT_sibling attribute to any debugging
+                        information entry. The value of this attribute is a reference to the sibling entry of the entry to
+                        which the attribute is attached
+                        */
                         match attr.as_cu_local_reference_position() {
                             Ok(pos) => pos,
                             Err(e) => {
@@ -378,7 +393,7 @@ impl<'a, 'b> Die<'a, 'b> {
         }
     }
 
-    /// Offset of the start of this DIE within `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]`.
+    /// Offset of the start of this DIE within `compile_unit.data`.
     pub fn position(&self) -> usize {
         match self {
             Die::Null(pos) => *pos,
@@ -473,6 +488,15 @@ impl<'elf> Attr<'elf> {
                 DwForm::Ref8 => (self.compile_unit, cursor.read_u64()? as usize),
                 DwForm::RefUdata => (self.compile_unit, cursor.uleb128()? as usize),
                 DwForm::RefAddr => {
+                    /*
+                    From https://dwarfstd.org/doc/DWARF4.pdf:
+                    The second type of reference can identify any debugging information entry within a
+                    .debug_info section; in particular, it may refer to an entry in a different compilation unit
+                    from the unit containing the reference, and may refer to an entry in a different shared object.
+                    This type of reference (DW_FORM_ref_addr) is an offset from the beginning of the
+                    .debug_info section of the target executable or shared object; it is relocatable in a
+                    relocatable object file and frequently relocated in an executable file or shared object.
+                    */
                     // Offset in .debug_info
                     let abs_offset = cursor.read_u32()? as usize;
                     find_cu_containing(dwarf, abs_offset)?
@@ -481,9 +505,9 @@ impl<'elf> Attr<'elf> {
                     return Err(anyhow!("Invalid form for as_reference: {:?}", other));
                 }
             };
-        // Reference offsets are measured from the start of the CU header, but the
-        // rest of this module uses offsets within `data[COMPILE_UNIT_HEADER_SIZE..]`.
-        // Translate so the parsed DIE's `position` matches that convention.
+        // Reference offsets are measured from the start of the CU header, but
+        // `compile_unit.data` no longer contains the header. Translate so the
+        // parsed DIE's `position` matches the header-free convention.
         let data_offset = cu_relative_offset
             .checked_sub(COMPILE_UNIT_HEADER_SIZE)
             .ok_or_else(|| {
@@ -496,15 +520,15 @@ impl<'elf> Attr<'elf> {
         // (DW_FORM_ref_addr can cross CU boundaries), so look it up by the target's
         // abbrev_offset rather than reusing the caller's table.
         let abbrev_table = abbrev_cache.get_table_at_offset(target_cu.abbrev_offset)?;
-        let mut reference_cursor = Cursor::new(&target_cu.data[COMPILE_UNIT_HEADER_SIZE..]);
+        let mut reference_cursor = Cursor::new(target_cu.data);
         reference_cursor.increment_cursor_by(data_offset);
         parse_die_raw(&mut reference_cursor, target_cu, abbrev_table)
     }
 
     /// Reads a CU-local reference and returns the target DIE's position within
-    /// `compile_unit.data[COMPILE_UNIT_HEADER_SIZE..]`. Rejects `DW_FORM_ref_addr`
-    /// (which may cross CU boundaries) — callers needing that must use
-    /// [`Attr::as_reference`] with an abbrev table cache.
+    /// `compile_unit.data`. Rejects `DW_FORM_ref_addr` (which may cross CU
+    /// boundaries) — callers needing that must use [`Attr::as_reference`] with
+    /// an abbrev table cache.
     pub fn as_cu_local_reference_position(&self) -> Result<usize> {
         let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
         let cu_relative_offset = match self.dw_form()? {
@@ -514,10 +538,7 @@ impl<'elf> Attr<'elf> {
             DwForm::Ref8 => cursor.read_u64()? as usize,
             DwForm::RefUdata => cursor.uleb128()? as usize,
             other => {
-                return Err(anyhow!(
-                    "Form is not a CU-local reference: {:?}",
-                    other
-                ));
+                return Err(anyhow!("Form is not a CU-local reference: {:?}", other));
             }
         };
         cu_relative_offset
