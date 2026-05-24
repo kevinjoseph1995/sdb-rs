@@ -74,7 +74,9 @@ pub struct DiePayload<'a, 'b> {
 }
 
 pub enum Die<'a, 'b> {
-    Null(usize /* Offset of the start of this DIE within `compile_unit.data` */),
+    Null(
+        usize, /* Offset of the start of this DIE within `compile_unit.data` */
+    ),
     NonNull(DiePayload<'a, 'b>),
 }
 
@@ -460,6 +462,36 @@ impl<'a, 'b> Die<'a, 'b> {
             Die::NonNull(die_payload) => die_payload,
         };
         payload.get_attr(attr)
+    }
+
+    pub fn low_pc(&self) -> Result<FileAddress<'a>> {
+        self.get_attr(DwAt::LowPc as u64)
+            .ok_or(anyhow!("Failed to get DwAt::LowPc for attr"))?
+            .as_address()
+    }
+
+    pub fn high_pc(&self) -> Result<FileAddress<'a>> {
+        /*
+        Building a Debugger. Page 322
+        For the high program counter value, we check the form. If the form is
+        an address, we extract it. Otherwise, the form must be an offset from the
+        low program counter, so we extract the low program counter and then offset
+        it with the high program counter attribute as an integer.
+         */
+        let attr = self
+            .get_attr(DwAt::HighPc as u64)
+            .ok_or(anyhow!("Failed to get DwAt::HighPc for attr"))?;
+        let address: usize = {
+            if attr.dw_form()? == DwForm::Addr {
+                attr.as_address()?.address
+            } else {
+                self.low_pc()?.address + attr.as_int()? as usize
+            }
+        };
+        Ok(FileAddress {
+            elf_handle: attr.compile_unit.elf,
+            address,
+        })
     }
 }
 
