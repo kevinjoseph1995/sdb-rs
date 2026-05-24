@@ -278,12 +278,54 @@ fn test_dwarf_die_tree_traversal() {
 // Gimli lockstep comparison tests
 // ---------------------------------------------------------------------------
 //
-// Strategy: build the `dwarf_fixture` binary once, parse it twice (libsdb +
-// gimli), walk both trees in lockstep, and collect a Vec<DieRecord> where
-// every entry holds parallel data from both parsers. Each focused test then
-// iterates the records and asserts one specific property — that keeps
-// failures targeted and decouples test logic from the (lifetime-heavy)
-// parsing pipeline.
+// Goal
+// ----
+// Cross-check libsdb's DWARF parser against gimli (used as an independent
+// oracle) on a real ELF binary. Any divergence — wrong tag, wrong offset,
+// wrong attribute value — signals a bug in the libsdb side under test.
+//
+// Architecture
+// ------------
+// Setup is expensive (build the fixture binary, mmap it, parse twice), so
+// we do it once via a `OnceLock<LockstepData>` and amortize across every
+// test. `LockstepData` is a flat `Vec<DieRecord>`; each `DieRecord` pairs
+// what libsdb saw for a single DIE with what gimli saw for the same DIE,
+// in two clearly-labeled sub-structs (`record.libsdb`, `record.gimli`).
+// Each test then iterates the records and asserts one specific property.
+// Keeping tests narrow makes failures point at one thing.
+//
+// Two-phase libsdb extraction
+// ---------------------------
+// Building a record needs two passes over libsdb's DIE tree because of how
+// the borrow checker pairs with `AbbrevTableCache`:
+//
+//   Phase 1 (inside `walk_lockstep`): the libsdb DIE iterator holds the
+//     abbrev cache borrowed `&mut`. We record everything we can derive
+//     without further cache use — tags, attr specs, addresses, integers,
+//     strings, blocks, and the CU-local *position* of references.
+//
+//   Phase 2 (after the walk returns, abbrev cache borrow released): for
+//     every queued reference attribute, call `Attr::as_reference()` to
+//     resolve the target DIE and stash its absolute `.debug_info` offset
+//     in `LibsdbDieData::resolved_ref_targets`.
+//
+// Phase-1 results in `attr_values` are never overwritten by phase 2 —
+// the two phases write to different fields. That means the `CuLocalRefPos`
+// recorded in phase 1 stays observable, and the CU-local ref test reads
+// it directly instead of re-walking the tree.
+//
+// `DW_AT_sibling` is deliberately excluded from phase-2 resolution: the
+// sibling shortcut is exercised by the lockstep walk itself, and skipping
+// it keeps `pending_refs` small.
+//
+// Test helpers
+// ------------
+// Per-form tests (string/int/address/sec_offset/block/reference/CU-local
+// ref) all share the same shape — iterate every (DIE, attr), filter by
+// form, compare libsdb's extracted value to gimli's, count probes,
+// assert the fixture exercises the form. `check_attrs` captures that
+// skeleton; `attr_location` and `extracted_mismatch_panic` give every
+// failure message a uniform shape.
 
 use libsdb::dwarf::Attr;
 use libsdb::dwarf_constants::{DwAt, DwForm};
@@ -330,30 +372,53 @@ fn load_gimli<'a>(file_data: &'a [u8]) -> gimli::Dwarf<GimliReader<'a>> {
     gimli::Dwarf::load(load).expect("gimli::Dwarf::load failed")
 }
 
-/// Per-DIE record holding parallel data from libsdb and gimli.
+/// Per-DIE record holding parallel data from libsdb and gimli for the same
+/// logical DIE. The two sub-structs are populated independently and then
+/// compared field-by-field in the individual tests below.
 #[derive(Debug)]
 struct DieRecord {
     cu_index: usize,
+    libsdb: LibsdbDieData,
+    gimli: GimliDieData,
+}
+
+/// Everything we observed for this DIE via the libsdb parser under test.
+#[derive(Debug)]
+struct LibsdbDieData {
     /// Position of this DIE within `compile_unit.data` (header-stripped).
-    libsdb_position: usize,
-    /// Absolute offset of this DIE within the `.debug_info` section, as
-    /// computed from libsdb (`cu.debug_info_offset + HEADER + position`).
-    libsdb_abs_offset: usize,
-    libsdb_tag: u64,
-    libsdb_has_children: bool,
-    libsdb_attr_specs: Vec<(u64, u64)>, // (attr_code, form_code)
+    position: usize,
+    /// Absolute offset of this DIE within the `.debug_info` section,
+    /// computed as `cu.debug_info_offset() + HEADER + position`.
+    abs_offset: usize,
+    tag: u64,
+    has_children: bool,
+    /// `(attr_code, form_code)` pairs in declared order.
+    attr_specs: Vec<(u64, u64)>,
+    /// Phase-1 form-based extraction results, parallel to `attr_specs`.
+    /// For CU-local reference forms this holds `CuLocalRefPos(p)`; the
+    /// resolved target offset lives in `resolved_ref_targets` instead so
+    /// nothing here is ever overwritten.
+    attr_values: Vec<SdbExtracted>,
+    /// Phase-2 reference resolutions, parallel to `attr_specs`.
+    /// - `None` for non-reference forms and for `DW_AT_sibling` (we
+    ///   skip sibling so phase 2 doesn't hammer the abbrev cache).
+    /// - `Some(Ok(off))` is the absolute `.debug_info` offset of the
+    ///   target DIE as reported by `Attr::as_reference()`.
+    /// - `Some(Err(msg))` is the formatted error from a failed
+    ///   resolution; tests panic with this string in their messages.
+    resolved_ref_targets: Vec<Option<Result<usize, String>>>,
+}
 
-    /// Absolute offset of this DIE in `.debug_info`, from gimli.
-    gimli_abs_offset: usize,
-    /// Offset within the gimli unit (excluding any unit header).
-    gimli_unit_offset: usize,
-    gimli_tag: u16,
-    gimli_has_children: bool,
-    gimli_attrs: Vec<GimliAttrInfo>,
-
-    /// Per-attribute extracted values from libsdb. Indexed identically to
-    /// `libsdb_attr_specs`.
-    libsdb_attr_values: Vec<SdbExtracted>,
+/// Everything we observed for the same DIE via gimli (the reference oracle).
+#[derive(Debug)]
+struct GimliDieData {
+    /// Absolute offset of this DIE in `.debug_info`.
+    abs_offset: usize,
+    /// Offset within the unit (includes the unit header).
+    unit_offset: usize,
+    tag: u16,
+    has_children: bool,
+    attrs: Vec<GimliAttrInfo>,
 }
 
 #[derive(Debug, Clone)]
@@ -466,29 +531,22 @@ fn build_lockstep_data() -> LockstepData {
             );
         }
 
-        // Phase 2 — resolve references using the now-free abbrev cache.
+        // Phase 2 — resolve references now that the abbrev cache is no
+        // longer borrowed by the live DIE iterator. Results land in the
+        // record's `resolved_ref_targets` slot for the attr; phase-1
+        // `attr_values` is left alone.
         for (rec_idx, attr_idx, attr) in pending_refs {
-            let result = attr.as_reference(dwarf, &mut abbrev_cache);
-            match result {
-                Ok(target_die) => {
-                    if let Die::NonNull(p) = &target_die {
-                        let abs = p.compile_unit().debug_info_offset()
-                            + COMPILE_UNIT_HEADER_SIZE
-                            + target_die.position();
-                        all_records[rec_idx].libsdb_attr_values[attr_idx] =
-                            SdbExtracted::ReferenceTargetAbs(abs);
-                    } else {
-                        all_records[rec_idx].libsdb_attr_values[attr_idx] =
-                            SdbExtracted::ExtractError(
-                                "as_reference returned Die::Null".to_string(),
-                            );
-                    }
-                }
-                Err(e) => {
-                    all_records[rec_idx].libsdb_attr_values[attr_idx] =
-                        SdbExtracted::ExtractError(format!("{e}"));
-                }
-            }
+            let resolved: Result<usize, String> = match attr.as_reference(dwarf, &mut abbrev_cache)
+            {
+                Ok(target_die) => match &target_die {
+                    Die::NonNull(p) => Ok(p.compile_unit().debug_info_offset()
+                        + COMPILE_UNIT_HEADER_SIZE
+                        + target_die.position()),
+                    Die::Null(_) => Err("as_reference returned Die::Null".to_string()),
+                },
+                Err(e) => Err(format!("{e}")),
+            };
+            all_records[rec_idx].libsdb.resolved_ref_targets[attr_idx] = Some(resolved);
         }
     }
 
@@ -623,8 +681,7 @@ fn walk_lockstep<'a, 'b>(
     );
 
     // Extract libsdb values for each attribute.
-    let mut libsdb_attr_values: Vec<SdbExtracted> =
-        Vec::with_capacity(libsdb_attr_specs.len());
+    let mut libsdb_attr_values: Vec<SdbExtracted> = Vec::with_capacity(libsdb_attr_specs.len());
     for &(attr_code, form_code) in &libsdb_attr_specs {
         let attr = match payload.get_attr(attr_code) {
             Some(a) => a,
@@ -640,25 +697,32 @@ fn walk_lockstep<'a, 'b>(
     }
 
     let record_index = out.len();
+    let attr_count = libsdb_attr_specs.len();
     out.push(DieRecord {
         cu_index,
-        libsdb_position,
-        libsdb_abs_offset,
-        libsdb_tag,
-        libsdb_has_children,
-        libsdb_attr_specs: libsdb_attr_specs.clone(),
-        gimli_abs_offset,
-        gimli_unit_offset,
-        gimli_tag,
-        gimli_has_children,
-        gimli_attrs,
-        libsdb_attr_values,
+        libsdb: LibsdbDieData {
+            position: libsdb_position,
+            abs_offset: libsdb_abs_offset,
+            tag: libsdb_tag,
+            has_children: libsdb_has_children,
+            attr_specs: libsdb_attr_specs.clone(),
+            attr_values: libsdb_attr_values,
+            // Phase 2 will overwrite individual slots; everything starts None.
+            resolved_ref_targets: vec![None; attr_count],
+        },
+        gimli: GimliDieData {
+            abs_offset: gimli_abs_offset,
+            unit_offset: gimli_unit_offset,
+            tag: gimli_tag,
+            has_children: gimli_has_children,
+            attrs: gimli_attrs,
+        },
     });
 
     // Queue reference attrs for phase-2 resolution.
     for (attr_idx, &(attr_code, form_code)) in libsdb_attr_specs.iter().enumerate() {
-        if is_any_ref_form(form_code)
-            && attr_code != DwAt::Sibling as u64 /* sibling is exercised separately */
+        if is_any_ref_form(form_code) && attr_code != DwAt::Sibling as u64
+        /* sibling is exercised separately */
         {
             if let Some(attr) = payload.get_attr(attr_code) {
                 // SAFETY: Attr<'a> borrows from CompileUnit<'a> only — not from
@@ -741,26 +805,30 @@ fn extract_libsdb_attr(attr: &Attr, form_code: u64) -> SdbExtracted {
             Ok(s) => SdbExtracted::String(s.to_bytes().to_vec()),
             Err(e) => SdbExtracted::ExtractError(format!("as_string: {e}")),
         },
-        DwForm::Block1 | DwForm::Block2 | DwForm::Block4 | DwForm::Block => {
-            match attr.as_block() {
-                Ok(b) => SdbExtracted::Block(b.to_vec()),
-                Err(e) => SdbExtracted::ExtractError(format!("as_block: {e}")),
-            }
-        }
+        DwForm::Block1 | DwForm::Block2 | DwForm::Block4 | DwForm::Block => match attr.as_block() {
+            Ok(b) => SdbExtracted::Block(b.to_vec()),
+            Err(e) => SdbExtracted::ExtractError(format!("as_block: {e}")),
+        },
         DwForm::Ref1 | DwForm::Ref2 | DwForm::Ref4 | DwForm::Ref8 | DwForm::RefUdata => {
-            // CU-local refs — record `as_cu_local_reference_position`. The
-            // full `as_reference` resolution is filled in phase 2 (and
-            // overwrites this value).
+            // CU-local refs: phase 1 records the CU-local position.
+            // Phase 2 stores the resolved target offset in a parallel
+            // field (`resolved_ref_targets`); this value is stable.
             match attr.as_cu_local_reference_position() {
                 Ok(p) => SdbExtracted::CuLocalRefPos(p),
-                Err(e) => SdbExtracted::ExtractError(format!("as_cu_local_reference_position: {e}")),
+                Err(e) => {
+                    SdbExtracted::ExtractError(format!("as_cu_local_reference_position: {e}"))
+                }
             }
         }
         DwForm::RefAddr => {
-            // Phase-2 resolution fills this in.
+            // No CU-local position exists for cross-CU refs; only phase
+            // 2's `resolved_ref_targets` will be populated.
             SdbExtracted::NotProbed
         }
-        DwForm::Flag | DwForm::FlagPresent | DwForm::Exprloc | DwForm::RefSig8
+        DwForm::Flag
+        | DwForm::FlagPresent
+        | DwForm::Exprloc
+        | DwForm::RefSig8
         | DwForm::Indirect => SdbExtracted::NotProbed,
     }
 }
@@ -788,9 +856,9 @@ fn extract_gimli_attr<R: gimli::Reader<Offset = usize>>(
         gimli::AttributeValue::Block(r) => {
             GimliExtracted::Block(r.to_slice().expect("block to_slice").to_vec())
         }
-        gimli::AttributeValue::Exprloc(expr) => GimliExtracted::Block(
-            expr.0.to_slice().expect("exprloc to_slice").to_vec(),
-        ),
+        gimli::AttributeValue::Exprloc(expr) => {
+            GimliExtracted::Block(expr.0.to_slice().expect("exprloc to_slice").to_vec())
+        }
         gimli::AttributeValue::String(r) => {
             GimliExtracted::String(r.to_slice().expect("string to_slice").to_vec())
         }
@@ -810,9 +878,7 @@ fn extract_gimli_attr<R: gimli::Reader<Offset = usize>>(
                 .0;
             GimliExtracted::ReferenceTargetAbs(abs)
         }
-        gimli::AttributeValue::DebugInfoRef(off) => {
-            GimliExtracted::ReferenceTargetAbs(off.0)
-        }
+        gimli::AttributeValue::DebugInfoRef(off) => GimliExtracted::ReferenceTargetAbs(off.0),
         _ => GimliExtracted::Other,
     };
     GimliAttrInfo {
@@ -820,6 +886,91 @@ fn extract_gimli_attr<R: gimli::Reader<Offset = usize>>(
         form,
         extracted,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-attribute test helpers
+// ---------------------------------------------------------------------------
+
+/// Canonical "CU N DIE @ 0xABCD attr K" prefix for failure messages.
+/// Centralizing this means every per-attribute test reports failures with
+/// the same coordinates: the CU index, the DIE's absolute `.debug_info`
+/// offset (great for `llvm-dwarfdump --debug-info` cross-reference), and
+/// the attribute index within the DIE.
+fn attr_location(rec: &DieRecord, attr_index: usize) -> String {
+    format!(
+        "CU {} DIE @ {:#x} attr {}",
+        rec.cu_index, rec.libsdb.abs_offset, attr_index
+    )
+}
+
+/// Panic with a uniform "extracted value didn't fit the expected variant"
+/// message. Used as the `_ =>` arm of comparator matches in `check_attrs`
+/// callers; `-> !` lets it appear in an expression position.
+///
+/// `expected` names the variant the caller wanted (e.g. `"String"`,
+/// `"Int"`); both raw `Debug` representations of the actual extracted
+/// values are appended so the failure shows what each parser produced.
+fn extracted_mismatch_panic(
+    rec: &DieRecord,
+    attr_index: usize,
+    form: u64,
+    expected: &str,
+    sdb: &SdbExtracted,
+    gim: &GimliExtracted,
+) -> ! {
+    panic!(
+        "{}: form {:#x} not extracted as {}: sdb={:?} gim={:?}",
+        attr_location(rec, attr_index),
+        form,
+        expected,
+        sdb,
+        gim,
+    );
+}
+
+/// Shared skeleton for every per-form value comparison test.
+///
+/// Walks every (DIE, attribute) pair in the shared lockstep data, calls
+/// `filter` on `(attr_code, form_code)` to pick the attributes we care
+/// about, and invokes `check` on those with both parsers' extracted
+/// values. After the walk, asserts the fixture exercised the form at
+/// least `min_probed` times — pass `0` for forms that may legitimately
+/// be absent (e.g. block forms, which are rare in C-generated DWARF).
+///
+/// `label` is used only in the "expected at least N" failure message.
+///
+/// `filter` takes both attr code and form so tests can do attribute-level
+/// exclusions (the reference test skips `DW_AT_sibling`, for instance).
+fn check_attrs<F, C>(label: &str, min_probed: usize, filter: F, mut check: C)
+where
+    F: Fn(u64, u64) -> bool,
+    C: FnMut(&DieRecord, usize, u64, &SdbExtracted, &GimliExtracted),
+{
+    let data = lockstep_data();
+    let mut probed = 0usize;
+    for rec in &data.records {
+        for (i, &(attr_code, form)) in rec.libsdb.attr_specs.iter().enumerate() {
+            if !filter(attr_code, form) {
+                continue;
+            }
+            check(
+                rec,
+                i,
+                form,
+                &rec.libsdb.attr_values[i],
+                &rec.gimli.attrs[i].extracted,
+            );
+            probed += 1;
+        }
+    }
+    assert!(
+        probed >= min_probed,
+        "fixture exercised {} {}-form attribute(s) (expected at least {})",
+        probed,
+        label,
+        min_probed,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -837,9 +988,9 @@ fn gimli_die_abs_offset_matches() {
     let data = lockstep_data();
     for rec in &data.records {
         assert_eq!(
-            rec.libsdb_abs_offset, rec.gimli_abs_offset,
+            rec.libsdb.abs_offset, rec.gimli.abs_offset,
             "CU {} DIE: libsdb abs offset {:#x} != gimli {:#x}",
-            rec.cu_index, rec.libsdb_abs_offset, rec.gimli_abs_offset
+            rec.cu_index, rec.libsdb.abs_offset, rec.gimli.abs_offset
         );
     }
 }
@@ -852,12 +1003,12 @@ fn gimli_die_position_within_cu_matches() {
     let data = lockstep_data();
     for rec in &data.records {
         assert_eq!(
-            rec.libsdb_position + COMPILE_UNIT_HEADER_SIZE,
-            rec.gimli_unit_offset,
+            rec.libsdb.position + COMPILE_UNIT_HEADER_SIZE,
+            rec.gimli.unit_offset,
             "CU {} DIE: libsdb position {:#x} + header != gimli unit offset {:#x}",
             rec.cu_index,
-            rec.libsdb_position,
-            rec.gimli_unit_offset
+            rec.libsdb.position,
+            rec.gimli.unit_offset
         );
     }
 }
@@ -867,13 +1018,9 @@ fn gimli_die_tags_match() {
     let data = lockstep_data();
     for rec in &data.records {
         assert_eq!(
-            rec.libsdb_tag,
-            rec.gimli_tag as u64,
+            rec.libsdb.tag, rec.gimli.tag as u64,
             "CU {} DIE @ {:#x}: libsdb tag {:#x} != gimli {:#x}",
-            rec.cu_index,
-            rec.libsdb_abs_offset,
-            rec.libsdb_tag,
-            rec.gimli_tag
+            rec.cu_index, rec.libsdb.abs_offset, rec.libsdb.tag, rec.gimli.tag
         );
     }
 }
@@ -883,12 +1030,9 @@ fn gimli_die_has_children_matches() {
     let data = lockstep_data();
     for rec in &data.records {
         assert_eq!(
-            rec.libsdb_has_children, rec.gimli_has_children,
+            rec.libsdb.has_children, rec.gimli.has_children,
             "CU {} DIE @ {:#x}: libsdb has_children {} != gimli {}",
-            rec.cu_index,
-            rec.libsdb_abs_offset,
-            rec.libsdb_has_children,
-            rec.gimli_has_children
+            rec.cu_index, rec.libsdb.abs_offset, rec.libsdb.has_children, rec.gimli.has_children
         );
     }
 }
@@ -898,309 +1042,234 @@ fn gimli_die_attribute_specs_match() {
     let data = lockstep_data();
     for rec in &data.records {
         assert_eq!(
-            rec.libsdb_attr_specs.len(),
-            rec.gimli_attrs.len(),
+            rec.libsdb.attr_specs.len(),
+            rec.gimli.attrs.len(),
             "CU {} DIE @ {:#x}: libsdb {} attrs != gimli {} attrs",
             rec.cu_index,
-            rec.libsdb_abs_offset,
-            rec.libsdb_attr_specs.len(),
-            rec.gimli_attrs.len()
+            rec.libsdb.abs_offset,
+            rec.libsdb.attr_specs.len(),
+            rec.gimli.attrs.len()
         );
         for (i, (sdb, gim)) in rec
-            .libsdb_attr_specs
+            .libsdb
+            .attr_specs
             .iter()
-            .zip(rec.gimli_attrs.iter())
+            .zip(rec.gimli.attrs.iter())
             .enumerate()
         {
             assert_eq!(
                 sdb.0, gim.name as u64,
                 "CU {} DIE @ {:#x} attr {}: libsdb attr {:#x} != gimli {:#x}",
-                rec.cu_index, rec.libsdb_abs_offset, i, sdb.0, gim.name
+                rec.cu_index, rec.libsdb.abs_offset, i, sdb.0, gim.name
             );
             assert_eq!(
                 sdb.1, gim.form as u64,
                 "CU {} DIE @ {:#x} attr {} ({:#x}): libsdb form {:#x} != gimli {:#x}",
-                rec.cu_index, rec.libsdb_abs_offset, i, sdb.0, sdb.1, gim.form
+                rec.cu_index, rec.libsdb.abs_offset, i, sdb.0, sdb.1, gim.form
             );
         }
     }
 }
 
+// Strings (`DW_FORM_string`, `DW_FORM_strp`) — libsdb's `Attr::as_string`
+// must yield the same bytes as gimli's resolved string (raw inline or
+// `.debug_str` lookup).
 #[test]
 fn gimli_die_string_attrs_match() {
-    let data = lockstep_data();
-    let mut probed = 0usize;
-    for rec in &data.records {
-        for (i, &(_, form)) in rec.libsdb_attr_specs.iter().enumerate() {
-            let is_string_form = matches!(
+    check_attrs(
+        "string",
+        1,
+        |_attr, form| {
+            matches!(
                 DwForm::try_from(form as u8).ok(),
-                Some(DwForm::String | DwForm::Strp)
-            );
-            if !is_string_form {
-                continue;
+                Some(DwForm::String | DwForm::Strp),
+            )
+        },
+        |rec, i, form, sdb, gim| match (sdb, gim) {
+            (SdbExtracted::String(s), GimliExtracted::String(g)) => {
+                assert_eq!(s, g, "{}: string bytes differ", attr_location(rec, i));
             }
-            let sdb = &rec.libsdb_attr_values[i];
-            let gim = &rec.gimli_attrs[i].extracted;
-            match (sdb, gim) {
-                (SdbExtracted::String(s_bytes), GimliExtracted::String(g_bytes)) => {
-                    assert_eq!(
-                        s_bytes, g_bytes,
-                        "CU {} DIE @ {:#x} attr {}: string mismatch",
-                        rec.cu_index, rec.libsdb_abs_offset, i
-                    );
-                    probed += 1;
-                }
-                _ => panic!(
-                    "CU {} DIE @ {:#x} attr {}: form {:#x} not extracted as String: sdb={:?} gim={:?}",
-                    rec.cu_index, rec.libsdb_abs_offset, i, form, sdb, gim
-                ),
-            }
-        }
-    }
-    assert!(probed > 0, "fixture had no string-form attributes to probe");
+            _ => extracted_mismatch_panic(rec, i, form, "String", sdb, gim),
+        },
+    );
 }
 
+// Integer-typed forms (`DW_FORM_data{1,2,4,8}`, `DW_FORM_udata`,
+// `DW_FORM_sdata`) — libsdb's `as_int` must agree with gimli's raw numeric
+// value. We feed gimli's `raw_value()` so attributes whose decoded meaning
+// is an enum (e.g. `DW_AT_language`) still arrive here as plain integers.
 #[test]
 fn gimli_die_int_attrs_match() {
-    let data = lockstep_data();
-    let mut probed = 0usize;
-    for rec in &data.records {
-        for (i, &(_, form)) in rec.libsdb_attr_specs.iter().enumerate() {
-            if !is_libsdb_int_form(form) {
-                continue;
+    check_attrs(
+        "integer",
+        1,
+        |_attr, form| is_libsdb_int_form(form),
+        |rec, i, form, sdb, gim| match (sdb, gim) {
+            (SdbExtracted::Int(s), GimliExtracted::Int(g)) => {
+                assert_eq!(
+                    s,
+                    g,
+                    "{}: libsdb int {} != gimli {}",
+                    attr_location(rec, i),
+                    s,
+                    g,
+                );
             }
-            let sdb = &rec.libsdb_attr_values[i];
-            let gim = &rec.gimli_attrs[i].extracted;
-            match (sdb, gim) {
-                (SdbExtracted::Int(s), GimliExtracted::Int(g)) => {
-                    assert_eq!(
-                        s, g,
-                        "CU {} DIE @ {:#x} attr {}: libsdb int {} != gimli {}",
-                        rec.cu_index, rec.libsdb_abs_offset, i, s, g
-                    );
-                    probed += 1;
-                }
-                _ => panic!(
-                    "CU {} DIE @ {:#x} attr {}: form {:#x} not extracted as Int: sdb={:?} gim={:?}",
-                    rec.cu_index, rec.libsdb_abs_offset, i, form, sdb, gim
-                ),
-            }
-        }
-    }
-    assert!(probed > 0, "fixture had no integer-form attributes to probe");
+            _ => extracted_mismatch_panic(rec, i, form, "Int", sdb, gim),
+        },
+    );
 }
 
+// Addresses (`DW_FORM_addr`) — libsdb returns a `FileAddress` carrying a
+// resolved `usize` address; widened to `u64` for comparison against gimli.
 #[test]
 fn gimli_die_address_attrs_match() {
-    let data = lockstep_data();
-    let mut probed = 0usize;
-    for rec in &data.records {
-        for (i, &(_, form)) in rec.libsdb_attr_specs.iter().enumerate() {
-            if DwForm::try_from(form as u8).ok() != Some(DwForm::Addr) {
-                continue;
+    check_attrs(
+        "address",
+        1,
+        |_attr, form| DwForm::try_from(form as u8).ok() == Some(DwForm::Addr),
+        |rec, i, form, sdb, gim| match (sdb, gim) {
+            (SdbExtracted::Address(s), GimliExtracted::Address(g)) => {
+                assert_eq!(
+                    *s as u64,
+                    *g,
+                    "{}: libsdb addr {:#x} != gimli {:#x}",
+                    attr_location(rec, i),
+                    s,
+                    g,
+                );
             }
-            let sdb = &rec.libsdb_attr_values[i];
-            let gim = &rec.gimli_attrs[i].extracted;
-            match (sdb, gim) {
-                (SdbExtracted::Address(s), GimliExtracted::Address(g)) => {
-                    assert_eq!(
-                        *s as u64, *g,
-                        "CU {} DIE @ {:#x} attr {}: libsdb addr {:#x} != gimli {:#x}",
-                        rec.cu_index, rec.libsdb_abs_offset, i, s, g
-                    );
-                    probed += 1;
-                }
-                _ => panic!(
-                    "CU {} DIE @ {:#x} attr {}: form DW_FORM_addr extraction mismatch: sdb={:?} gim={:?}",
-                    rec.cu_index, rec.libsdb_abs_offset, i, sdb, gim
-                ),
-            }
-        }
-    }
-    assert!(probed > 0, "fixture had no address-form attributes to probe");
+            _ => extracted_mismatch_panic(rec, i, form, "Address", sdb, gim),
+        },
+    );
 }
 
+// `DW_FORM_sec_offset` — used for cross-section references (line tables,
+// loclists, etc.). libsdb stores it as `u32`; gimli as `u64`.
 #[test]
 fn gimli_die_section_offset_attrs_match() {
-    let data = lockstep_data();
-    let mut probed = 0usize;
-    for rec in &data.records {
-        for (i, &(_, form)) in rec.libsdb_attr_specs.iter().enumerate() {
-            if DwForm::try_from(form as u8).ok() != Some(DwForm::SecOffset) {
-                continue;
+    check_attrs(
+        "sec_offset",
+        1,
+        |_attr, form| DwForm::try_from(form as u8).ok() == Some(DwForm::SecOffset),
+        |rec, i, form, sdb, gim| match (sdb, gim) {
+            (SdbExtracted::SecOffset(s), GimliExtracted::SecOffset(g)) => {
+                assert_eq!(
+                    *s as u64,
+                    *g,
+                    "{}: libsdb sec_offset {:#x} != gimli {:#x}",
+                    attr_location(rec, i),
+                    s,
+                    g,
+                );
             }
-            let sdb = &rec.libsdb_attr_values[i];
-            let gim = &rec.gimli_attrs[i].extracted;
-            match (sdb, gim) {
-                (SdbExtracted::SecOffset(s), GimliExtracted::SecOffset(g)) => {
-                    assert_eq!(
-                        *s as u64, *g,
-                        "CU {} DIE @ {:#x} attr {}: libsdb sec_offset {:#x} != gimli {:#x}",
-                        rec.cu_index, rec.libsdb_abs_offset, i, s, g
-                    );
-                    probed += 1;
-                }
-                _ => panic!(
-                    "CU {} DIE @ {:#x} attr {}: form DW_FORM_sec_offset extraction mismatch: sdb={:?} gim={:?}",
-                    rec.cu_index, rec.libsdb_abs_offset, i, sdb, gim
-                ),
-            }
-        }
-    }
-    assert!(probed > 0, "fixture had no sec_offset attributes to probe");
+            _ => extracted_mismatch_panic(rec, i, form, "SecOffset", sdb, gim),
+        },
+    );
 }
 
+// Block-encoded forms — `DW_FORM_block{1,2,4}` and `DW_FORM_block`.
+// `min_probed = 0` because plain block forms are rare in C-generated DWARF
+// (exprloc dominates, and libsdb's `as_block` deliberately rejects it).
 #[test]
 fn gimli_die_block_attrs_match() {
-    let data = lockstep_data();
-    let mut probed = 0usize;
-    for rec in &data.records {
-        for (i, &(_, form)) in rec.libsdb_attr_specs.iter().enumerate() {
-            if !is_libsdb_block_form(form) {
-                continue;
+    check_attrs(
+        "block",
+        0,
+        |_attr, form| is_libsdb_block_form(form),
+        |rec, i, form, sdb, gim| match (sdb, gim) {
+            (SdbExtracted::Block(s), GimliExtracted::Block(g)) => {
+                assert_eq!(s, g, "{}: block bytes differ", attr_location(rec, i));
             }
-            let sdb = &rec.libsdb_attr_values[i];
-            let gim = &rec.gimli_attrs[i].extracted;
-            match (sdb, gim) {
-                (SdbExtracted::Block(s), GimliExtracted::Block(g)) => {
-                    assert_eq!(
-                        s, g,
-                        "CU {} DIE @ {:#x} attr {}: block bytes differ",
-                        rec.cu_index, rec.libsdb_abs_offset, i
-                    );
-                    probed += 1;
-                }
-                _ => panic!(
-                    "CU {} DIE @ {:#x} attr {}: form {:#x} not extracted as Block: sdb={:?} gim={:?}",
-                    rec.cu_index, rec.libsdb_abs_offset, i, form, sdb, gim
-                ),
-            }
-        }
-    }
-    // The fixture may or may not emit block-form attributes; if it doesn't,
-    // skip the "probed > 0" assertion silently. Block attrs are rare in C.
-    let _ = probed;
+            _ => extracted_mismatch_panic(rec, i, form, "Block", sdb, gim),
+        },
+    );
 }
 
+// Reference-form attributes — every CU-local ref form plus `DW_FORM_ref_addr`.
+// Reads phase 2's `resolved_ref_targets` slot (phase 1 only captured the
+// CU-local position; the actual target abs offset comes from
+// `Attr::as_reference`). `DW_AT_sibling` is skipped here for the same
+// reason it's skipped during phase-2 resolution — see the architecture
+// comment above.
 #[test]
 fn gimli_die_references_match() {
-    let data = lockstep_data();
-    let mut probed = 0usize;
-    for rec in &data.records {
-        for (i, &(attr_code, form)) in rec.libsdb_attr_specs.iter().enumerate() {
-            if !is_any_ref_form(form) {
-                continue;
-            }
-            // Sibling references are not resolved into ReferenceTargetAbs by
-            // phase 2 (we exclude them so the cache stays free); skip them
-            // here too.
-            if attr_code == DwAt::Sibling as u64 {
-                continue;
-            }
-            let sdb = &rec.libsdb_attr_values[i];
-            let gim = &rec.gimli_attrs[i].extracted;
-            match (sdb, gim) {
-                (
-                    SdbExtracted::ReferenceTargetAbs(s),
-                    GimliExtracted::ReferenceTargetAbs(g),
-                ) => {
-                    assert_eq!(
-                        s, g,
-                        "CU {} DIE @ {:#x} attr {} ({:#x}): libsdb ref target {:#x} != gimli {:#x}",
-                        rec.cu_index, rec.libsdb_abs_offset, i, attr_code, s, g
-                    );
-                    probed += 1;
-                }
-                _ => panic!(
-                    "CU {} DIE @ {:#x} attr {}: ref form {:#x} extraction mismatch: sdb={:?} gim={:?}",
-                    rec.cu_index, rec.libsdb_abs_offset, i, form, sdb, gim
+    check_attrs(
+        "reference",
+        1,
+        |attr_code, form| is_any_ref_form(form) && attr_code != DwAt::Sibling as u64,
+        |rec, i, _form, _sdb, gim| {
+            let sdb_abs = match &rec.libsdb.resolved_ref_targets[i] {
+                Some(Ok(abs)) => *abs,
+                Some(Err(e)) => panic!(
+                    "{}: phase-2 ref resolution failed: {}",
+                    attr_location(rec, i),
+                    e,
                 ),
-            }
-        }
-    }
-    assert!(probed > 0, "fixture had no resolvable reference attributes");
+                None => panic!(
+                    "{}: ref attr was not queued for phase-2 resolution",
+                    attr_location(rec, i),
+                ),
+            };
+            let gim_abs = match gim {
+                GimliExtracted::ReferenceTargetAbs(g) => *g,
+                other => panic!(
+                    "{}: gimli did not produce ReferenceTargetAbs: {:?}",
+                    attr_location(rec, i),
+                    other,
+                ),
+            };
+            assert_eq!(
+                sdb_abs,
+                gim_abs,
+                "{}: libsdb ref target {:#x} != gimli {:#x}",
+                attr_location(rec, i),
+                sdb_abs,
+                gim_abs,
+            );
+        },
+    );
 }
 
+// `Attr::as_cu_local_reference_position()` — exercised separately from the
+// full reference resolution above. The phase-1 extractor captured the raw
+// CU-local position in `attr_values`; the expected value is derived from
+// gimli's resolved absolute target by stripping off the source CU's
+// `.debug_info` offset and the unit header.
 #[test]
 fn gimli_cu_local_reference_position_matches() {
-    // For CU-local ref forms, the phase-1 extractor recorded
-    // `as_cu_local_reference_position()`. Phase 2 then overwrites these
-    // with `ReferenceTargetAbs`. To exercise just the CU-local extractor,
-    // we re-walk and call it directly.
-    let path = fixture_binary_path();
-    let elf = Elf::new(path).expect("Failed to load ELF for cu-local ref test");
-    let dwarf = Dwarf::new(&elf).expect("Failed to parse DWARF");
-    let mut cache = AbbrevTableCache::new(&elf);
-
-    let binary_data = std::fs::read(path).expect("read fixture");
-    let gimli_dwarf = load_gimli(&binary_data);
-    let mut gimli_units = Vec::new();
-    let mut headers = gimli_dwarf.units();
-    while let Some(h) = headers.next().expect("units iter") {
-        gimli_units.push(gimli_dwarf.unit(h).expect("dwarf.unit"));
-    }
-
-    let mut checked = 0usize;
-    for (cu_idx, libsdb_cu) in dwarf.compile_units.iter().enumerate() {
-        let gimli_unit = &gimli_units[cu_idx];
-        let root = libsdb_cu.root(&mut cache).expect("root");
-        check_cu_local_refs(libsdb_cu, &dwarf, &root, gimli_unit, &mut checked);
-    }
-    assert!(checked > 0, "fixture had no CU-local references to check");
-}
-
-fn check_cu_local_refs<'a, 'b>(
-    libsdb_cu: &'a libsdb::dwarf::CompileUnit<'a>,
-    libsdb_dwarf: &'a Dwarf<'a>,
-    libsdb_die: &Die<'a, 'b>,
-    gimli_unit: &gimli::Unit<GimliReader<'a>>,
-    checked: &mut usize,
-) {
-    if let Die::NonNull(payload) = libsdb_die {
-        let unit_offset = libsdb_die.position() + COMPILE_UNIT_HEADER_SIZE;
-        let gimli_entry = gimli_unit
-            .entry(gimli::UnitOffset(unit_offset))
-            .expect("gimli unit.entry by offset");
-        for spec in payload.attr_specs() {
-            if !is_cu_local_ref_form(spec.form()) {
-                continue;
-            }
-            let attr_code = spec.attr();
-            let libsdb_attr = payload.get_attr(attr_code).expect("get_attr");
-            let libsdb_pos = libsdb_attr
-                .as_cu_local_reference_position()
-                .expect("as_cu_local_reference_position");
-
-            let gimli_attr = gimli_entry
-                .attr(gimli::DwAt(attr_code as u16))
-                .expect("gimli entry.attr")
-                .expect("gimli attr present");
-            let expected_unit_offset = match gimli_attr.value() {
-                gimli::AttributeValue::UnitRef(uo) => uo.0,
-                other => panic!("expected UnitRef, got {:?}", other),
+    check_attrs(
+        "CU-local reference",
+        1,
+        |_attr, form| is_cu_local_ref_form(form),
+        |rec, i, form, sdb, gim| {
+            let libsdb_pos = match sdb {
+                SdbExtracted::CuLocalRefPos(p) => *p,
+                _ => extracted_mismatch_panic(rec, i, form, "CuLocalRefPos", sdb, gim),
             };
-            let expected_libsdb_pos = expected_unit_offset - COMPILE_UNIT_HEADER_SIZE;
+            let gimli_abs = match gim {
+                GimliExtracted::ReferenceTargetAbs(g) => *g,
+                _ => extracted_mismatch_panic(rec, i, form, "ReferenceTargetAbs", sdb, gim),
+            };
+            // libsdb.abs_offset = cu_debug_info_offset + HEADER + position,
+            // so we can recover the source CU's debug_info offset from the
+            // record without storing it separately.
+            let cu_debug_info_offset =
+                rec.libsdb.abs_offset - COMPILE_UNIT_HEADER_SIZE - rec.libsdb.position;
+            let expected = gimli_abs - cu_debug_info_offset - COMPILE_UNIT_HEADER_SIZE;
             assert_eq!(
-                libsdb_pos, expected_libsdb_pos,
-                "CU-local ref position mismatch at DIE position {:#x} attr {:#x}: \
-                 libsdb {:#x} != expected {:#x}",
-                libsdb_die.position(),
-                attr_code,
                 libsdb_pos,
-                expected_libsdb_pos
+                expected,
+                "{}: libsdb CU-local pos {:#x} != expected {:#x} \
+                 (gimli abs {:#x}, source cu_debug_info_offset {:#x})",
+                attr_location(rec, i),
+                libsdb_pos,
+                expected,
+                gimli_abs,
+                cu_debug_info_offset,
             );
-            *checked += 1;
-        }
-        if let Some(children_iter) = libsdb_die.children(libsdb_dwarf) {
-            let children: Vec<_> = children_iter
-                .collect::<Result<Vec<_>, _>>()
-                .expect("children");
-            for child in &children {
-                check_cu_local_refs(libsdb_cu, libsdb_dwarf, child, gimli_unit, checked);
-            }
-        }
-    }
-    let _ = libsdb_cu;
+        },
+    );
 }
 
 #[test]
@@ -1279,7 +1348,7 @@ fn sibling_optimization_does_not_diverge_from_gimli() {
     let data = lockstep_data();
     let mut saw_sibling = false;
     for rec in &data.records {
-        for &(attr_code, _) in &rec.libsdb_attr_specs {
+        for &(attr_code, _) in &rec.libsdb.attr_specs {
             if attr_code == DwAt::Sibling as u64 {
                 saw_sibling = true;
                 break;
