@@ -252,7 +252,7 @@ fn test_dwarf_die_tree_traversal() {
             "Compile unit root DIE should not be null"
         );
         let children = root
-            .children(&dwarf)
+            .children()
             .expect("Root DIE should expose a children iterator")
             .collect::<Result<Vec<_>, _>>()
             .expect("Failed to iterate root DIE children");
@@ -520,7 +520,6 @@ fn build_lockstep_data() -> LockstepData {
             walk_lockstep(
                 cu_index,
                 libsdb_cu,
-                dwarf,
                 &libsdb_root,
                 &gimli_dwarf,
                 gimli_unit,
@@ -614,7 +613,6 @@ fn is_libsdb_int_form(form: u64) -> bool {
 fn walk_lockstep<'a, 'b>(
     cu_index: usize,
     libsdb_cu: &'a libsdb::dwarf::CompileUnit<'a>,
-    libsdb_dwarf: &'a Dwarf<'a>,
     libsdb_die: &Die<'a, 'b>,
     gimli_dwarf: &gimli::Dwarf<GimliReader<'a>>,
     gimli_unit: &gimli::Unit<GimliReader<'a>>,
@@ -737,7 +735,7 @@ fn walk_lockstep<'a, 'b>(
 
     // Recurse into children, lockstep with gimli.
     let mut gimli_children = gimli_node.children();
-    let libsdb_children_opt = libsdb_die.children(libsdb_dwarf);
+    let libsdb_children_opt = libsdb_die.children();
     let mut libsdb_children: Vec<Die<'a, 'b>> = match libsdb_children_opt {
         None => Vec::new(),
         Some(iter) => iter
@@ -753,7 +751,6 @@ fn walk_lockstep<'a, 'b>(
         walk_lockstep(
             cu_index,
             libsdb_cu,
-            libsdb_dwarf,
             libsdb_child,
             gimli_dwarf,
             gimli_unit,

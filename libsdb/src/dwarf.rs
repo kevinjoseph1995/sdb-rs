@@ -8,35 +8,9 @@ use std::{collections::HashMap, ffi::CStr};
 /// unit_length (4) + version (2) + debug_abbrev_offset (4) + address_size (1).
 pub const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 
-pub struct AttrSpec {
-    attr: u64,
-    form: u64,
-}
-
-impl AttrSpec {
-    pub fn attr(&self) -> u64 {
-        self.attr
-    }
-    pub fn form(&self) -> u64 {
-        self.form
-    }
-}
-
-pub struct Abbrev {
-    code: u64,
-    tag: u64,
-    has_children: bool,
-    attr_specs: Vec<AttrSpec>,
-}
-
-/// The .debug_abbrev section contains several abbreviation tables. Each compile
-/// unit in the .debug_info section uses exactly one abbreviation table, but different
-/// compile units may share the same table.
-/// Maps byte offsets to another map, of integers to abbreviation entries.
-pub type AbbrevTable = HashMap<u64 /* abbreviation code*/, Abbrev>;
-pub struct AbbrevTableCache<'a> {
-    elf: &'a Elf,
-    tables: HashMap<usize /*offset into the .debug_abbrev section*/, AbbrevTable>,
+// --- Top-level DWARF handle
+pub struct Dwarf<'elf> {
+    pub compile_units: Vec<CompileUnit<'elf>>,
 }
 
 pub struct CompileUnit<'elf> {
@@ -50,13 +24,14 @@ pub struct CompileUnit<'elf> {
     data: &'elf [u8],
     elf: &'elf Elf,
 }
-
-pub struct Dwarf<'elf> {
-    elf: &'elf Elf,
-    pub compile_units: Vec<CompileUnit<'elf>>,
+// --- Debugging Information Entries
+pub enum Die<'a, 'b> {
+    Null(
+        usize, /* Offset of the start of this DIE within `compile_unit.data` */
+    ),
+    NonNull(DiePayload<'a, 'b>),
 }
 
-///  Debugging Information Entry
 pub struct DiePayload<'a, 'b> {
     /// Offset of the start of this DIE within `compile_unit.data`.
     position: usize,
@@ -73,12 +48,14 @@ pub struct DiePayload<'a, 'b> {
     abbrev_table: &'b AbbrevTable,
 }
 
-pub enum Die<'a, 'b> {
-    Null(
-        usize, /* Offset of the start of this DIE within `compile_unit.data` */
-    ),
-    NonNull(DiePayload<'a, 'b>),
+pub struct DieChildrenIter<'a, 'b> {
+    compile_unit: &'a CompileUnit<'a>,
+    abbrev_table: &'b AbbrevTable,
+    current_offset: usize,
+    done: bool,
 }
+
+// --- Attributes
 
 pub struct Attr<'elf> {
     form: u64,
@@ -87,50 +64,69 @@ pub struct Attr<'elf> {
     location_offset: usize, // Offset in compile_unit.data
 }
 
-fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
-    let section_buffer: &[u8] = elf
-        .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_abbrev\0").unwrap())
-        .context(format!(
-            "Failed to find the .debug_abbrev section in {:?}",
-            &elf.path
-        ))?;
-    let mut cursor = Cursor::new(&section_buffer);
-    cursor.increment_cursor_by(offset);
-    let mut table = HashMap::<u64, Abbrev>::new();
-    loop {
-        // Parse one entry
-        // We extract the ULEB128 for the code, the ULEB128 for the tag,
-        // the 1-byte unsigned integer for the children flag (which will be either
-        // 1 or 0), and the list of ULEB128 pairs of attribute types and forms,
-        // terminated by a pair of 0s.
-        let code = cursor.uleb128()?;
-        if code == 0 {
-            // Abbrev table is terminated by a single 0 byte (code 0).
-            break;
-        }
-        let tag = cursor.uleb128()?;
-        let has_children = cursor.read_u8()? > 0;
-        let mut attr_specs = Vec::<AttrSpec>::new();
-        loop {
-            let attr = cursor.uleb128()?;
-            let form = cursor.uleb128()?;
-            if attr == 0 {
-                // Attr, form list is terminated by a pair of 0s.
-                break;
-            }
-            attr_specs.push(AttrSpec { attr, form });
-        }
-        table.insert(
-            code,
-            Abbrev {
-                code,
-                tag,
-                has_children,
-                attr_specs,
-            },
-        );
+pub struct AttrSpec {
+    attr: u64,
+    form: u64,
+}
+
+// --- Abbreviations
+pub struct Abbrev {
+    code: u64,
+    tag: u64,
+    has_children: bool,
+    attr_specs: Vec<AttrSpec>,
+}
+
+/// The .debug_abbrev section contains several abbreviation tables. Each compile
+/// unit in the .debug_info section uses exactly one abbreviation table, but different
+/// compile units may share the same table.
+/// Maps byte offsets to another map, of integers to abbreviation entries.
+pub type AbbrevTable = HashMap<u64 /* abbreviation code*/, Abbrev>;
+pub struct AbbrevTableCache<'a> {
+    elf: &'a Elf,
+    tables: HashMap<usize /*offset into the .debug_abbrev section*/, AbbrevTable>,
+}
+// ===================================================================
+
+// --- Dwarf ---
+
+impl<'elf> Dwarf<'elf> {
+    pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
+        let compile_units = parse_compile_units(elf)?;
+        Ok(Dwarf { compile_units })
     }
-    return Ok(table);
+}
+
+fn find_cu_containing<'a, 'elf>(
+    dwarf: &'a Dwarf<'elf>,
+    abs_offset: usize,
+) -> Result<(
+    &'a CompileUnit<'elf>,
+    usize, /*Offset relative to the found CU */
+)> {
+    let cu = dwarf
+        .compile_units
+        .iter()
+        .find(|cu| {
+            // `data` no longer includes the CU header, so the CU's footprint
+            // in .debug_info is `[debug_info_offset, debug_info_offset + header + data)`.
+            abs_offset >= cu.debug_info_offset
+                && abs_offset < cu.debug_info_offset + COMPILE_UNIT_HEADER_SIZE + cu.data.len()
+        })
+        .ok_or_else(|| anyhow!("RefAddr {:#x} not in any compile unit", abs_offset))?;
+    Ok((cu, abs_offset - cu.debug_info_offset))
+}
+
+fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
+    let debug_info_data = elf
+        .get_section_content_by_name(&CStr::from_bytes_with_nul(b".debug_info\0")?)
+        .context("Failed to find .debug_info section")?;
+    let mut cursor = Cursor::new(debug_info_data);
+    let mut compile_units = Vec::new();
+    while !cursor.is_at_end() {
+        compile_units.push(parse_compile_unit(&mut cursor, elf)?);
+    }
+    Ok(compile_units)
 }
 
 fn parse_compile_unit<'elf>(
@@ -175,62 +171,7 @@ fn parse_compile_unit<'elf>(
     })
 }
 
-fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
-    let debug_info_data = elf
-        .get_section_content_by_name(&CStr::from_bytes_with_nul(b".debug_info\0")?)
-        .context("Failed to find .debug_info section")?;
-    let mut cursor = Cursor::new(debug_info_data);
-    let mut compile_units = Vec::new();
-    while !cursor.is_at_end() {
-        compile_units.push(parse_compile_unit(&mut cursor, elf)?);
-    }
-    Ok(compile_units)
-}
-
-impl<'elf> Dwarf<'elf> {
-    pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
-        let compile_units = parse_compile_units(elf)?;
-        Ok(Dwarf { elf, compile_units })
-    }
-}
-
-fn find_cu_containing<'a, 'elf>(
-    dwarf: &'a Dwarf<'elf>,
-    abs_offset: usize,
-) -> Result<(
-    &'a CompileUnit<'elf>,
-    usize, /*Offset relative to the found CU */
-)> {
-    let cu = dwarf
-        .compile_units
-        .iter()
-        .find(|cu| {
-            // `data` no longer includes the CU header, so the CU's footprint
-            // in .debug_info is `[debug_info_offset, debug_info_offset + header + data)`.
-            abs_offset >= cu.debug_info_offset
-                && abs_offset < cu.debug_info_offset + COMPILE_UNIT_HEADER_SIZE + cu.data.len()
-        })
-        .ok_or_else(|| anyhow!("RefAddr {:#x} not in any compile unit", abs_offset))?;
-    Ok((cu, abs_offset - cu.debug_info_offset))
-}
-
-impl<'elf> AbbrevTableCache<'elf> {
-    pub fn new(elf: &'elf Elf) -> AbbrevTableCache<'elf> {
-        AbbrevTableCache {
-            elf,
-            tables: HashMap::new(),
-        }
-    }
-
-    pub fn get_table_at_offset(&mut self, offset: usize) -> Result<&AbbrevTable> {
-        if !self.tables.contains_key(&offset) {
-            // Cache miss
-            self.tables
-                .insert(offset, parse_abbrev_table(self.elf, offset)?);
-        }
-        Ok(self.tables.get(&offset).unwrap())
-    }
-}
+// --- CompileUnit ---
 
 impl<'elf> CompileUnit<'elf> {
     pub fn debug_info_offset(&self) -> usize {
@@ -252,69 +193,121 @@ impl<'elf> CompileUnit<'elf> {
     }
 }
 
-fn parse_die_raw<'a, 'b>(
-    cursor: &mut Cursor,
-    compile_unit: &'a CompileUnit,
-    abbrev_table: &'b AbbrevTable,
-) -> Result<Die<'a, 'b>> {
-    let position = cursor.position();
-    let abbrev_code = cursor.uleb128()?;
-    if abbrev_code == 0 {
-        return Ok(Die::Null(position));
-    }
-    let abbrev: &Abbrev = abbrev_table
-        .get(&abbrev_code)
-        .context("Failed to get abbrev entry from CU's abbrev_table")?;
-    let mut attr_locations = Vec::new();
-    attr_locations.reserve(abbrev.attr_specs.len());
-    for attr in &abbrev.attr_specs {
-        attr_locations.push(cursor.position());
-        cursor.skip_form(attr.form)?;
-    }
-    let next = cursor.position();
-    Ok(Die::NonNull(DiePayload {
-        position,
-        next,
-        compile_unit,
-        abbrev,
-        attr_locations,
-        abbrev_table,
-    }))
-}
+// --- Die / DiePayload / DieChildrenIter ---
 
-fn parse_die<'a, 'b>(
-    cursor: &mut Cursor,
-    compile_unit: &'a CompileUnit,
-    abbrev_table_cache: &'b mut AbbrevTableCache,
-) -> Result<Die<'a, 'b>> {
-    let abbrev_table = abbrev_table_cache.get_table_at_offset(compile_unit.abbrev_offset)?;
-    parse_die_raw(cursor, compile_unit, abbrev_table)
-}
-
-fn skip_children(cursor: &mut Cursor, abbrev_table: &AbbrevTable) -> Result<()> {
-    loop {
-        let code = cursor.uleb128()?;
-        if code == 0 {
-            return Ok(());
-        }
-        let abbrev = abbrev_table
-            .get(&code)
-            .ok_or_else(|| anyhow!("Unknown abbreviation code: {}", code))?;
-        for attr in &abbrev.attr_specs {
-            cursor.skip_form(attr.form)?;
-        }
-        if abbrev.has_children {
-            skip_children(cursor, abbrev_table)?;
+impl<'a, 'b> Die<'a, 'b> {
+    pub fn children(&self) -> Option<DieChildrenIter<'a, 'b>> {
+        match self {
+            Die::Null(_) => None,
+            Die::NonNull(payload) => Some(payload.children()),
         }
     }
+
+    /// Offset of the start of this DIE within `compile_unit.data`.
+    pub fn position(&self) -> usize {
+        match self {
+            Die::Null(pos) => *pos,
+            Die::NonNull(payload) => payload.position,
+        }
+    }
+
+    pub fn tag(&self) -> Option<u64> {
+        match self {
+            Die::Null(_) => None,
+            Die::NonNull(payload) => Some(payload.tag()),
+        }
+    }
+
+    pub fn has_children(&self) -> bool {
+        match self {
+            Die::Null(_) => false,
+            Die::NonNull(payload) => payload.has_children(),
+        }
+    }
+
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
+        let payload = match &self {
+            Die::Null(_) => return None,
+            Die::NonNull(die_payload) => die_payload,
+        };
+        payload.get_attr(attr)
+    }
+
+    pub fn low_pc(&self) -> Result<FileAddress<'a>> {
+        self.get_attr(DwAt::LowPc as u64)
+            .ok_or(anyhow!("Failed to get DwAt::LowPc for attr"))?
+            .as_address()
+    }
+
+    pub fn high_pc(&self) -> Result<FileAddress<'a>> {
+        /*
+        Building a Debugger. Page 322
+        For the high program counter value, we check the form. If the form is
+        an address, we extract it. Otherwise, the form must be an offset from the
+        low program counter, so we extract the low program counter and then offset
+        it with the high program counter attribute as an integer.
+         */
+        let attr = self
+            .get_attr(DwAt::HighPc as u64)
+            .ok_or(anyhow!("Failed to get DwAt::HighPc for attr"))?;
+        let address: usize = {
+            if attr.dw_form()? == DwForm::Addr {
+                attr.as_address()?.address
+            } else {
+                self.low_pc()?.address + attr.as_int()? as usize
+            }
+        };
+        Ok(FileAddress {
+            elf_handle: attr.compile_unit.elf,
+            address,
+        })
+    }
 }
 
-pub struct DieChildrenIter<'a, 'b> {
-    compile_unit: &'a CompileUnit<'a>,
-    dwarf: &'a Dwarf<'a>,
-    abbrev_table: &'b AbbrevTable,
-    current_offset: usize,
-    done: bool,
+impl<'a, 'b> DiePayload<'a, 'b> {
+    pub fn children(&self) -> DieChildrenIter<'a, 'b> {
+        DieChildrenIter {
+            compile_unit: self.compile_unit,
+            abbrev_table: self.abbrev_table,
+            current_offset: self.next,
+            done: !self.abbrev.has_children,
+        }
+    }
+
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
+        let specs = &self.abbrev.attr_specs;
+        for (index, spec) in specs.iter().enumerate() {
+            if spec.attr == attr {
+                return Some(Attr {
+                    form: spec.form,
+                    attr_type: spec.attr,
+                    compile_unit: self.compile_unit,
+                    location_offset: self.attr_locations[index],
+                });
+            }
+        }
+        None
+    }
+
+    pub fn tag(&self) -> u64 {
+        self.abbrev.tag
+    }
+
+    pub fn has_children(&self) -> bool {
+        self.abbrev.has_children
+    }
+
+    pub fn abbrev_code(&self) -> u64 {
+        self.abbrev.code
+    }
+
+    pub fn attr_specs(&self) -> &[AttrSpec] {
+        &self.abbrev.attr_specs
+    }
+
+    pub fn compile_unit(&self) -> &'a CompileUnit<'a> {
+        self.compile_unit
+    }
 }
 
 impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
@@ -379,121 +372,64 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
     }
 }
 
-impl<'a, 'b> DiePayload<'a, 'b> {
-    pub fn children(&self, parent_dwarf: &'a Dwarf<'a>) -> DieChildrenIter<'a, 'b> {
-        DieChildrenIter {
-            compile_unit: self.compile_unit,
-            dwarf: parent_dwarf,
-            abbrev_table: self.abbrev_table,
-            current_offset: self.next,
-            done: !self.abbrev.has_children,
+fn parse_die<'a, 'b>(
+    cursor: &mut Cursor,
+    compile_unit: &'a CompileUnit,
+    abbrev_table_cache: &'b mut AbbrevTableCache,
+) -> Result<Die<'a, 'b>> {
+    let abbrev_table = abbrev_table_cache.get_table_at_offset(compile_unit.abbrev_offset)?;
+    parse_die_raw(cursor, compile_unit, abbrev_table)
+}
+
+fn parse_die_raw<'a, 'b>(
+    cursor: &mut Cursor,
+    compile_unit: &'a CompileUnit,
+    abbrev_table: &'b AbbrevTable,
+) -> Result<Die<'a, 'b>> {
+    let position = cursor.position();
+    let abbrev_code = cursor.uleb128()?;
+    if abbrev_code == 0 {
+        return Ok(Die::Null(position));
+    }
+    let abbrev: &Abbrev = abbrev_table
+        .get(&abbrev_code)
+        .context("Failed to get abbrev entry from CU's abbrev_table")?;
+    let mut attr_locations = Vec::new();
+    attr_locations.reserve(abbrev.attr_specs.len());
+    for attr in &abbrev.attr_specs {
+        attr_locations.push(cursor.position());
+        cursor.skip_form(attr.form)?;
+    }
+    let next = cursor.position();
+    Ok(Die::NonNull(DiePayload {
+        position,
+        next,
+        compile_unit,
+        abbrev,
+        attr_locations,
+        abbrev_table,
+    }))
+}
+
+fn skip_children(cursor: &mut Cursor, abbrev_table: &AbbrevTable) -> Result<()> {
+    loop {
+        let code = cursor.uleb128()?;
+        if code == 0 {
+            return Ok(());
         }
-    }
-
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
-        let specs = &self.abbrev.attr_specs;
-        for (index, spec) in specs.iter().enumerate() {
-            if spec.attr == attr {
-                return Some(Attr {
-                    form: spec.form,
-                    attr_type: spec.attr,
-                    compile_unit: self.compile_unit,
-                    location_offset: self.attr_locations[index],
-                });
-            }
+        let abbrev = abbrev_table
+            .get(&code)
+            .ok_or_else(|| anyhow!("Unknown abbreviation code: {}", code))?;
+        for attr in &abbrev.attr_specs {
+            cursor.skip_form(attr.form)?;
         }
-        None
-    }
-
-    pub fn tag(&self) -> u64 {
-        self.abbrev.tag
-    }
-
-    pub fn has_children(&self) -> bool {
-        self.abbrev.has_children
-    }
-
-    pub fn abbrev_code(&self) -> u64 {
-        self.abbrev.code
-    }
-
-    pub fn attr_specs(&self) -> &[AttrSpec] {
-        &self.abbrev.attr_specs
-    }
-
-    pub fn compile_unit(&self) -> &'a CompileUnit<'a> {
-        self.compile_unit
+        if abbrev.has_children {
+            skip_children(cursor, abbrev_table)?;
+        }
     }
 }
 
-impl<'a, 'b> Die<'a, 'b> {
-    pub fn children(&self, parent_dwarf: &'a Dwarf<'a>) -> Option<DieChildrenIter<'a, 'b>> {
-        match self {
-            Die::Null(_) => None,
-            Die::NonNull(payload) => Some(payload.children(parent_dwarf)),
-        }
-    }
-
-    /// Offset of the start of this DIE within `compile_unit.data`.
-    pub fn position(&self) -> usize {
-        match self {
-            Die::Null(pos) => *pos,
-            Die::NonNull(payload) => payload.position,
-        }
-    }
-
-    pub fn tag(&self) -> Option<u64> {
-        match self {
-            Die::Null(_) => None,
-            Die::NonNull(payload) => Some(payload.tag()),
-        }
-    }
-
-    pub fn has_children(&self) -> bool {
-        match self {
-            Die::Null(_) => false,
-            Die::NonNull(payload) => payload.has_children(),
-        }
-    }
-
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
-        let payload = match &self {
-            Die::Null(_) => return None,
-            Die::NonNull(die_payload) => die_payload,
-        };
-        payload.get_attr(attr)
-    }
-
-    pub fn low_pc(&self) -> Result<FileAddress<'a>> {
-        self.get_attr(DwAt::LowPc as u64)
-            .ok_or(anyhow!("Failed to get DwAt::LowPc for attr"))?
-            .as_address()
-    }
-
-    pub fn high_pc(&self) -> Result<FileAddress<'a>> {
-        /*
-        Building a Debugger. Page 322
-        For the high program counter value, we check the form. If the form is
-        an address, we extract it. Otherwise, the form must be an offset from the
-        low program counter, so we extract the low program counter and then offset
-        it with the high program counter attribute as an integer.
-         */
-        let attr = self
-            .get_attr(DwAt::HighPc as u64)
-            .ok_or(anyhow!("Failed to get DwAt::HighPc for attr"))?;
-        let address: usize = {
-            if attr.dw_form()? == DwForm::Addr {
-                attr.as_address()?.address
-            } else {
-                self.low_pc()?.address + attr.as_int()? as usize
-            }
-        };
-        Ok(FileAddress {
-            elf_handle: attr.compile_unit.elf,
-            address,
-        })
-    }
-}
+// --- Attr / AttrSpec ---
 
 impl<'elf> Attr<'elf> {
     pub fn form(&self) -> u64 {
@@ -665,4 +601,79 @@ impl<'elf> Attr<'elf> {
             }
         }
     }
+}
+
+impl AttrSpec {
+    pub fn attr(&self) -> u64 {
+        self.attr
+    }
+    pub fn form(&self) -> u64 {
+        self.form
+    }
+}
+
+// --- Abbreviations ---
+
+impl<'elf> AbbrevTableCache<'elf> {
+    pub fn new(elf: &'elf Elf) -> AbbrevTableCache<'elf> {
+        AbbrevTableCache {
+            elf,
+            tables: HashMap::new(),
+        }
+    }
+
+    pub fn get_table_at_offset(&mut self, offset: usize) -> Result<&AbbrevTable> {
+        if !self.tables.contains_key(&offset) {
+            // Cache miss
+            self.tables
+                .insert(offset, parse_abbrev_table(self.elf, offset)?);
+        }
+        Ok(self.tables.get(&offset).unwrap())
+    }
+}
+
+fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
+    let section_buffer: &[u8] = elf
+        .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_abbrev\0").unwrap())
+        .context(format!(
+            "Failed to find the .debug_abbrev section in {:?}",
+            &elf.path
+        ))?;
+    let mut cursor = Cursor::new(&section_buffer);
+    cursor.increment_cursor_by(offset);
+    let mut table = HashMap::<u64, Abbrev>::new();
+    loop {
+        // Parse one entry
+        // We extract the ULEB128 for the code, the ULEB128 for the tag,
+        // the 1-byte unsigned integer for the children flag (which will be either
+        // 1 or 0), and the list of ULEB128 pairs of attribute types and forms,
+        // terminated by a pair of 0s.
+        let code = cursor.uleb128()?;
+        if code == 0 {
+            // Abbrev table is terminated by a single 0 byte (code 0).
+            break;
+        }
+        let tag = cursor.uleb128()?;
+        let has_children = cursor.read_u8()? > 0;
+        let mut attr_specs = Vec::<AttrSpec>::new();
+        loop {
+            let attr = cursor.uleb128()?;
+            let form = cursor.uleb128()?;
+            if attr == 0 {
+                // Attr, form list is terminated by a pair of 0s.
+                break;
+            }
+            attr_specs.push(AttrSpec { attr, form });
+        }
+        table.insert(
+            code,
+            Abbrev {
+                code,
+                tag,
+                has_children,
+                attr_specs,
+            },
+        );
+    }
+    return Ok(table);
 }
