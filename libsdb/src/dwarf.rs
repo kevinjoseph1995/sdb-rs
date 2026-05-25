@@ -93,15 +93,20 @@ pub struct AbbrevTableCache<'a> {
 pub struct RangeList<'elf> {
     compile_unit: &'elf CompileUnit<'elf>,
     data: &'elf [u8],
-    base_address: Option<FileAddress<'elf>>,
+    base_address: FileAddress<'elf>,
 }
 
-struct RangeListEntry<'elf> {
+pub struct RangeListEntry<'elf> {
     low: FileAddress<'elf>,
     high: FileAddress<'elf>,
 }
 
-struct RangeListIterator {}
+pub struct RangeListIterator<'elf> {
+    compile_unit: &'elf CompileUnit<'elf>,
+    data: &'elf [u8],
+    position: usize,
+    base_address: FileAddress<'elf>,
+}
 
 // ===================================================================
 
@@ -637,13 +642,16 @@ impl<'elf, 'b> Attr<'elf, 'b> {
         // Parse the offset stored at the current attribute position
         let offset = self.as_section_offset()? as usize;
         let data = &debug_ranges_bytes[offset..];
-        let base_address: Option<FileAddress<'elf>> = match self
+        let base_address: FileAddress<'elf> = match self
             .compile_unit
             .root_internal(&self.abbrev_table)?
             .get_attr(DwAt::LowPc as u64)
         {
-            Some(attr) => Some(attr.as_address()?),
-            None => None,
+            Some(attr) => attr.as_address()?,
+            None => FileAddress {
+                elf_handle: self.compile_unit.elf,
+                address: 0usize,
+            },
         };
         Ok(RangeList {
             compile_unit: self.compile_unit,
@@ -726,4 +734,75 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
         );
     }
     return Ok(table);
+}
+
+// --- Range Lists ---
+
+impl<'elf> RangeList<'elf> {
+    pub fn iter(&self) -> RangeListIterator<'elf> {
+        RangeListIterator {
+            compile_unit: self.compile_unit,
+            data: self.data,
+            position: 0usize,
+            base_address: self.base_address,
+        }
+    }
+
+    fn contains(&self, address: FileAddress) -> bool {
+        self.iter().find(|entry| entry.contains(address)).is_some()
+    }
+}
+
+impl<'elf> RangeListEntry<'elf> {
+    fn contains(&self, address: FileAddress) -> bool {
+        return self.low <= address && address < self.high;
+    }
+}
+
+impl<'elf> Iterator for RangeListIterator<'elf> {
+    type Item = RangeListEntry<'elf>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        /*
+        * The .debug_range section consists of a series of entries of three possible kinds:
+            - regular range list entries
+            - base address selectors(which change how we should interpret regular entries)
+            - end-of-list indicators
+        * All range list entries consist of two integers with a byte size identical to the address size of the machine(8 bytes, on x64).
+            - Regular entries:
+                - A beginning address offset relative to the current base address.
+                - An ending address offset relative to the current base address.
+            - Base address selectors
+                - An integer with all bits set, which indicates that this entry is a base address selector.
+                - An integer that sets the base address from which all future range list entries should be considered an offset.
+                  (until the base address is changed again or the list ends)
+            - End-of-list indicator has both integers set to 0.
+
+         */
+        const BASE_ADDRESS_FLAG: u64 = u64::MAX;
+        let mut cursor = Cursor::new(&self.data[self.position..]);
+        loop {
+            let low: u64 = cursor
+                .read_u64()
+                .expect("Failed to extract range-list entry low");
+            let high: u64 = cursor
+                .read_u64()
+                .expect("Failed to extract range-list entry high");
+            if low == BASE_ADDRESS_FLAG {
+                self.base_address = FileAddress {
+                    elf_handle: self.compile_unit.elf,
+                    address: high as usize,
+                };
+            } else if low == 0 && high == 0 {
+                // Should end iteration as we're at the End-of-list indicator.
+                return None;
+            } else {
+                self.position = cursor.position();
+                return Some(RangeListEntry {
+                    low: self.base_address + low as usize,
+                    high: self.base_address + high as usize,
+                });
+            }
+        }
+    }
 }
