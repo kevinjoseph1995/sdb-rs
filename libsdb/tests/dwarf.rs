@@ -506,7 +506,7 @@ fn build_lockstep_data() -> LockstepData {
 
         // Holds (record_index_in_all_records, attr_index_in_record, attr).
         // Filled during walk, drained after `libsdb_root` is dropped.
-        let mut pending_refs: Vec<(usize, usize, Attr<'static>)> = Vec::new();
+        let mut pending_refs: Vec<(usize, usize, Attr<'static, 'static>)> = Vec::new();
 
         {
             let libsdb_root = libsdb_cu
@@ -619,7 +619,7 @@ fn walk_lockstep<'a, 'b>(
     gimli_unit_section_offset: usize,
     gimli_node: gimli::EntriesTreeNode<GimliReader<'a>>,
     out: &mut Vec<DieRecord>,
-    pending_refs: &mut Vec<(usize, usize, Attr<'a>)>,
+    pending_refs: &mut Vec<(usize, usize, Attr<'a, 'a>)>,
 ) {
     let gimli_entry = gimli_node.entry();
     let payload = match libsdb_die {
@@ -727,7 +727,7 @@ fn walk_lockstep<'a, 'b>(
                 // any &mut on the abbrev cache. Transmuting the inner lifetime
                 // is a workaround for the test's 'static dwarf reference; the
                 // referenced data outlives the test.
-                let attr_static: Attr<'static> = unsafe { std::mem::transmute(attr) };
+                let attr_static: Attr<'static, 'static> = unsafe { std::mem::transmute(attr) };
                 pending_refs.push((record_index, attr_idx, attr_static));
             }
         }

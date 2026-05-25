@@ -57,11 +57,12 @@ pub struct DieChildrenIter<'a, 'b> {
 
 // --- Attributes
 
-pub struct Attr<'elf> {
+pub struct Attr<'elf, 'b> {
     form: u64,
     attr_type: u64,
     compile_unit: &'elf CompileUnit<'elf>,
     location_offset: usize, // Offset in compile_unit.data
+    abbrev_table: &'b AbbrevTable,
 }
 
 pub struct AttrSpec {
@@ -86,6 +87,22 @@ pub struct AbbrevTableCache<'a> {
     elf: &'a Elf,
     tables: HashMap<usize /*offset into the .debug_abbrev section*/, AbbrevTable>,
 }
+
+// --- Range list related types
+
+pub struct RangeList<'elf> {
+    compile_unit: &'elf CompileUnit<'elf>,
+    data: &'elf [u8],
+    base_address: Option<FileAddress<'elf>>,
+}
+
+struct RangeListEntry<'elf> {
+    low: FileAddress<'elf>,
+    high: FileAddress<'elf>,
+}
+
+struct RangeListIterator {}
+
 // ===================================================================
 
 // --- Dwarf ---
@@ -191,6 +208,11 @@ impl<'elf> CompileUnit<'elf> {
         let mut cursor = Cursor::new(self.data);
         return parse_die(&mut cursor, &self, abbrev_table_cache);
     }
+
+    fn root_internal<'a, 'b>(&'a self, abbrev_table: &'b AbbrevTable) -> Result<Die<'a, 'b>> {
+        let mut cursor = Cursor::new(self.data);
+        return parse_die_raw(&mut cursor, &self, abbrev_table);
+    }
 }
 
 // --- Die / DiePayload / DieChildrenIter ---
@@ -225,7 +247,7 @@ impl<'a, 'b> Die<'a, 'b> {
         }
     }
 
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a, 'b>> {
         let payload = match &self {
             Die::Null(_) => return None,
             Die::NonNull(die_payload) => die_payload,
@@ -274,7 +296,7 @@ impl<'a, 'b> DiePayload<'a, 'b> {
         }
     }
 
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a>> {
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'a, 'b>> {
         let specs = &self.abbrev.attr_specs;
         for (index, spec) in specs.iter().enumerate() {
             if spec.attr == attr {
@@ -283,6 +305,7 @@ impl<'a, 'b> DiePayload<'a, 'b> {
                     attr_type: spec.attr,
                     compile_unit: self.compile_unit,
                     location_offset: self.attr_locations[index],
+                    abbrev_table: self.abbrev_table,
                 });
             }
         }
@@ -431,7 +454,7 @@ fn skip_children(cursor: &mut Cursor, abbrev_table: &AbbrevTable) -> Result<()> 
 
 // --- Attr / AttrSpec ---
 
-impl<'elf> Attr<'elf> {
+impl<'elf, 'b> Attr<'elf, 'b> {
     pub fn form(&self) -> u64 {
         self.form
     }
@@ -503,7 +526,7 @@ impl<'elf> Attr<'elf> {
         Ok(buffer)
     }
 
-    pub fn as_reference<'b>(
+    pub fn as_reference(
         &self,
         dwarf: &'elf Dwarf<'elf>,
         abbrev_cache: &'b mut AbbrevTableCache<'elf>,
@@ -600,6 +623,33 @@ impl<'elf> Attr<'elf> {
                 return Err(anyhow!("Invalid form for as_string: {:?}", other));
             }
         }
+    }
+
+    pub fn as_range_list(&self) -> Result<RangeList<'elf>> {
+        let debug_ranges_bytes = self
+            .compile_unit
+            .elf
+            .get_section_content_by_name(
+                &CStr::from_bytes_until_nul(b".debug_ranges")
+                    .expect("Bytes -> &CStr conversion failed"),
+            )
+            .ok_or(anyhow!("Failed to find .debug_ranges"))?;
+        // Parse the offset stored at the current attribute position
+        let offset = self.as_section_offset()? as usize;
+        let data = &debug_ranges_bytes[offset..];
+        let base_address: Option<FileAddress<'elf>> = match self
+            .compile_unit
+            .root_internal(&self.abbrev_table)?
+            .get_attr(DwAt::LowPc as u64)
+        {
+            Some(attr) => Some(attr.as_address()?),
+            None => None,
+        };
+        Ok(RangeList {
+            compile_unit: self.compile_unit,
+            data,
+            base_address,
+        })
     }
 }
 
