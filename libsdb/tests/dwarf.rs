@@ -2,7 +2,7 @@ use std::{ffi::CString, path::PathBuf, sync::OnceLock};
 
 use libsdb::{
     cursor::Cursor,
-    dwarf::{AbbrevTableCache, COMPILE_UNIT_HEADER_SIZE, Die, Dwarf},
+    dwarf::{COMPILE_UNIT_HEADER_SIZE, Die, Dwarf},
     elf::Elf,
 };
 use test_binary::TestBinary;
@@ -232,7 +232,6 @@ fn test_dwarf_die_tree_traversal() {
         .expect("Failed to build test binary"),
     );
     let elf = Elf::new(&test_executable).expect("Failed to create Elf object");
-    let mut abbrev_table = AbbrevTableCache::new(&elf);
     let dwarf = Dwarf::new(&elf).expect("Failed to parse Dwarf object");
 
     // validate the number of compile units (and per-unit root-child counts)
@@ -241,8 +240,8 @@ fn test_dwarf_die_tree_traversal() {
     assert_eq!(dwarf.compile_units.len(), expected_child_counts.len());
 
     for (compile_unit, expected) in dwarf.compile_units.iter().zip(expected_child_counts.iter()) {
-        let root = compile_unit
-            .root(&mut abbrev_table)
+        let root = dwarf
+            .root_of(compile_unit)
             .expect("Failed to get root");
 
         // The root of a compile unit is always a DW_TAG_compile_unit DIE,
@@ -296,18 +295,16 @@ fn test_dwarf_die_tree_traversal() {
 //
 // Two-phase libsdb extraction
 // ---------------------------
-// Building a record needs two passes over libsdb's DIE tree because of how
-// the borrow checker pairs with `AbbrevTableCache`:
+// Building a record uses two passes over libsdb's DIE tree to keep the
+// data collection and reference resolution concerns separate:
 //
-//   Phase 1 (inside `walk_lockstep`): the libsdb DIE iterator holds the
-//     abbrev cache borrowed `&mut`. We record everything we can derive
-//     without further cache use — tags, attr specs, addresses, integers,
-//     strings, blocks, and the CU-local *position* of references.
+//   Phase 1 (inside `walk_lockstep`): record everything derivable without
+//     resolving references — tags, attr specs, addresses, integers, strings,
+//     blocks, and the CU-local *position* of references.
 //
-//   Phase 2 (after the walk returns, abbrev cache borrow released): for
-//     every queued reference attribute, call `Attr::as_reference()` to
-//     resolve the target DIE and stash its absolute `.debug_info` offset
-//     in `LibsdbDieData::resolved_ref_targets`.
+//   Phase 2 (after the walk returns): for every queued reference attribute,
+//     call `Attr::as_reference()` to resolve the target DIE and stash its
+//     absolute `.debug_info` offset in `LibsdbDieData::resolved_ref_targets`.
 //
 // Phase-1 results in `attr_values` are never overwritten by phase 2 —
 // the two phases write to different fields. That means the `CuLocalRefPos`
@@ -474,7 +471,6 @@ fn build_lockstep_data() -> LockstepData {
     let elf: &'static Elf = Box::leak(Box::new(elf));
     let dwarf = Dwarf::new(elf).expect("Failed to parse DWARF");
     let dwarf: &'static Dwarf<'static> = Box::leak(Box::new(dwarf));
-    let mut abbrev_cache = AbbrevTableCache::new(elf);
 
     // First collect gimli's per-unit data (headers + units).
     let mut gimli_units: Vec<gimli::Unit<GimliReader<'static>>> = Vec::new();
@@ -489,9 +485,7 @@ fn build_lockstep_data() -> LockstepData {
     );
 
     let mut all_records: Vec<DieRecord> = Vec::new();
-    // (record_index, attr_index, source attr) — resolved AFTER each CU walk
-    // (so libsdb's `Die` and its &mut borrow of abbrev_cache have been
-    // released).
+    // (record_index, attr_index, source attr) — resolved AFTER each CU walk.
     let cu_count = dwarf.compile_units.len();
 
     for cu_index in 0..cu_count {
@@ -509,9 +503,9 @@ fn build_lockstep_data() -> LockstepData {
         let mut pending_refs: Vec<(usize, usize, Attr<'static, 'static>)> = Vec::new();
 
         {
-            let libsdb_root = libsdb_cu
-                .root(&mut abbrev_cache)
-                .expect("libsdb cu.root failed");
+            let libsdb_root = dwarf
+                .root_of(libsdb_cu)
+                .expect("libsdb root_of failed");
             let mut tree = gimli_unit
                 .entries_tree(None)
                 .expect("gimli entries_tree failed");
@@ -530,13 +524,10 @@ fn build_lockstep_data() -> LockstepData {
             );
         }
 
-        // Phase 2 — resolve references now that the abbrev cache is no
-        // longer borrowed by the live DIE iterator. Results land in the
-        // record's `resolved_ref_targets` slot for the attr; phase-1
-        // `attr_values` is left alone.
+        // Phase 2 — resolve references. Results land in the record's
+        // `resolved_ref_targets` slot; phase-1 `attr_values` is left alone.
         for (rec_idx, attr_idx, attr) in pending_refs {
-            let resolved: Result<usize, String> = match attr.as_reference(dwarf, &mut abbrev_cache)
-            {
+            let resolved: Result<usize, String> = match attr.as_reference(dwarf) {
                 Ok(target_die) => match &target_die {
                     Die::NonNull(p) => Ok(p.compile_unit().debug_info_offset()
                         + COMPILE_UNIT_HEADER_SIZE
@@ -1312,25 +1303,24 @@ fn count_gimli_subtree<R: gimli::Reader>(node: gimli::EntriesTreeNode<R>) -> usi
 
 #[test]
 fn abbrev_cache_returns_same_table_for_same_offset() {
+    // The cache is now internal to Dwarf. Verify consistent behavior by
+    // calling root_of twice on the same CU and checking identical results.
     let path = fixture_binary_path();
     let elf = Elf::new(path).expect("Elf");
-    let mut cache = AbbrevTableCache::new(&elf);
-
-    // Use the offset of CU 0's abbrev table.
     let dwarf = Dwarf::new(&elf).expect("Dwarf");
-    let offset = dwarf.compile_units[0].abbrev_offset();
+    let cu = &dwarf.compile_units[0];
 
-    let addr1 = {
-        let t = cache.get_table_at_offset(offset).expect("first lookup");
-        t as *const _ as usize
-    };
-    let addr2 = {
-        let t = cache.get_table_at_offset(offset).expect("second lookup");
-        t as *const _ as usize
-    };
+    let root1 = dwarf.root_of(cu).expect("first root_of");
+    let root2 = dwarf.root_of(cu).expect("second root_of");
     assert_eq!(
-        addr1, addr2,
-        "AbbrevTableCache returned different table addresses for the same offset"
+        root1.tag(),
+        root2.tag(),
+        "root DIE tag differed between two root_of calls on the same CU"
+    );
+    assert_eq!(
+        root1.position(),
+        root2.position(),
+        "root DIE position differed between two root_of calls on the same CU"
     );
 }
 

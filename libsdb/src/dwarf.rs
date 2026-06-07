@@ -3,6 +3,7 @@ use crate::elf::Elf;
 use crate::{address::FileAddress, cursor::Cursor};
 use anyhow::{Context, Result, anyhow};
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::{collections::HashMap, ffi::CStr};
 
 /// Size of the DWARF v4 compile unit header in DWARF32 format:
@@ -56,11 +57,11 @@ where
     /// The compile unit that owns this Die
     compile_unit: &'dwarf CompileUnit<'elf>,
     /// abbrev entry for this DIE
-    abbrev: &'dwarf Abbrev,
+    abbrev: Rc<Abbrev>,
     /// Offsets within `compile_unit.data` where each attribute's value bytes live.
     attr_locations: Vec<usize>,
     /// Abbrev table
-    abbrev_table: &'dwarf AbbrevTable,
+    abbrev_table: Rc<AbbrevTable>,
 }
 
 pub struct DieChildrenIter<'elf, 'dwarf>
@@ -68,7 +69,7 @@ where
     'elf: 'dwarf,
 {
     compile_unit: &'dwarf CompileUnit<'elf>,
-    abbrev_table: &'dwarf AbbrevTable,
+    abbrev_table: Rc<AbbrevTable>,
     current_offset: usize,
     done: bool,
 }
@@ -83,7 +84,7 @@ where
     attr_type: u64,
     compile_unit: &'dwarf CompileUnit<'elf>,
     location_offset: usize, // Offset in compile_unit.data
-    abbrev_table: &'dwarf AbbrevTable,
+    abbrev_table: Rc<AbbrevTable>,
 }
 
 pub struct AttrSpec {
@@ -103,10 +104,11 @@ pub struct Abbrev {
 /// unit in the .debug_info section uses exactly one abbreviation table, but different
 /// compile units may share the same table.
 /// Maps byte offsets to another map, of integers to abbreviation entries.
-pub type AbbrevTable = HashMap<u64 /* abbreviation code*/, Abbrev>;
-pub struct AbbrevTableCache<'a> {
+pub type AbbrevTable = HashMap<u64 /* abbreviation code*/, Rc<Abbrev>>;
+
+struct AbbrevTableCache<'a> {
     elf: &'a Elf,
-    tables: HashMap<usize /*offset into the .debug_abbrev section*/, AbbrevTable>,
+    tables: HashMap<usize /*offset into the .debug_abbrev section*/, Rc<AbbrevTable>>,
 }
 
 // --- Range list related types
@@ -152,44 +154,46 @@ impl<'elf> Dwarf<'elf> {
         })
     }
 
-    pub fn compile_unit_containing_address<'slf, 'b>(
-        &'slf self,
+    fn get_abbrev_table(&self, offset: usize) -> Result<Rc<AbbrevTable>> {
+        self.abbrev_table_cache.borrow_mut().get_table_at_offset(offset)
+    }
+
+    pub fn root_of<'a>(&'a self, cu: &'a CompileUnit<'elf>) -> Result<Die<'elf, 'a>> {
+        let table = self.get_abbrev_table(cu.abbrev_offset)?;
+        cu.root(table)
+    }
+
+    pub fn compile_unit_containing_address(
+        &self,
         address: FileAddress<'elf>,
-        abbrev_table: &'b AbbrevTable,
-    ) -> Option<&'slf CompileUnit<'elf>> {
+    ) -> Option<&CompileUnit<'elf>> {
         self.compile_units.iter().find(|&compile_unit| {
-            if compile_unit
+            let abbrev_table = self
+                .get_abbrev_table(compile_unit.abbrev_offset)
+                .expect("Failed to get abbrev table");
+            compile_unit
                 .root_internal(abbrev_table)
                 .expect("Failed to extract root DIE from compile unit")
                 .contains(address)
-            {
-                return true;
-            }
-            return false;
         })
     }
 
-    pub fn function_containing_address<'b>(
-        &mut self,
-        address: FileAddress<'elf>,
-        abbrev_table: &'b AbbrevTable,
-    ) -> Option<Die<'elf, 'b>> {
+    pub fn function_containing_address(&mut self, address: FileAddress<'elf>) -> Option<Die<'elf, 'elf>> {
         self.index();
 
-        // (func1, [index_entry1, index_entry2]), (func2, [index_entry1]), ...
-        // (func1, index_entry1), (func1, index_entry2), (func2, index_entry1)...
-        for (_function_name, index_entry) in
-            self.function_index
-                .iter()
-                .flat_map(|(function_name, index_entries)| {
-                    index_entries
-                        .iter()
-                        .map(move |index_entry| (function_name, index_entry))
-                })
-        {
-            let mut cursor = Cursor::new(&index_entry.compile_unit.data[index_entry.offset..]);
-            let die = parse_die_raw(&mut cursor, index_entry.compile_unit, abbrev_table)
-                .expect("Failed to parse DIE");
+        let entries: Vec<(&'elf CompileUnit<'elf>, usize)> = self
+            .function_index
+            .values()
+            .flatten()
+            .map(|e| (e.compile_unit, e.offset))
+            .collect();
+
+        for (cu, offset) in entries {
+            let abbrev_table = self
+                .get_abbrev_table(cu.abbrev_offset)
+                .expect("Failed to get abbrev table");
+            let mut cursor = Cursor::new(&cu.data[offset..]);
+            let die = parse_die_raw(&mut cursor, cu, abbrev_table).expect("Failed to parse DIE");
             match (die.contains(address), &die) {
                 (true, Die::NonNull(die_payload)) => {
                     if die_payload.abbrev.tag == crate::dwarf_constants::DwTag::Subprogram as u64 {
@@ -199,31 +203,33 @@ impl<'elf> Dwarf<'elf> {
                 _ => {}
             }
         }
-        return None;
+        None
     }
 
-    pub fn find_functions<'b>(
-        &mut self,
-        function_name: &str,
-        abbrev_table: &'b AbbrevTable,
-    ) -> Vec<Die<'elf, 'b>> {
+    pub fn find_functions(&mut self, function_name: &str) -> Vec<Die<'elf, 'elf>> {
         self.index();
-        let index_entries = match self.function_index.get(function_name) {
-            Some(index_entries) => index_entries,
-            None => return Vec::new(),
-        };
 
-        index_entries
-            .iter()
-            .map(|index_entry| {
-                let mut cursor = Cursor::new(&index_entry.compile_unit.data[index_entry.offset..]);
-                parse_die_raw(&mut cursor, index_entry.compile_unit, abbrev_table)
-                    .expect("Failed to parse DIE")
+        let entries: Vec<(&'elf CompileUnit<'elf>, usize)> =
+            match self.function_index.get(function_name) {
+                Some(index_entries) => {
+                    index_entries.iter().map(|e| (e.compile_unit, e.offset)).collect()
+                }
+                None => return Vec::new(),
+            };
+
+        entries
+            .into_iter()
+            .map(|(cu, offset)| {
+                let abbrev_table = self
+                    .get_abbrev_table(cu.abbrev_offset)
+                    .expect("Failed to get abbrev table");
+                let mut cursor = Cursor::new(&cu.data[offset..]);
+                parse_die_raw(&mut cursor, cu, abbrev_table).expect("Failed to parse DIE")
             })
             .collect()
     }
 
-    fn index<'b>(&mut self) {
+    fn index(&mut self) {
         todo!()
     }
 
@@ -290,7 +296,7 @@ fn parse_compile_unit<'elf>(
     if address_size != 8 {
         return Err(anyhow!("Invalid address size for DWARF"));
     }
-    // "because the reported size in the compile unit header doesn’t include the size field itself"
+    // "because the reported size in the compile unit header doesn't include the size field itself"
     size += std::mem::size_of::<u32>() as u32;
     let end = start + size as usize;
     // `data` is the DIE stream only — the CU header has already been consumed
@@ -321,18 +327,18 @@ impl<'elf> CompileUnit<'elf> {
 
     pub fn root<'dwarf>(
         &'dwarf self,
-        abbrev_table_cache: &'dwarf mut AbbrevTableCache,
+        abbrev_table: Rc<AbbrevTable>,
     ) -> Result<Die<'elf, 'dwarf>> {
         let mut cursor = Cursor::new(self.data);
-        return parse_die(&mut cursor, &self, abbrev_table_cache);
+        parse_die_raw(&mut cursor, self, abbrev_table)
     }
 
     fn root_internal<'dwarf>(
         &'dwarf self,
-        abbrev_table: &'dwarf AbbrevTable,
+        abbrev_table: Rc<AbbrevTable>,
     ) -> Result<Die<'elf, 'dwarf>> {
         let mut cursor = Cursor::new(self.data);
-        return parse_die_raw(&mut cursor, &self, abbrev_table);
+        parse_die_raw(&mut cursor, self, abbrev_table)
     }
 }
 
@@ -467,7 +473,7 @@ impl<'elf, 'dwarf> DiePayload<'elf, 'dwarf> {
     pub fn children(&self) -> DieChildrenIter<'elf, 'dwarf> {
         DieChildrenIter {
             compile_unit: self.compile_unit,
-            abbrev_table: self.abbrev_table,
+            abbrev_table: Rc::clone(&self.abbrev_table),
             current_offset: self.next,
             done: !self.abbrev.has_children,
         }
@@ -482,7 +488,7 @@ impl<'elf, 'dwarf> DiePayload<'elf, 'dwarf> {
                     attr_type: spec.attr,
                     compile_unit: self.compile_unit,
                     location_offset: self.attr_locations[index],
-                    abbrev_table: self.abbrev_table,
+                    abbrev_table: Rc::clone(&self.abbrev_table),
                 });
             }
         }
@@ -521,7 +527,7 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
         let mut cursor = Cursor::new(die_data);
         cursor.increment_cursor_by(self.current_offset);
 
-        match parse_die_raw(&mut cursor, self.compile_unit, self.abbrev_table) {
+        match parse_die_raw(&mut cursor, self.compile_unit, Rc::clone(&self.abbrev_table)) {
             Err(e) => {
                 self.done = true;
                 Some(Err(e))
@@ -554,7 +560,7 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
                     } else {
                         let mut skip_cursor = Cursor::new(die_data);
                         skip_cursor.increment_cursor_by(payload.next);
-                        match skip_children(&mut skip_cursor, self.abbrev_table) {
+                        match skip_children(&mut skip_cursor, &self.abbrev_table) {
                             Ok(()) => skip_cursor.position(),
                             Err(e) => {
                                 self.done = true;
@@ -572,28 +578,20 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
     }
 }
 
-fn parse_die<'elf, 'dwarf>(
-    cursor: &mut Cursor,
-    compile_unit: &'dwarf CompileUnit<'elf>,
-    abbrev_table_cache: &'dwarf mut AbbrevTableCache,
-) -> Result<Die<'elf, 'dwarf>> {
-    let abbrev_table = abbrev_table_cache.get_table_at_offset(compile_unit.abbrev_offset)?;
-    parse_die_raw(cursor, compile_unit, abbrev_table)
-}
-
 fn parse_die_raw<'elf, 'dwarf>(
     cursor: &mut Cursor,
     compile_unit: &'dwarf CompileUnit<'elf>,
-    abbrev_table: &'dwarf AbbrevTable,
+    abbrev_table: Rc<AbbrevTable>,
 ) -> Result<Die<'elf, 'dwarf>> {
     let position = cursor.position();
     let abbrev_code = cursor.uleb128()?;
     if abbrev_code == 0 {
         return Ok(Die::Null(position));
     }
-    let abbrev: &Abbrev = abbrev_table
+    let abbrev: Rc<Abbrev> = abbrev_table
         .get(&abbrev_code)
-        .context("Failed to get abbrev entry from CU's abbrev_table")?;
+        .context("Failed to get abbrev entry from CU's abbrev_table")?
+        .clone();
     let mut attr_locations = Vec::new();
     attr_locations.reserve(abbrev.attr_specs.len());
     for attr in &abbrev.attr_specs {
@@ -703,11 +701,7 @@ impl<'elf, 'dwarf> Attr<'elf, 'dwarf> {
         Ok(buffer)
     }
 
-    pub fn as_reference(
-        &self,
-        dwarf: &'elf Dwarf<'elf>,
-        abbrev_cache: &'dwarf mut AbbrevTableCache<'elf>,
-    ) -> Result<Die<'elf, 'dwarf>> {
+    pub fn as_reference(&self, dwarf: &'dwarf Dwarf<'elf>) -> Result<Die<'elf, 'dwarf>> {
         let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
         let (target_cu, cu_relative_offset): (&'dwarf CompileUnit<'elf>, usize) =
             match self.dw_form()? {
@@ -748,7 +742,7 @@ impl<'elf, 'dwarf> Attr<'elf, 'dwarf> {
         // The target CU may use a different abbrev table than `self.compile_unit`
         // (DW_FORM_ref_addr can cross CU boundaries), so look it up by the target's
         // abbrev_offset rather than reusing the caller's table.
-        let abbrev_table = abbrev_cache.get_table_at_offset(target_cu.abbrev_offset)?;
+        let abbrev_table = dwarf.get_abbrev_table(target_cu.abbrev_offset)?;
         let mut reference_cursor = Cursor::new(target_cu.data);
         reference_cursor.increment_cursor_by(data_offset);
         parse_die_raw(&mut reference_cursor, target_cu, abbrev_table)
@@ -756,8 +750,7 @@ impl<'elf, 'dwarf> Attr<'elf, 'dwarf> {
 
     /// Reads a CU-local reference and returns the target DIE's position within
     /// `compile_unit.data`. Rejects `DW_FORM_ref_addr` (which may cross CU
-    /// boundaries) — callers needing that must use [`Attr::as_reference`] with
-    /// an abbrev table cache.
+    /// boundaries) — callers needing cross-CU references must use [`Attr::as_reference`].
     pub fn as_cu_local_reference_position(&self) -> Result<usize> {
         let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
         let cu_relative_offset = match self.dw_form()? {
@@ -816,7 +809,7 @@ impl<'elf, 'dwarf> Attr<'elf, 'dwarf> {
         let data = &debug_ranges_bytes[offset..];
         let base_address = match self
             .compile_unit
-            .root_internal(self.abbrev_table)?
+            .root_internal(Rc::clone(&self.abbrev_table))?
             .get_attr(DwAt::LowPc as u64)
         {
             Some(attr) => attr.as_address()?,
@@ -845,20 +838,13 @@ impl AttrSpec {
 // --- Abbreviations ---
 
 impl<'elf> AbbrevTableCache<'elf> {
-    pub fn new(elf: &'elf Elf) -> AbbrevTableCache<'elf> {
-        AbbrevTableCache {
-            elf,
-            tables: HashMap::new(),
-        }
-    }
-
-    pub fn get_table_at_offset(&mut self, offset: usize) -> Result<&AbbrevTable> {
+    fn get_table_at_offset(&mut self, offset: usize) -> Result<Rc<AbbrevTable>> {
         if !self.tables.contains_key(&offset) {
             // Cache miss
             self.tables
-                .insert(offset, parse_abbrev_table(self.elf, offset)?);
+                .insert(offset, Rc::new(parse_abbrev_table(self.elf, offset)?));
         }
-        Ok(self.tables.get(&offset).unwrap())
+        Ok(Rc::clone(self.tables.get(&offset).unwrap()))
     }
 }
 
@@ -871,7 +857,7 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
         ))?;
     let mut cursor = Cursor::new(&section_buffer);
     cursor.increment_cursor_by(offset);
-    let mut table = HashMap::<u64, Abbrev>::new();
+    let mut table = HashMap::<u64, Rc<Abbrev>>::new();
     loop {
         // Parse one entry
         // We extract the ULEB128 for the code, the ULEB128 for the tag,
@@ -897,12 +883,12 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
         }
         table.insert(
             code,
-            Abbrev {
+            Rc::new(Abbrev {
                 code,
                 tag,
                 has_children,
                 attr_specs,
-            },
+            }),
         );
     }
     return Ok(table);
