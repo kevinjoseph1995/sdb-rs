@@ -11,9 +11,9 @@ use std::{collections::HashMap, ffi::CStr};
 pub const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 
 // --- Top-level DWARF handle
-pub struct Dwarf<'elf> {
+pub struct Dwarf<'elf, 'dwarf> {
     pub compile_units: Vec<CompileUnit<'elf>>,
-    function_index: HashMap<String, Vec<IndexEntry<'elf>>>,
+    function_index: HashMap<String, Vec<IndexEntry<'elf, 'dwarf>>>,
     abbrev_table_cache: RefCell<AbbrevTableCache<'elf>>,
 }
 
@@ -29,8 +29,11 @@ pub struct CompileUnit<'elf> {
     elf: &'elf Elf,
 }
 
-struct IndexEntry<'elf> {
-    compile_unit: &'elf CompileUnit<'elf>,
+struct IndexEntry<'elf, 'dwarf>
+where
+    'elf: 'dwarf,
+{
+    compile_unit: &'dwarf CompileUnit<'elf>,
     offset: usize,
 }
 
@@ -141,8 +144,8 @@ where
 
 // --- Dwarf ---
 
-impl<'elf> Dwarf<'elf> {
-    pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
+impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
+    pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf, 'dwarf>> {
         let compile_units = parse_compile_units(elf)?;
         Ok(Dwarf {
             compile_units,
@@ -155,10 +158,12 @@ impl<'elf> Dwarf<'elf> {
     }
 
     fn get_abbrev_table(&self, offset: usize) -> Result<Rc<AbbrevTable>> {
-        self.abbrev_table_cache.borrow_mut().get_table_at_offset(offset)
+        self.abbrev_table_cache
+            .borrow_mut()
+            .get_table_at_offset(offset)
     }
 
-    pub fn root_of<'a>(&'a self, cu: &'a CompileUnit<'elf>) -> Result<Die<'elf, 'a>> {
+    pub fn root_of(&'dwarf self, cu: &'dwarf CompileUnit<'elf>) -> Result<Die<'elf, 'dwarf>> {
         let table = self.get_abbrev_table(cu.abbrev_offset)?;
         cu.root(table)
     }
@@ -178,10 +183,13 @@ impl<'elf> Dwarf<'elf> {
         })
     }
 
-    pub fn function_containing_address(&mut self, address: FileAddress<'elf>) -> Option<Die<'elf, 'elf>> {
+    pub fn function_containing_address(
+        &'dwarf mut self,
+        address: FileAddress<'elf>,
+    ) -> Option<Die<'elf, 'dwarf>> {
         self.index();
 
-        let entries: Vec<(&'elf CompileUnit<'elf>, usize)> = self
+        let entries: Vec<(&'dwarf CompileUnit<'elf>, usize)> = self
             .function_index
             .values()
             .flatten()
@@ -206,14 +214,15 @@ impl<'elf> Dwarf<'elf> {
         None
     }
 
-    pub fn find_functions(&mut self, function_name: &str) -> Vec<Die<'elf, 'elf>> {
+    pub fn find_functions(&'dwarf mut self, function_name: &str) -> Vec<Die<'elf, 'dwarf>> {
         self.index();
 
-        let entries: Vec<(&'elf CompileUnit<'elf>, usize)> =
+        let entries: Vec<(&'dwarf CompileUnit<'elf>, usize)> =
             match self.function_index.get(function_name) {
-                Some(index_entries) => {
-                    index_entries.iter().map(|e| (e.compile_unit, e.offset)).collect()
-                }
+                Some(index_entries) => index_entries
+                    .iter()
+                    .map(|e| (e.compile_unit, e.offset))
+                    .collect(),
                 None => return Vec::new(),
             };
 
@@ -238,11 +247,11 @@ impl<'elf> Dwarf<'elf> {
     }
 }
 
-fn find_cu_containing<'a, 'elf>(
-    dwarf: &'a Dwarf<'elf>,
+fn find_cu_containing<'elf, 'dwarf>(
+    dwarf: &'dwarf Dwarf<'elf, 'dwarf>,
     abs_offset: usize,
 ) -> Result<(
-    &'a CompileUnit<'elf>,
+    &'dwarf CompileUnit<'elf>,
     usize, /*Offset relative to the found CU */
 )> {
     let cu = dwarf
@@ -325,10 +334,7 @@ impl<'elf> CompileUnit<'elf> {
         self.abbrev_offset
     }
 
-    pub fn root<'dwarf>(
-        &'dwarf self,
-        abbrev_table: Rc<AbbrevTable>,
-    ) -> Result<Die<'elf, 'dwarf>> {
+    pub fn root<'dwarf>(&'dwarf self, abbrev_table: Rc<AbbrevTable>) -> Result<Die<'elf, 'dwarf>> {
         let mut cursor = Cursor::new(self.data);
         parse_die_raw(&mut cursor, self, abbrev_table)
     }
@@ -527,7 +533,11 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
         let mut cursor = Cursor::new(die_data);
         cursor.increment_cursor_by(self.current_offset);
 
-        match parse_die_raw(&mut cursor, self.compile_unit, Rc::clone(&self.abbrev_table)) {
+        match parse_die_raw(
+            &mut cursor,
+            self.compile_unit,
+            Rc::clone(&self.abbrev_table),
+        ) {
             Err(e) => {
                 self.done = true;
                 Some(Err(e))
@@ -701,7 +711,7 @@ impl<'elf, 'dwarf> Attr<'elf, 'dwarf> {
         Ok(buffer)
     }
 
-    pub fn as_reference(&self, dwarf: &'dwarf Dwarf<'elf>) -> Result<Die<'elf, 'dwarf>> {
+    pub fn as_reference(&self, dwarf: &'dwarf Dwarf<'elf, 'dwarf>) -> Result<Die<'elf, 'dwarf>> {
         let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
         let (target_cu, cu_relative_offset): (&'dwarf CompileUnit<'elf>, usize) =
             match self.dw_form()? {

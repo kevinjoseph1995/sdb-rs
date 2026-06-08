@@ -240,9 +240,7 @@ fn test_dwarf_die_tree_traversal() {
     assert_eq!(dwarf.compile_units.len(), expected_child_counts.len());
 
     for (compile_unit, expected) in dwarf.compile_units.iter().zip(expected_child_counts.iter()) {
-        let root = dwarf
-            .root_of(compile_unit)
-            .expect("Failed to get root");
+        let root = dwarf.root_of(compile_unit).expect("Failed to get root");
 
         // The root of a compile unit is always a DW_TAG_compile_unit DIE,
         // which is non-null and exposes a children iterator.
@@ -470,7 +468,7 @@ fn build_lockstep_data() -> LockstepData {
     let elf = Elf::new(path).expect("Failed to load ELF");
     let elf: &'static Elf = Box::leak(Box::new(elf));
     let dwarf = Dwarf::new(elf).expect("Failed to parse DWARF");
-    let dwarf: &'static Dwarf<'static> = Box::leak(Box::new(dwarf));
+    let dwarf: &'static Dwarf<'static, 'static> = Box::leak(Box::new(dwarf));
 
     // First collect gimli's per-unit data (headers + units).
     let mut gimli_units: Vec<gimli::Unit<GimliReader<'static>>> = Vec::new();
@@ -503,9 +501,7 @@ fn build_lockstep_data() -> LockstepData {
         let mut pending_refs: Vec<(usize, usize, Attr<'static, 'static>)> = Vec::new();
 
         {
-            let libsdb_root = dwarf
-                .root_of(libsdb_cu)
-                .expect("libsdb root_of failed");
+            let libsdb_root = dwarf.root_of(libsdb_cu).expect("libsdb root_of failed");
             let mut tree = gimli_unit
                 .entries_tree(None)
                 .expect("gimli entries_tree failed");
