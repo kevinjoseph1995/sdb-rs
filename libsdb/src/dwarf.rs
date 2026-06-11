@@ -13,7 +13,7 @@ pub const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 // --- Top-level DWARF handle
 pub struct Dwarf<'elf, 'dwarf> {
     pub compile_units: Vec<CompileUnit<'elf>>,
-    function_index: HashMap<String, Vec<IndexEntry<'elf, 'dwarf>>>,
+    function_index: RefCell<HashMap<String, Vec<IndexEntry<'elf, 'dwarf>>>>,
     abbrev_table_cache: RefCell<AbbrevTableCache<'elf>>,
 }
 
@@ -149,7 +149,7 @@ impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
         let compile_units = parse_compile_units(elf)?;
         Ok(Dwarf {
             compile_units,
-            function_index: HashMap::new(),
+            function_index: RefCell::new(HashMap::new()),
             abbrev_table_cache: RefCell::new(AbbrevTableCache {
                 elf,
                 tables: HashMap::new(),
@@ -184,13 +184,14 @@ impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
     }
 
     pub fn function_containing_address(
-        &'dwarf mut self,
+        &'dwarf self,
         address: FileAddress<'elf>,
     ) -> Option<Die<'elf, 'dwarf>> {
         self.index();
 
         let entries: Vec<(&'dwarf CompileUnit<'elf>, usize)> = self
             .function_index
+            .borrow()
             .values()
             .flatten()
             .map(|e| (e.compile_unit, e.offset))
@@ -214,11 +215,11 @@ impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
         None
     }
 
-    pub fn find_functions(&'dwarf mut self, function_name: &str) -> Vec<Die<'elf, 'dwarf>> {
+    pub fn find_functions(&'dwarf self, function_name: &str) -> Vec<Die<'elf, 'dwarf>> {
         self.index();
 
         let entries: Vec<(&'dwarf CompileUnit<'elf>, usize)> =
-            match self.function_index.get(function_name) {
+            match self.function_index.borrow().get(function_name) {
                 Some(index_entries) => index_entries
                     .iter()
                     .map(|e| (e.compile_unit, e.offset))
@@ -238,11 +239,19 @@ impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
             .collect()
     }
 
-    fn index(&mut self) {
-        todo!()
+    fn index(&'dwarf self) {
+        if !self.function_index.borrow().is_empty() {
+            return;
+        }
+        self.compile_units.iter().for_each(|compile_unit| {
+            let die = self
+                .root_of(compile_unit)
+                .expect("Failed to get root of compile unit");
+            self.index_die(die);
+        });
     }
 
-    fn index_die<'b>(&mut self, die: Die<'elf, 'b>) {
+    fn index_die<'b>(&'dwarf self, die: Die<'elf, 'b>) {
         todo!()
     }
 }
@@ -472,6 +481,34 @@ impl<'elf, 'b> Die<'elf, 'b> {
                 }
             }
         }
+    }
+
+    pub fn name(&self) -> Option<String> {
+        let payload = match &self {
+            Die::Null(_) => {
+                return None;
+            }
+            Die::NonNull(die_payload) => die_payload,
+        };
+
+        if let Some(attr) = self.get_attr(DwAt::Name as u64) {
+            return Some(
+                attr.as_string()
+                    .expect("Failed to get string attribute")
+                    .to_str()
+                    .expect("CStr -> str conversion failed")
+                    .to_string(),
+            );
+        }
+        if let Some(attr) = self.get_attr(DwAt::Specification as u64) {
+            todo!();
+        }
+
+        if let Some(attr) = self.get_attr(DwAt::AbstractOrigin as u64) {
+            todo!();
+        }
+
+        return None;
     }
 }
 
