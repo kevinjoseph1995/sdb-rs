@@ -11,13 +11,19 @@ use std::{collections::HashMap, ffi::CStr};
 pub const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 
 // --- Top-level DWARF handle
-pub struct Dwarf<'elf, 'dwarf> {
-    pub compile_units: Vec<CompileUnit<'elf>>,
-    function_index: RefCell<HashMap<String, Vec<IndexEntry<'elf, 'dwarf>>>>,
+pub struct Dwarf<'elf, 'arena>
+where
+    'elf: 'arena,
+{
+    pub compile_units: bumpalo::collections::Vec<'arena, CompileUnit<'elf, 'arena>>,
+    function_index: RefCell<HashMap<String, Vec<IndexEntry<'elf, 'arena>>>>,
     abbrev_table_cache: RefCell<AbbrevTableCache<'elf>>,
 }
 
-pub struct CompileUnit<'elf> {
+pub struct CompileUnit<'elf, 'arena>
+where
+    'elf: 'arena,
+{
     abbrev_offset: usize,
     /// Start offset of this CU (including its header) within the .debug_info section.
     /// Used to resolve `DW_FORM_ref_addr` references that point into other CUs.
@@ -27,30 +33,31 @@ pub struct CompileUnit<'elf> {
     /// `attr_locations`) are indices into this slice.
     data: &'elf [u8],
     elf: &'elf Elf,
+    dwarf: &'arena Dwarf<'elf, 'arena>,
 }
 
-struct IndexEntry<'elf, 'dwarf>
+struct IndexEntry<'elf, 'arena>
 where
-    'elf: 'dwarf,
+    'elf: 'arena,
 {
-    compile_unit: &'dwarf CompileUnit<'elf>,
+    compile_unit: &'arena CompileUnit<'elf, 'arena>,
     offset: usize,
 }
 
 // --- Debugging Information Entries
-pub enum Die<'elf, 'dwarf>
+pub enum Die<'elf, 'arena>
 where
-    'elf: 'dwarf,
+    'elf: 'arena,
 {
     Null(
         usize, /* Offset of the start of this DIE within `compile_unit.data` */
     ),
-    NonNull(DiePayload<'elf, 'dwarf>),
+    NonNull(DiePayload<'elf, 'arena>),
 }
 
-pub struct DiePayload<'elf, 'dwarf>
+pub struct DiePayload<'elf, 'arena>
 where
-    'elf: 'dwarf,
+    'elf: 'arena,
 {
     /// Offset of the start of this DIE within `compile_unit.data`.
     position: usize,
@@ -58,7 +65,7 @@ where
     /// first child of this DIE.
     next: usize,
     /// The compile unit that owns this Die
-    compile_unit: &'dwarf CompileUnit<'elf>,
+    compile_unit: &'arena CompileUnit<'elf, 'arena>,
     /// abbrev entry for this DIE
     abbrev: Rc<Abbrev>,
     /// Offsets within `compile_unit.data` where each attribute's value bytes live.
@@ -67,11 +74,11 @@ where
     abbrev_table: Rc<AbbrevTable>,
 }
 
-pub struct DieChildrenIter<'elf, 'dwarf>
+pub struct DieChildrenIter<'elf, 'arena>
 where
-    'elf: 'dwarf,
+    'elf: 'arena,
 {
-    compile_unit: &'dwarf CompileUnit<'elf>,
+    compile_unit: &'arena CompileUnit<'elf, 'arena>,
     abbrev_table: Rc<AbbrevTable>,
     current_offset: usize,
     done: bool,
@@ -79,13 +86,13 @@ where
 
 // --- Attributes
 
-pub struct Attr<'elf, 'dwarf>
+pub struct Attr<'elf, 'arena>
 where
-    'elf: 'dwarf,
+    'elf: 'arena,
 {
     form: u64,
     attr_type: u64,
-    compile_unit: &'dwarf CompileUnit<'elf>,
+    compile_unit: &'arena CompileUnit<'elf, 'arena>,
     location_offset: usize, // Offset in compile_unit.data
     abbrev_table: Rc<AbbrevTable>,
 }
@@ -109,18 +116,18 @@ pub struct Abbrev {
 /// Maps byte offsets to another map, of integers to abbreviation entries.
 pub type AbbrevTable = HashMap<u64 /* abbreviation code*/, Rc<Abbrev>>;
 
-struct AbbrevTableCache<'a> {
-    elf: &'a Elf,
+struct AbbrevTableCache<'elf> {
+    elf: &'elf Elf,
     tables: HashMap<usize /*offset into the .debug_abbrev section*/, Rc<AbbrevTable>>,
 }
 
 // --- Range list related types
 
-pub struct RangeList<'elf, 'dwarf>
+pub struct RangeList<'elf, 'arena>
 where
-    'elf: 'dwarf,
+    'elf: 'arena,
 {
-    compile_unit: &'dwarf CompileUnit<'elf>,
+    compile_unit: &'arena CompileUnit<'elf, 'arena>,
     data: &'elf [u8],
     base_address: FileAddress<'elf>,
 }
@@ -130,11 +137,11 @@ pub struct RangeListEntry<'elf> {
     high: FileAddress<'elf>,
 }
 
-pub struct RangeListIterator<'elf, 'dwarf>
+pub struct RangeListIterator<'elf, 'arena>
 where
-    'elf: 'dwarf,
+    'elf: 'arena,
 {
-    compile_unit: &'dwarf CompileUnit<'elf>,
+    compile_unit: &'arena CompileUnit<'elf, 'arena>,
     data: &'elf [u8],
     position: usize,
     base_address: FileAddress<'elf>,
@@ -144,17 +151,21 @@ where
 
 // --- Dwarf ---
 
-impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
-    pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf, 'dwarf>> {
-        let compile_units = parse_compile_units(elf)?;
-        Ok(Dwarf {
-            compile_units,
+impl<'elf, 'arena> Dwarf<'elf, 'arena> {
+    pub fn new(
+        elf: &'elf Elf,
+        allocator: &'arena bumpalo::Bump,
+    ) -> Result<&'arena Dwarf<'elf, 'arena>> {
+        let dwarf = allocator.alloc(Dwarf {
+            compile_units: bumpalo::collections::Vec::new_in(allocator),
             function_index: RefCell::new(HashMap::new()),
             abbrev_table_cache: RefCell::new(AbbrevTableCache {
                 elf,
                 tables: HashMap::new(),
             }),
-        })
+        });
+
+        Ok(dwarf)
     }
 
     fn get_abbrev_table(&self, offset: usize) -> Result<Rc<AbbrevTable>> {
@@ -163,15 +174,18 @@ impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
             .get_table_at_offset(offset)
     }
 
-    pub fn root_of(&'dwarf self, cu: &'dwarf CompileUnit<'elf>) -> Result<Die<'elf, 'dwarf>> {
+    pub fn root_of(
+        &'arena self,
+        cu: &'arena CompileUnit<'elf, 'arena>,
+    ) -> Result<Die<'elf, 'arena>> {
         let table = self.get_abbrev_table(cu.abbrev_offset)?;
         cu.root(table)
     }
 
     pub fn compile_unit_containing_address(
-        &self,
+        &'arena self,
         address: FileAddress<'elf>,
-    ) -> Option<&CompileUnit<'elf>> {
+    ) -> Option<&'arena CompileUnit<'elf, 'arena>> {
         self.compile_units.iter().find(|&compile_unit| {
             let abbrev_table = self
                 .get_abbrev_table(compile_unit.abbrev_offset)
@@ -184,12 +198,12 @@ impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
     }
 
     pub fn function_containing_address(
-        &'dwarf self,
+        &'arena self,
         address: FileAddress<'elf>,
-    ) -> Option<Die<'elf, 'dwarf>> {
+    ) -> Option<Die<'elf, 'arena>> {
         self.index();
 
-        let entries: Vec<(&'dwarf CompileUnit<'elf>, usize)> = self
+        let entries: Vec<(&'arena CompileUnit<'elf, 'arena>, usize)> = self
             .function_index
             .borrow()
             .values()
@@ -215,10 +229,10 @@ impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
         None
     }
 
-    pub fn find_functions(&'dwarf self, function_name: &str) -> Vec<Die<'elf, 'dwarf>> {
+    pub fn find_functions(&'arena self, function_name: &str) -> Vec<Die<'elf, 'arena>> {
         self.index();
 
-        let entries: Vec<(&'dwarf CompileUnit<'elf>, usize)> =
+        let entries: Vec<(&'arena CompileUnit<'elf, 'arena>, usize)> =
             match self.function_index.borrow().get(function_name) {
                 Some(index_entries) => index_entries
                     .iter()
@@ -239,7 +253,7 @@ impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
             .collect()
     }
 
-    fn index(&'dwarf self) {
+    fn index(&'arena self) {
         if !self.function_index.borrow().is_empty() {
             return;
         }
@@ -251,16 +265,16 @@ impl<'elf, 'dwarf> Dwarf<'elf, 'dwarf> {
         });
     }
 
-    fn index_die<'b>(&'dwarf self, die: Die<'elf, 'b>) {
+    fn index_die(&'arena self, die: Die<'elf, 'arena>) {
         todo!()
     }
 }
 
-fn find_cu_containing<'elf, 'dwarf>(
-    dwarf: &'dwarf Dwarf<'elf, 'dwarf>,
+fn find_cu_containing<'elf, 'arena>(
+    dwarf: &'arena Dwarf<'elf, 'arena>,
     abs_offset: usize,
 ) -> Result<(
-    &'dwarf CompileUnit<'elf>,
+    &'arena CompileUnit<'elf, 'arena>,
     usize, /*Offset relative to the found CU */
 )> {
     let cu = dwarf
@@ -276,22 +290,23 @@ fn find_cu_containing<'elf, 'dwarf>(
     Ok((cu, abs_offset - cu.debug_info_offset))
 }
 
-fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
-    let debug_info_data = elf
-        .get_section_content_by_name(&CStr::from_bytes_with_nul(b".debug_info\0")?)
-        .context("Failed to find .debug_info section")?;
-    let mut cursor = Cursor::new(debug_info_data);
-    let mut compile_units = Vec::new();
-    while !cursor.is_at_end() {
-        compile_units.push(parse_compile_unit(&mut cursor, elf)?);
-    }
-    Ok(compile_units)
-}
+// fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf, 'arena>>> {
+//     let debug_info_data = elf
+//         .get_section_content_by_name(&CStr::from_bytes_with_nul(b".debug_info\0")?)
+//         .context("Failed to find .debug_info section")?;
+//     let mut cursor = Cursor::new(debug_info_data);
+//     let mut compile_units = Vec::new();
+//     while !cursor.is_at_end() {
+//         compile_units.push(parse_compile_unit(&mut cursor, elf)?);
+//     }
+//     Ok(compile_units)
+// }
 
-fn parse_compile_unit<'elf>(
+fn parse_compile_unit<'elf, 'arena>(
     cursor: &mut Cursor<'elf>,
     elf: &'elf Elf,
-) -> Result<CompileUnit<'elf>> {
+    dwarf: &'arena Dwarf<'elf, 'arena>,
+) -> Result<CompileUnit<'elf, 'arena>> {
     let start = cursor.position();
     let mut size: u32 = cursor
         .read_u32()
@@ -327,12 +342,13 @@ fn parse_compile_unit<'elf>(
         debug_info_offset: start,
         data: compile_unit_data,
         elf,
+        dwarf,
     })
 }
 
 // --- CompileUnit ---
 
-impl<'elf> CompileUnit<'elf> {
+impl<'elf, 'arena> CompileUnit<'elf, 'arena> {
     pub fn debug_info_offset(&self) -> usize {
         self.debug_info_offset
     }
@@ -343,15 +359,12 @@ impl<'elf> CompileUnit<'elf> {
         self.abbrev_offset
     }
 
-    pub fn root<'dwarf>(&'dwarf self, abbrev_table: Rc<AbbrevTable>) -> Result<Die<'elf, 'dwarf>> {
+    pub fn root(&'arena self, abbrev_table: Rc<AbbrevTable>) -> Result<Die<'elf, 'arena>> {
         let mut cursor = Cursor::new(self.data);
         parse_die_raw(&mut cursor, self, abbrev_table)
     }
 
-    fn root_internal<'dwarf>(
-        &'dwarf self,
-        abbrev_table: Rc<AbbrevTable>,
-    ) -> Result<Die<'elf, 'dwarf>> {
+    fn root_internal(&'arena self, abbrev_table: Rc<AbbrevTable>) -> Result<Die<'elf, 'arena>> {
         let mut cursor = Cursor::new(self.data);
         parse_die_raw(&mut cursor, self, abbrev_table)
     }
@@ -359,8 +372,8 @@ impl<'elf> CompileUnit<'elf> {
 
 // --- Die / DiePayload / DieChildrenIter ---
 
-impl<'elf, 'b> Die<'elf, 'b> {
-    pub fn children(&self) -> Option<DieChildrenIter<'elf, 'b>> {
+impl<'elf, 'arena> Die<'elf, 'arena> {
+    pub fn children(&self) -> Option<DieChildrenIter<'elf, 'arena>> {
         match self {
             Die::Null(_) => None,
             Die::NonNull(payload) => Some(payload.children()),
@@ -389,7 +402,7 @@ impl<'elf, 'b> Die<'elf, 'b> {
         }
     }
 
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'elf, 'b>> {
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'elf, 'arena>> {
         let payload = match &self {
             Die::Null(_) => return None,
             Die::NonNull(die_payload) => die_payload,
@@ -512,8 +525,8 @@ impl<'elf, 'b> Die<'elf, 'b> {
     }
 }
 
-impl<'elf, 'dwarf> DiePayload<'elf, 'dwarf> {
-    pub fn children(&self) -> DieChildrenIter<'elf, 'dwarf> {
+impl<'elf, 'arena> DiePayload<'elf, 'arena> {
+    pub fn children(&self) -> DieChildrenIter<'elf, 'arena> {
         DieChildrenIter {
             compile_unit: self.compile_unit,
             abbrev_table: Rc::clone(&self.abbrev_table),
@@ -522,7 +535,7 @@ impl<'elf, 'dwarf> DiePayload<'elf, 'dwarf> {
         }
     }
 
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'elf, 'dwarf>> {
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'elf, 'arena>> {
         let specs = &self.abbrev.attr_specs;
         for (index, spec) in specs.iter().enumerate() {
             if spec.attr == attr {
@@ -554,13 +567,13 @@ impl<'elf, 'dwarf> DiePayload<'elf, 'dwarf> {
         &self.abbrev.attr_specs
     }
 
-    pub fn compile_unit(&self) -> &'dwarf CompileUnit<'elf> {
+    pub fn compile_unit(&self) -> &'arena CompileUnit<'elf, 'arena> {
         self.compile_unit
     }
 }
 
-impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
-    type Item = Result<Die<'a, 'b>>;
+impl<'elf, 'arena> Iterator for DieChildrenIter<'elf, 'arena> {
+    type Item = Result<Die<'elf, 'arena>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
@@ -625,11 +638,11 @@ impl<'a, 'b> Iterator for DieChildrenIter<'a, 'b> {
     }
 }
 
-fn parse_die_raw<'elf, 'dwarf>(
+fn parse_die_raw<'elf, 'arena>(
     cursor: &mut Cursor,
-    compile_unit: &'dwarf CompileUnit<'elf>,
+    compile_unit: &'arena CompileUnit<'elf, 'arena>,
     abbrev_table: Rc<AbbrevTable>,
-) -> Result<Die<'elf, 'dwarf>> {
+) -> Result<Die<'elf, 'arena>> {
     let position = cursor.position();
     let abbrev_code = cursor.uleb128()?;
     if abbrev_code == 0 {
@@ -676,7 +689,7 @@ fn skip_children(cursor: &mut Cursor, abbrev_table: &AbbrevTable) -> Result<()> 
 
 // --- Attr / AttrSpec ---
 
-impl<'elf, 'dwarf> Attr<'elf, 'dwarf> {
+impl<'elf, 'arena> Attr<'elf, 'arena> {
     pub fn form(&self) -> u64 {
         self.form
     }
@@ -748,9 +761,9 @@ impl<'elf, 'dwarf> Attr<'elf, 'dwarf> {
         Ok(buffer)
     }
 
-    pub fn as_reference(&self, dwarf: &'dwarf Dwarf<'elf, 'dwarf>) -> Result<Die<'elf, 'dwarf>> {
+    pub fn as_reference(&self, dwarf: &'arena Dwarf<'elf, 'arena>) -> Result<Die<'elf, 'arena>> {
         let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
-        let (target_cu, cu_relative_offset): (&'dwarf CompileUnit<'elf>, usize) =
+        let (target_cu, cu_relative_offset): (&'arena CompileUnit<'elf, 'arena>, usize) =
             match self.dw_form()? {
                 DwForm::Ref1 => (self.compile_unit, cursor.read_u8()? as usize),
                 DwForm::Ref2 => (self.compile_unit, cursor.read_u16()? as usize),
@@ -820,7 +833,7 @@ impl<'elf, 'dwarf> Attr<'elf, 'dwarf> {
             })
     }
 
-    pub fn as_string(&'elf self) -> Result<&'elf CStr> {
+    pub fn as_string(&self) -> Result<&'elf CStr> {
         let mut cursor: Cursor<'elf> = Cursor::new(&self.compile_unit.data[self.location_offset..]);
         match self.dw_form()? {
             DwForm::String => {
@@ -842,7 +855,7 @@ impl<'elf, 'dwarf> Attr<'elf, 'dwarf> {
         }
     }
 
-    pub fn as_range_list(&self) -> Result<RangeList<'elf, 'dwarf>> {
+    pub fn as_range_list(&self) -> Result<RangeList<'elf, 'arena>> {
         let debug_ranges_bytes = self
             .compile_unit
             .elf
@@ -943,8 +956,8 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
 
 // --- Range Lists ---
 
-impl<'elf, 'dwarf> RangeList<'elf, 'dwarf> {
-    pub fn iter(&self) -> RangeListIterator<'elf, 'dwarf> {
+impl<'elf, 'arena> RangeList<'elf, 'arena> {
+    pub fn iter(&self) -> RangeListIterator<'elf, 'arena> {
         RangeListIterator {
             compile_unit: self.compile_unit,
             data: self.data,
@@ -964,7 +977,7 @@ impl<'elf> RangeListEntry<'elf> {
     }
 }
 
-impl<'elf, 'dwarf> Iterator for RangeListIterator<'elf, 'dwarf> {
+impl<'elf, 'arena> Iterator for RangeListIterator<'elf, 'arena> {
     type Item = RangeListEntry<'elf>;
 
     fn next(&mut self) -> Option<Self::Item> {

@@ -21,5 +21,4 @@ bumpalo = { version = "3.20.3", features = ["allocator-api2", "collections"] }
 
 [dev-dependencies]
 procfs = "0.17.0"
-gimli = "0.31"
 object = "0.36"
