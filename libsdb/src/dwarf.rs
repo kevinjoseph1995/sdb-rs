@@ -11,19 +11,14 @@ use std::{collections::HashMap, ffi::CStr};
 pub const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 
 // --- Top-level DWARF handle
-pub struct Dwarf<'elf, 'arena>
-where
-    'elf: 'arena,
-{
-    pub compile_units: bumpalo::collections::Vec<'arena, CompileUnit<'elf, 'arena>>,
-    function_index: RefCell<HashMap<String, Vec<IndexEntry<'elf, 'arena>>>>,
-    abbrev_table_cache: RefCell<AbbrevTableCache<'elf>>,
+pub struct Dwarf<'elf> {
+    elf: &'elf Elf,
+    compile_units: Vec<CompileUnit<'elf>>,
+    function_index: RefCell<HashMap<String, Vec<IndexEntry>>>,
+    abbrev_table_cache: RefCell<HashMap<usize, Rc<AbbrevTable>>>,
 }
 
-pub struct CompileUnit<'elf, 'arena>
-where
-    'elf: 'arena,
-{
+pub struct CompileUnit<'elf> {
     abbrev_offset: usize,
     /// Start offset of this CU (including its header) within the .debug_info section.
     /// Used to resolve `DW_FORM_ref_addr` references that point into other CUs.
@@ -32,71 +27,58 @@ where
     /// already stripped. All offsets stored in this module (DIE `position`/`next`,
     /// `attr_locations`) are indices into this slice.
     data: &'elf [u8],
-    elf: &'elf Elf,
-    dwarf: &'arena Dwarf<'elf, 'arena>,
 }
 
-struct IndexEntry<'elf, 'arena>
-where
-    'elf: 'arena,
-{
-    compile_unit: &'arena CompileUnit<'elf, 'arena>,
+struct IndexEntry {
+    /// Index into [`Dwarf::compile_units`] of the owning CU.
+    cu_index: usize,
+    /// Offset of the DIE within that CU's `data`.
     offset: usize,
 }
 
 // --- Debugging Information Entries
-pub enum Die<'elf, 'arena>
-where
-    'elf: 'arena,
-{
+pub enum Die<'dw, 'elf> {
     Null(
-        usize, /* Offset of the start of this DIE within `compile_unit.data` */
+        usize, /* Offset of the start of this DIE within the CU's `data` */
     ),
-    NonNull(DiePayload<'elf, 'arena>),
+    NonNull(DiePayload<'dw, 'elf>),
 }
 
-pub struct DiePayload<'elf, 'arena>
-where
-    'elf: 'arena,
-{
-    /// Offset of the start of this DIE within `compile_unit.data`.
+pub struct DiePayload<'dw, 'elf> {
+    /// Offset of the start of this DIE within the CU's `data`.
     position: usize,
-    /// Offset (within `compile_unit.data`) of either the next sibling or the
+    /// Offset (within the CU's `data`) of either the next sibling or the
     /// first child of this DIE.
     next: usize,
-    /// The compile unit that owns this Die
-    compile_unit: &'arena CompileUnit<'elf, 'arena>,
+    /// Index into [`Dwarf::compile_units`] of the CU that owns this Die.
+    cu_index: usize,
     /// abbrev entry for this DIE
     abbrev: Rc<Abbrev>,
-    /// Offsets within `compile_unit.data` where each attribute's value bytes live.
+    /// Offsets within the CU's `data` where each attribute's value bytes live.
     attr_locations: Vec<usize>,
     /// Abbrev table
     abbrev_table: Rc<AbbrevTable>,
-    dwarf: &'arena Dwarf<'elf, 'arena>,
+    /// Borrow of the owning Dwarf, for cross-CU references and abbrev lookups.
+    dwarf: &'dw Dwarf<'elf>,
 }
 
-pub struct DieChildrenIter<'elf, 'arena>
-where
-    'elf: 'arena,
-{
-    compile_unit: &'arena CompileUnit<'elf, 'arena>,
+pub struct DieChildrenIter<'dw, 'elf> {
+    cu_index: usize,
     abbrev_table: Rc<AbbrevTable>,
     current_offset: usize,
     done: bool,
+    dwarf: &'dw Dwarf<'elf>,
 }
 
 // --- Attributes
 
-pub struct Attr<'elf, 'arena>
-where
-    'elf: 'arena,
-{
+pub struct Attr<'dw, 'elf> {
     form: u64,
     attr_type: u64,
-    compile_unit: &'arena CompileUnit<'elf, 'arena>,
-    location_offset: usize, // Offset in compile_unit.data
+    cu_index: usize,
+    location_offset: usize, // Offset in the CU's `data`
     abbrev_table: Rc<AbbrevTable>,
-    dwarf: &'arena Dwarf<'elf, 'arena>,
+    dwarf: &'dw Dwarf<'elf>,
 }
 
 pub struct AttrSpec {
@@ -118,18 +100,10 @@ pub struct Abbrev {
 /// Maps byte offsets to another map, of integers to abbreviation entries.
 pub type AbbrevTable = HashMap<u64 /* abbreviation code*/, Rc<Abbrev>>;
 
-struct AbbrevTableCache<'elf> {
-    elf: &'elf Elf,
-    tables: HashMap<usize /*offset into the .debug_abbrev section*/, Rc<AbbrevTable>>,
-}
-
 // --- Range list related types
 
-pub struct RangeList<'elf, 'arena>
-where
-    'elf: 'arena,
-{
-    compile_unit: &'arena CompileUnit<'elf, 'arena>,
+pub struct RangeList<'elf> {
+    elf: &'elf Elf,
     data: &'elf [u8],
     base_address: FileAddress<'elf>,
 }
@@ -139,11 +113,8 @@ pub struct RangeListEntry<'elf> {
     high: FileAddress<'elf>,
 }
 
-pub struct RangeListIterator<'elf, 'arena>
-where
-    'elf: 'arena,
-{
-    compile_unit: &'arena CompileUnit<'elf, 'arena>,
+pub struct RangeListIterator<'elf> {
+    elf: &'elf Elf,
     data: &'elf [u8],
     position: usize,
     base_address: FileAddress<'elf>,
@@ -153,72 +124,69 @@ where
 
 // --- Dwarf ---
 
-impl<'elf, 'arena> Dwarf<'elf, 'arena> {
-    pub fn new(
-        elf: &'elf Elf,
-        allocator: &'arena bumpalo::Bump,
-    ) -> Result<&'arena Dwarf<'elf, 'arena>> {
-        let dwarf = allocator.alloc(Dwarf {
-            compile_units: bumpalo::collections::Vec::new_in(allocator),
+impl<'elf> Dwarf<'elf> {
+    pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
+        let compile_units = parse_compile_units(elf)?;
+        Ok(Dwarf {
+            elf,
+            compile_units,
             function_index: RefCell::new(HashMap::new()),
-            abbrev_table_cache: RefCell::new(AbbrevTableCache {
-                elf,
-                tables: HashMap::new(),
-            }),
-        });
+            abbrev_table_cache: RefCell::new(HashMap::new()),
+        })
+    }
 
-        Ok(dwarf)
+    pub fn compile_units(&self) -> &[CompileUnit<'elf>] {
+        &self.compile_units
     }
 
     fn get_abbrev_table(&self, offset: usize) -> Result<Rc<AbbrevTable>> {
+        if let Some(table) = self.abbrev_table_cache.borrow().get(&offset) {
+            return Ok(Rc::clone(table));
+        }
+        let table = Rc::new(parse_abbrev_table(self.elf, offset)?);
         self.abbrev_table_cache
             .borrow_mut()
-            .get_table_at_offset(offset)
+            .insert(offset, Rc::clone(&table));
+        Ok(table)
     }
 
-    pub fn root_of(
-        &'arena self,
-        cu: &'arena CompileUnit<'elf, 'arena>,
-    ) -> Result<Die<'elf, 'arena>> {
+    pub fn root_of<'dw>(&'dw self, cu_index: usize) -> Result<Die<'dw, 'elf>> {
+        let cu = &self.compile_units[cu_index];
         let table = self.get_abbrev_table(cu.abbrev_offset)?;
-        cu.root(table)
+        let mut cursor = Cursor::new(cu.data);
+        parse_die_raw(&mut cursor, self, cu_index, table)
     }
 
-    pub fn compile_unit_containing_address(
-        &'arena self,
-        address: FileAddress<'elf>,
-    ) -> Option<&'arena CompileUnit<'elf, 'arena>> {
-        self.compile_units.iter().find(|&compile_unit| {
-            let abbrev_table = self
-                .get_abbrev_table(compile_unit.abbrev_offset)
-                .expect("Failed to get abbrev table");
-            compile_unit
-                .root_internal(abbrev_table)
+    pub fn compile_unit_containing_address(&self, address: FileAddress<'elf>) -> Option<usize> {
+        (0..self.compile_units.len()).find(|&cu_index| {
+            self.root_of(cu_index)
                 .expect("Failed to extract root DIE from compile unit")
                 .contains(address)
         })
     }
 
-    pub fn function_containing_address(
-        &'arena self,
+    pub fn function_containing_address<'dw>(
+        &'dw self,
         address: FileAddress<'elf>,
-    ) -> Option<Die<'elf, 'arena>> {
+    ) -> Option<Die<'dw, 'elf>> {
         self.index();
 
-        let entries: Vec<(&'arena CompileUnit<'elf, 'arena>, usize)> = self
+        let entries: Vec<(usize, usize)> = self
             .function_index
             .borrow()
             .values()
             .flatten()
-            .map(|e| (e.compile_unit, e.offset))
+            .map(|e| (e.cu_index, e.offset))
             .collect();
 
-        for (cu, offset) in entries {
+        for (cu_index, offset) in entries {
+            let cu = &self.compile_units[cu_index];
             let abbrev_table = self
                 .get_abbrev_table(cu.abbrev_offset)
                 .expect("Failed to get abbrev table");
             let mut cursor = Cursor::new(&cu.data[offset..]);
-            let die = parse_die_raw(&mut cursor, cu, abbrev_table).expect("Failed to parse DIE");
+            let die = parse_die_raw(&mut cursor, self, cu_index, abbrev_table)
+                .expect("Failed to parse DIE");
             match (die.contains(address), &die) {
                 (true, Die::NonNull(die_payload)) => {
                     if die_payload.abbrev.tag == crate::dwarf_constants::DwTag::Subprogram as u64 {
@@ -231,43 +199,44 @@ impl<'elf, 'arena> Dwarf<'elf, 'arena> {
         None
     }
 
-    pub fn find_functions(&'arena self, function_name: &str) -> Vec<Die<'elf, 'arena>> {
+    pub fn find_functions<'dw>(&'dw self, function_name: &str) -> Vec<Die<'dw, 'elf>> {
         self.index();
 
-        let entries: Vec<(&'arena CompileUnit<'elf, 'arena>, usize)> =
-            match self.function_index.borrow().get(function_name) {
-                Some(index_entries) => index_entries
-                    .iter()
-                    .map(|e| (e.compile_unit, e.offset))
-                    .collect(),
-                None => return Vec::new(),
-            };
+        let entries: Vec<(usize, usize)> = match self.function_index.borrow().get(function_name) {
+            Some(index_entries) => index_entries
+                .iter()
+                .map(|e| (e.cu_index, e.offset))
+                .collect(),
+            None => return Vec::new(),
+        };
 
         entries
             .into_iter()
-            .map(|(cu, offset)| {
+            .map(|(cu_index, offset)| {
+                let cu = &self.compile_units[cu_index];
                 let abbrev_table = self
                     .get_abbrev_table(cu.abbrev_offset)
                     .expect("Failed to get abbrev table");
                 let mut cursor = Cursor::new(&cu.data[offset..]);
-                parse_die_raw(&mut cursor, cu, abbrev_table).expect("Failed to parse DIE")
+                parse_die_raw(&mut cursor, self, cu_index, abbrev_table)
+                    .expect("Failed to parse DIE")
             })
             .collect()
     }
 
-    fn index(&'arena self) {
+    fn index(&self) {
         if !self.function_index.borrow().is_empty() {
             return;
         }
-        self.compile_units.iter().for_each(|compile_unit| {
+        for cu_index in 0..self.compile_units.len() {
             let die = self
-                .root_of(compile_unit)
+                .root_of(cu_index)
                 .expect("Failed to get root of compile unit");
             self.index_die(die);
-        });
+        }
     }
 
-    fn index_die(&'arena self, die: Die<'elf, 'arena>) {
+    fn index_die(&self, die: Die<'_, 'elf>) {
         let has_range: bool = match die.get_attr(DwAt::LowPc as u64) {
             Some(_) => true,
             None => false,
@@ -288,23 +257,15 @@ impl<'elf, 'arena> Dwarf<'elf, 'arena> {
         if is_function && has_range {
             if let Some(name) = die.name() {
                 let die_payload = die_payload.expect("This should not happen");
-                let index_entry = IndexEntry {
-                    compile_unit: die_payload.compile_unit,
+                let entry = IndexEntry {
+                    cu_index: die_payload.cu_index,
                     offset: die_payload.position,
                 };
                 self.function_index
                     .borrow_mut()
                     .entry(name)
-                    .and_modify(|list| {
-                        list.push(IndexEntry {
-                            compile_unit: die_payload.compile_unit,
-                            offset: die_payload.position,
-                        })
-                    })
-                    .or_insert(vec![IndexEntry {
-                        compile_unit: die_payload.compile_unit,
-                        offset: die_payload.position,
-                    }]);
+                    .or_insert_with(Vec::new)
+                    .push(entry);
             }
         }
 
@@ -318,43 +279,34 @@ impl<'elf, 'arena> Dwarf<'elf, 'arena> {
     }
 }
 
-fn find_cu_containing<'elf, 'arena>(
-    dwarf: &'arena Dwarf<'elf, 'arena>,
-    abs_offset: usize,
-) -> Result<(
-    &'arena CompileUnit<'elf, 'arena>,
-    usize, /*Offset relative to the found CU */
-)> {
-    let cu = dwarf
+fn find_cu_containing(dwarf: &Dwarf<'_>, abs_offset: usize) -> Result<(usize, usize)> {
+    let cu_index = dwarf
         .compile_units
         .iter()
-        .find(|cu| {
+        .position(|cu| {
             // `data` no longer includes the CU header, so the CU's footprint
             // in .debug_info is `[debug_info_offset, debug_info_offset + header + data)`.
             abs_offset >= cu.debug_info_offset
                 && abs_offset < cu.debug_info_offset + COMPILE_UNIT_HEADER_SIZE + cu.data.len()
         })
         .ok_or_else(|| anyhow!("RefAddr {:#x} not in any compile unit", abs_offset))?;
-    Ok((cu, abs_offset - cu.debug_info_offset))
+    let cu = &dwarf.compile_units[cu_index];
+    Ok((cu_index, abs_offset - cu.debug_info_offset))
 }
 
-// fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf, 'arena>>> {
-//     let debug_info_data = elf
-//         .get_section_content_by_name(&CStr::from_bytes_with_nul(b".debug_info\0")?)
-//         .context("Failed to find .debug_info section")?;
-//     let mut cursor = Cursor::new(debug_info_data);
-//     let mut compile_units = Vec::new();
-//     while !cursor.is_at_end() {
-//         compile_units.push(parse_compile_unit(&mut cursor, elf)?);
-//     }
-//     Ok(compile_units)
-// }
+fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
+    let debug_info_data = elf
+        .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_info\0")?)
+        .context("Failed to find .debug_info section")?;
+    let mut cursor = Cursor::new(debug_info_data);
+    let mut compile_units = Vec::new();
+    while !cursor.is_at_end() {
+        compile_units.push(parse_compile_unit(&mut cursor)?);
+    }
+    Ok(compile_units)
+}
 
-fn parse_compile_unit<'elf, 'arena>(
-    cursor: &mut Cursor<'elf>,
-    elf: &'elf Elf,
-    dwarf: &'arena Dwarf<'elf, 'arena>,
-) -> Result<CompileUnit<'elf, 'arena>> {
+fn parse_compile_unit<'elf>(cursor: &mut Cursor<'elf>) -> Result<CompileUnit<'elf>> {
     let start = cursor.position();
     let mut size: u32 = cursor
         .read_u32()
@@ -389,14 +341,12 @@ fn parse_compile_unit<'elf, 'arena>(
         abbrev_offset: abbrev as usize,
         debug_info_offset: start,
         data: compile_unit_data,
-        elf,
-        dwarf,
     })
 }
 
 // --- CompileUnit ---
 
-impl<'elf, 'arena> CompileUnit<'elf, 'arena> {
+impl<'elf> CompileUnit<'elf> {
     pub fn debug_info_offset(&self) -> usize {
         self.debug_info_offset
     }
@@ -406,29 +356,19 @@ impl<'elf, 'arena> CompileUnit<'elf, 'arena> {
     pub fn abbrev_offset(&self) -> usize {
         self.abbrev_offset
     }
-
-    pub fn root(&'arena self, abbrev_table: Rc<AbbrevTable>) -> Result<Die<'elf, 'arena>> {
-        let mut cursor = Cursor::new(self.data);
-        parse_die_raw(&mut cursor, self, abbrev_table)
-    }
-
-    fn root_internal(&'arena self, abbrev_table: Rc<AbbrevTable>) -> Result<Die<'elf, 'arena>> {
-        let mut cursor = Cursor::new(self.data);
-        parse_die_raw(&mut cursor, self, abbrev_table)
-    }
 }
 
 // --- Die / DiePayload / DieChildrenIter ---
 
-impl<'elf, 'arena> Die<'elf, 'arena> {
-    pub fn children(&self) -> Option<DieChildrenIter<'elf, 'arena>> {
+impl<'dw, 'elf> Die<'dw, 'elf> {
+    pub fn children(&self) -> Option<DieChildrenIter<'dw, 'elf>> {
         match self {
             Die::Null(_) => None,
             Die::NonNull(payload) => Some(payload.children()),
         }
     }
 
-    /// Offset of the start of this DIE within `compile_unit.data`.
+    /// Offset of the start of this DIE within the CU's `data`.
     pub fn position(&self) -> usize {
         match self {
             Die::Null(pos) => *pos,
@@ -450,7 +390,7 @@ impl<'elf, 'arena> Die<'elf, 'arena> {
         }
     }
 
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'elf, 'arena>> {
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'dw, 'elf>> {
         let payload = match &self {
             Die::Null(_) => return None,
             Die::NonNull(die_payload) => die_payload,
@@ -511,7 +451,7 @@ impl<'elf, 'arena> Die<'elf, 'arena> {
                 }
             };
             Ok(FileAddress {
-                elf_handle: attr.compile_unit.elf,
+                elf_handle: attr.dwarf.elf,
                 address,
             })
         } else {
@@ -523,7 +463,7 @@ impl<'elf, 'arena> Die<'elf, 'arena> {
         match self {
             Die::Null(_) => return false,
             Die::NonNull(die_payload) => {
-                if die_payload.compile_unit.elf.path != address.elf_handle.path {
+                if die_payload.dwarf.elf.path != address.elf_handle.path {
                     // Ensure that both elf objects are pointing to the same underlying file.
                     // It's very unlikely we'd be referencing two different objects but the provided
                     // FileAddress need not be constructed using the same Elf object as the Die.
@@ -562,14 +502,14 @@ impl<'elf, 'arena> Die<'elf, 'arena> {
             );
         }
         if let Some(attr) = self.get_attr(DwAt::Specification as u64) {
-            let referenced_die: Die<'elf, 'arena> = attr
+            let referenced_die: Die<'dw, 'elf> = attr
                 .as_reference()
                 .expect("Failed to get referenced DIE with DwAt::Specification");
             return referenced_die.name();
         }
 
         if let Some(attr) = self.get_attr(DwAt::AbstractOrigin as u64) {
-            let referenced_die: Die<'elf, 'arena> = attr
+            let referenced_die: Die<'dw, 'elf> = attr
                 .as_reference()
                 .expect("Failed to get referenced DIE with DwAt::AbstractOrigin");
             return referenced_die.name();
@@ -578,24 +518,25 @@ impl<'elf, 'arena> Die<'elf, 'arena> {
     }
 }
 
-impl<'elf, 'arena> DiePayload<'elf, 'arena> {
-    pub fn children(&self) -> DieChildrenIter<'elf, 'arena> {
+impl<'dw, 'elf> DiePayload<'dw, 'elf> {
+    pub fn children(&self) -> DieChildrenIter<'dw, 'elf> {
         DieChildrenIter {
-            compile_unit: self.compile_unit,
+            cu_index: self.cu_index,
             abbrev_table: Rc::clone(&self.abbrev_table),
             current_offset: self.next,
             done: !self.abbrev.has_children,
+            dwarf: self.dwarf,
         }
     }
 
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'elf, 'arena>> {
+    pub fn get_attr(&self, attr: u64) -> Option<Attr<'dw, 'elf>> {
         let specs = &self.abbrev.attr_specs;
         for (index, spec) in specs.iter().enumerate() {
             if spec.attr == attr {
                 return Some(Attr {
                     form: spec.form,
                     attr_type: spec.attr,
-                    compile_unit: self.compile_unit,
+                    cu_index: self.cu_index,
                     location_offset: self.attr_locations[index],
                     abbrev_table: Rc::clone(&self.abbrev_table),
                     dwarf: self.dwarf,
@@ -621,25 +562,26 @@ impl<'elf, 'arena> DiePayload<'elf, 'arena> {
         &self.abbrev.attr_specs
     }
 
-    pub fn compile_unit(&self) -> &'arena CompileUnit<'elf, 'arena> {
-        self.compile_unit
+    pub fn compile_unit(&self) -> &'dw CompileUnit<'elf> {
+        &self.dwarf.compile_units[self.cu_index]
     }
 }
 
-impl<'elf, 'arena> Iterator for DieChildrenIter<'elf, 'arena> {
-    type Item = Result<Die<'elf, 'arena>>;
+impl<'dw, 'elf> Iterator for DieChildrenIter<'dw, 'elf> {
+    type Item = Result<Die<'dw, 'elf>>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
         }
-        let die_data = self.compile_unit.data;
+        let die_data = self.dwarf.compile_units[self.cu_index].data;
         let mut cursor = Cursor::new(die_data);
         cursor.increment_cursor_by(self.current_offset);
 
         match parse_die_raw(
             &mut cursor,
-            self.compile_unit,
+            self.dwarf,
+            self.cu_index,
             Rc::clone(&self.abbrev_table),
         ) {
             Err(e) => {
@@ -692,11 +634,12 @@ impl<'elf, 'arena> Iterator for DieChildrenIter<'elf, 'arena> {
     }
 }
 
-fn parse_die_raw<'elf, 'arena>(
+fn parse_die_raw<'dw, 'elf>(
     cursor: &mut Cursor,
-    compile_unit: &'arena CompileUnit<'elf, 'arena>,
+    dwarf: &'dw Dwarf<'elf>,
+    cu_index: usize,
     abbrev_table: Rc<AbbrevTable>,
-) -> Result<Die<'elf, 'arena>> {
+) -> Result<Die<'dw, 'elf>> {
     let position = cursor.position();
     let abbrev_code = cursor.uleb128()?;
     if abbrev_code == 0 {
@@ -716,11 +659,11 @@ fn parse_die_raw<'elf, 'arena>(
     Ok(Die::NonNull(DiePayload {
         position,
         next,
-        compile_unit,
+        cu_index,
         abbrev,
         attr_locations,
         abbrev_table,
-        dwarf: compile_unit.dwarf,
+        dwarf,
     }))
 }
 
@@ -744,13 +687,17 @@ fn skip_children(cursor: &mut Cursor, abbrev_table: &AbbrevTable) -> Result<()> 
 
 // --- Attr / AttrSpec ---
 
-impl<'elf, 'arena> Attr<'elf, 'arena> {
+impl<'dw, 'elf> Attr<'dw, 'elf> {
     pub fn form(&self) -> u64 {
         self.form
     }
 
     pub fn attr_type(&self) -> u64 {
         self.attr_type
+    }
+
+    fn cu(&self) -> &'dw CompileUnit<'elf> {
+        &self.dwarf.compile_units[self.cu_index]
     }
 
     fn dw_form(&self) -> Result<DwForm> {
@@ -764,10 +711,10 @@ impl<'elf, 'arena> Attr<'elf, 'arena> {
         if self.dw_form()? != DwForm::Addr {
             return Err(anyhow!("Invalid attr type. Expected DwForm::Addr"));
         }
-        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
         let address = cursor.read_u64().context("Failed to extract u64")? as usize;
         Ok(FileAddress {
-            elf_handle: self.compile_unit.elf,
+            elf_handle: self.dwarf.elf,
             address,
         })
     }
@@ -776,12 +723,12 @@ impl<'elf, 'arena> Attr<'elf, 'arena> {
         if self.dw_form()? != DwForm::SecOffset {
             return Err(anyhow!("Invalid attr type. Expected DwForm::SecOffset"));
         }
-        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
         Ok(cursor.read_u32().context("Failed to extract u32")?)
     }
 
     pub fn as_int(&self) -> Result<u64> {
-        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
         match self.dw_form()? {
             DwForm::Data1 => Ok(cursor.read_u8()? as u64),
             DwForm::Data2 => Ok(cursor.read_u16()? as u64),
@@ -794,7 +741,7 @@ impl<'elf, 'arena> Attr<'elf, 'arena> {
     }
 
     pub fn as_block(&self) -> Result<&[u8]> {
-        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
         let size = match self.dw_form()? {
             DwForm::Block1 => cursor.read_u8()? as usize,
             DwForm::Block2 => cursor.read_u16()? as usize,
@@ -809,42 +756,41 @@ impl<'elf, 'arena> Attr<'elf, 'arena> {
             .checked_add(size)
             .ok_or_else(|| anyhow!("Block size overflow"))?;
         let buffer = self
-            .compile_unit
+            .cu()
             .data
             .get(start..end)
             .ok_or_else(|| anyhow!("Block extends past compile unit data"))?;
         Ok(buffer)
     }
 
-    pub fn as_reference(&self) -> Result<Die<'elf, 'arena>> {
-        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
-        let (target_cu, cu_relative_offset): (&'arena CompileUnit<'elf, 'arena>, usize) =
-            match self.dw_form()? {
-                DwForm::Ref1 => (self.compile_unit, cursor.read_u8()? as usize),
-                DwForm::Ref2 => (self.compile_unit, cursor.read_u16()? as usize),
-                DwForm::Ref4 => (self.compile_unit, cursor.read_u32()? as usize),
-                DwForm::Ref8 => (self.compile_unit, cursor.read_u64()? as usize),
-                DwForm::RefUdata => (self.compile_unit, cursor.uleb128()? as usize),
-                DwForm::RefAddr => {
-                    /*
-                    From https://dwarfstd.org/doc/DWARF4.pdf:
-                    The second type of reference can identify any debugging information entry within a
-                    .debug_info section; in particular, it may refer to an entry in a different compilation unit
-                    from the unit containing the reference, and may refer to an entry in a different shared object.
-                    This type of reference (DW_FORM_ref_addr) is an offset from the beginning of the
-                    .debug_info section of the target executable or shared object; it is relocatable in a
-                    relocatable object file and frequently relocated in an executable file or shared object.
-                    */
-                    // Offset in .debug_info
-                    let abs_offset = cursor.read_u32()? as usize;
-                    find_cu_containing(self.dwarf, abs_offset)?
-                }
-                other => {
-                    return Err(anyhow!("Invalid form for as_reference: {:?}", other));
-                }
-            };
+    pub fn as_reference(&self) -> Result<Die<'dw, 'elf>> {
+        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
+        let (target_cu_index, cu_relative_offset): (usize, usize) = match self.dw_form()? {
+            DwForm::Ref1 => (self.cu_index, cursor.read_u8()? as usize),
+            DwForm::Ref2 => (self.cu_index, cursor.read_u16()? as usize),
+            DwForm::Ref4 => (self.cu_index, cursor.read_u32()? as usize),
+            DwForm::Ref8 => (self.cu_index, cursor.read_u64()? as usize),
+            DwForm::RefUdata => (self.cu_index, cursor.uleb128()? as usize),
+            DwForm::RefAddr => {
+                /*
+                From https://dwarfstd.org/doc/DWARF4.pdf:
+                The second type of reference can identify any debugging information entry within a
+                .debug_info section; in particular, it may refer to an entry in a different compilation unit
+                from the unit containing the reference, and may refer to an entry in a different shared object.
+                This type of reference (DW_FORM_ref_addr) is an offset from the beginning of the
+                .debug_info section of the target executable or shared object; it is relocatable in a
+                relocatable object file and frequently relocated in an executable file or shared object.
+                */
+                // Offset in .debug_info
+                let abs_offset = cursor.read_u32()? as usize;
+                find_cu_containing(self.dwarf, abs_offset)?
+            }
+            other => {
+                return Err(anyhow!("Invalid form for as_reference: {:?}", other));
+            }
+        };
         // Reference offsets are measured from the start of the CU header, but
-        // `compile_unit.data` no longer contains the header. Translate so the
+        // the CU's `data` no longer contains the header. Translate so the
         // parsed DIE's `position` matches the header-free convention.
         let data_offset = cu_relative_offset
             .checked_sub(COMPILE_UNIT_HEADER_SIZE)
@@ -854,20 +800,26 @@ impl<'elf, 'arena> Attr<'elf, 'arena> {
                     cu_relative_offset
                 )
             })?;
-        // The target CU may use a different abbrev table than `self.compile_unit`
+        // The target CU may use a different abbrev table than this attr's CU
         // (DW_FORM_ref_addr can cross CU boundaries), so look it up by the target's
         // abbrev_offset rather than reusing the caller's table.
+        let target_cu = &self.dwarf.compile_units[target_cu_index];
         let abbrev_table = self.dwarf.get_abbrev_table(target_cu.abbrev_offset)?;
         let mut reference_cursor = Cursor::new(target_cu.data);
         reference_cursor.increment_cursor_by(data_offset);
-        parse_die_raw(&mut reference_cursor, target_cu, abbrev_table)
+        parse_die_raw(
+            &mut reference_cursor,
+            self.dwarf,
+            target_cu_index,
+            abbrev_table,
+        )
     }
 
     /// Reads a CU-local reference and returns the target DIE's position within
-    /// `compile_unit.data`. Rejects `DW_FORM_ref_addr` (which may cross CU
+    /// the CU's `data`. Rejects `DW_FORM_ref_addr` (which may cross CU
     /// boundaries) — callers needing cross-CU references must use [`Attr::as_reference`].
     pub fn as_cu_local_reference_position(&self) -> Result<usize> {
-        let mut cursor = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
         let cu_relative_offset = match self.dw_form()? {
             DwForm::Ref1 => cursor.read_u8()? as usize,
             DwForm::Ref2 => cursor.read_u16()? as usize,
@@ -889,7 +841,7 @@ impl<'elf, 'arena> Attr<'elf, 'arena> {
     }
 
     pub fn as_string(&self) -> Result<&'elf CStr> {
-        let mut cursor: Cursor<'elf> = Cursor::new(&self.compile_unit.data[self.location_offset..]);
+        let mut cursor: Cursor<'elf> = Cursor::new(&self.cu().data[self.location_offset..]);
         match self.dw_form()? {
             DwForm::String => {
                 return cursor.read_string();
@@ -897,7 +849,7 @@ impl<'elf, 'arena> Attr<'elf, 'arena> {
             DwForm::Strp => {
                 let offset = cursor.read_u32()? as usize;
                 let string_table = self
-                    .compile_unit
+                    .dwarf
                     .elf
                     .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_str\0")?)
                     .ok_or(anyhow!("Failed to find .debug_str section"))?;
@@ -910,9 +862,9 @@ impl<'elf, 'arena> Attr<'elf, 'arena> {
         }
     }
 
-    pub fn as_range_list(&self) -> Result<RangeList<'elf, 'arena>> {
+    pub fn as_range_list(&self) -> Result<RangeList<'elf>> {
         let debug_ranges_bytes = self
-            .compile_unit
+            .dwarf
             .elf
             .get_section_content_by_name(
                 &CStr::from_bytes_until_nul(b".debug_ranges")
@@ -922,19 +874,24 @@ impl<'elf, 'arena> Attr<'elf, 'arena> {
         // Parse the offset stored at the current attribute position
         let offset = self.as_section_offset()? as usize;
         let data = &debug_ranges_bytes[offset..];
-        let base_address = match self
-            .compile_unit
-            .root_internal(Rc::clone(&self.abbrev_table))?
-            .get_attr(DwAt::LowPc as u64)
-        {
-            Some(attr) => attr.as_address()?,
-            None => FileAddress {
-                elf_handle: self.compile_unit.elf,
-                address: 0usize,
-            },
+        let base_address = {
+            let mut root_cursor = Cursor::new(self.cu().data);
+            let root = parse_die_raw(
+                &mut root_cursor,
+                self.dwarf,
+                self.cu_index,
+                Rc::clone(&self.abbrev_table),
+            )?;
+            match root.get_attr(DwAt::LowPc as u64) {
+                Some(attr) => attr.as_address()?,
+                None => FileAddress {
+                    elf_handle: self.dwarf.elf,
+                    address: 0usize,
+                },
+            }
         };
         Ok(RangeList {
-            compile_unit: self.compile_unit,
+            elf: self.dwarf.elf,
             data,
             base_address,
         })
@@ -951,17 +908,6 @@ impl AttrSpec {
 }
 
 // --- Abbreviations ---
-
-impl<'elf> AbbrevTableCache<'elf> {
-    fn get_table_at_offset(&mut self, offset: usize) -> Result<Rc<AbbrevTable>> {
-        if !self.tables.contains_key(&offset) {
-            // Cache miss
-            self.tables
-                .insert(offset, Rc::new(parse_abbrev_table(self.elf, offset)?));
-        }
-        Ok(Rc::clone(self.tables.get(&offset).unwrap()))
-    }
-}
 
 fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
     let section_buffer: &[u8] = elf
@@ -1011,10 +957,10 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
 
 // --- Range Lists ---
 
-impl<'elf, 'arena> RangeList<'elf, 'arena> {
-    pub fn iter(&self) -> RangeListIterator<'elf, 'arena> {
+impl<'elf> RangeList<'elf> {
+    pub fn iter(&self) -> RangeListIterator<'elf> {
         RangeListIterator {
-            compile_unit: self.compile_unit,
+            elf: self.elf,
             data: self.data,
             position: 0usize,
             base_address: self.base_address,
@@ -1032,7 +978,7 @@ impl<'elf> RangeListEntry<'elf> {
     }
 }
 
-impl<'elf, 'arena> Iterator for RangeListIterator<'elf, 'arena> {
+impl<'elf> Iterator for RangeListIterator<'elf> {
     type Item = RangeListEntry<'elf>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1063,7 +1009,7 @@ impl<'elf, 'arena> Iterator for RangeListIterator<'elf, 'arena> {
                 .expect("Failed to extract range-list entry high");
             if low == BASE_ADDRESS_FLAG {
                 self.base_address = FileAddress {
-                    elf_handle: self.compile_unit.elf,
+                    elf_handle: self.elf,
                     address: high as usize,
                 };
             } else if low == 0 && high == 0 {

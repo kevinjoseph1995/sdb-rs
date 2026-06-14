@@ -17,7 +17,6 @@ syscalls = { version = "0.7.0", features = ["x86_64"] }
 test-binary = "3.0.2"
 zydis = "4.1.1"
 elf = "0.8.0"
-bumpalo = { version = "3.20.3", features = ["allocator-api2", "collections"] }
 
 [dev-dependencies]
 procfs = "0.17.0"
