@@ -1,12 +1,15 @@
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
-use crate::{address::VirtAddress, elf::Elf, process::Process};
+use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
 use anyhow::{Context, Result};
 use libc::AT_ENTRY;
 
 pub struct Target {
     pub process: Process,
-    pub elf: Elf,
+    pub elf: Rc<Elf>,
+    /// DWARF debug info, or `None` for a binary without a `.debug_info` section.
+    pub dwarf: Option<Dwarf>,
 }
 
 impl Target {
@@ -22,8 +25,12 @@ impl Target {
             debug_process_being_launched,
             stdout_replacement,
         )?;
-        let elf = Self::create_loaded_elf(&process, executable_path)?;
-        Ok(Target { process, elf })
+        let (elf, dwarf) = Self::load(&process, executable_path)?;
+        Ok(Target {
+            process,
+            elf,
+            dwarf,
+        })
     }
 
     pub fn attach(pid: crate::Pid) -> Result<Self> {
@@ -31,8 +38,19 @@ impl Target {
         // exe: Link to the executable of this process
         let executable_path = PathBuf::from_iter(["/proc", &pid.to_string(), "exe"]);
         let process = Process::attach(pid)?;
-        let elf = Self::create_loaded_elf(&process, &executable_path)?;
-        Ok(Target { process, elf })
+        let (elf, dwarf) = Self::load(&process, &executable_path)?;
+        Ok(Target {
+            process,
+            elf,
+            dwarf,
+        })
+    }
+
+    /// Loads the executable's ELF (with load bias applied) and its DWARF info, if any.
+    fn load(process: &Process, path: &Path) -> Result<(Rc<Elf>, Option<Dwarf>)> {
+        let elf = Rc::new(Self::create_loaded_elf(process, path)?);
+        let dwarf = Dwarf::new(Rc::clone(&elf))?;
+        Ok((elf, dwarf))
     }
 
     fn create_loaded_elf(process: &Process, path: &Path) -> Result<Elf> {
