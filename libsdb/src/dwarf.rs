@@ -107,7 +107,8 @@ pub type AbbrevTable = HashMap<u64 /* abbreviation code*/, Rc<Abbrev>>;
 
 pub struct RangeList<'elf> {
     elf: &'elf Elf,
-    data: &'elf [u8],
+    /// Offset of this range list within the `.debug_ranges` section.
+    offset: usize,
     base_address: FileAddress<'elf>,
 }
 
@@ -118,7 +119,9 @@ pub struct RangeListEntry<'elf> {
 
 pub struct RangeListIterator<'elf> {
     elf: &'elf Elf,
-    data: &'elf [u8],
+    /// Offset of the range list within the `.debug_ranges` section.
+    offset: usize,
+    /// Position within the range list, relative to `offset`.
     position: usize,
     base_address: FileAddress<'elf>,
 }
@@ -858,17 +861,11 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
     }
 
     pub fn as_range_list(&self) -> Result<RangeList<'elf>> {
-        let debug_ranges_bytes = self
-            .dwarf
-            .elf
-            .get_section_content_by_name(
-                &CStr::from_bytes_until_nul(b".debug_ranges")
-                    .expect("Bytes -> &CStr conversion failed"),
-            )
-            .ok_or(anyhow!("Failed to find .debug_ranges"))?;
+        // Validate the section is present up front; the iterator resolves the
+        // bytes lazily from this offset.
+        debug_ranges_section(self.dwarf.elf)?;
         // Parse the offset stored at the current attribute position
         let offset = self.as_section_offset()? as usize;
-        let data = &debug_ranges_bytes[offset..];
         let base_address = {
             let mut root_cursor = Cursor::new(self.dwarf.cu_data(self.cu_index));
             let root = parse_die_raw(
@@ -887,7 +884,7 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
         };
         Ok(RangeList {
             elf: self.dwarf.elf,
-            data,
+            offset,
             base_address,
         })
     }
@@ -952,11 +949,20 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
 
 // --- Range Lists ---
 
+/// Resolves the `.debug_ranges` section bytes.
+fn debug_ranges_section(elf: &Elf) -> Result<&[u8]> {
+    elf.get_section_content_by_name(
+        &CStr::from_bytes_until_nul(b".debug_ranges")
+            .expect("Bytes -> &CStr conversion failed"),
+    )
+    .ok_or_else(|| anyhow!("Failed to find .debug_ranges"))
+}
+
 impl<'elf> RangeList<'elf> {
     pub fn iter(&self) -> RangeListIterator<'elf> {
         RangeListIterator {
             elf: self.elf,
-            data: self.data,
+            offset: self.offset,
             position: 0usize,
             base_address: self.base_address,
         }
@@ -994,7 +1000,9 @@ impl<'elf> Iterator for RangeListIterator<'elf> {
 
          */
         const BASE_ADDRESS_FLAG: u64 = u64::MAX;
-        let mut cursor = Cursor::new(&self.data[self.position..]);
+        let debug_ranges = debug_ranges_section(self.elf).expect("Failed to find .debug_ranges");
+        let data = &debug_ranges[self.offset..];
+        let mut cursor = Cursor::new(&data[self.position..]);
         loop {
             let low: u64 = cursor
                 .read_u64()
