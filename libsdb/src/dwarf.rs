@@ -13,20 +13,23 @@ pub const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 // --- Top-level DWARF handle
 pub struct Dwarf<'elf> {
     elf: &'elf Elf,
-    compile_units: Vec<CompileUnit<'elf>>,
+    /// The whole `.debug_info` section. CU `data_range`s index into this.
+    debug_info: &'elf [u8],
+    compile_units: Vec<CompileUnit>,
     function_index: HashMap<String, Vec<IndexEntry>>,
     abbrev_table_cache: RefCell<HashMap<usize, Rc<AbbrevTable>>>,
 }
 
-pub struct CompileUnit<'elf> {
+pub struct CompileUnit {
     abbrev_offset: usize,
     /// Start offset of this CU (including its header) within the .debug_info section.
     /// Used to resolve `DW_FORM_ref_addr` references that point into other CUs.
     debug_info_offset: usize,
-    /// DIE bytes for this CU, with the [`COMPILE_UNIT_HEADER_SIZE`]-byte header
-    /// already stripped. All offsets stored in this module (DIE `position`/`next`,
-    /// `attr_locations`) are indices into this slice.
-    data: &'elf [u8],
+    /// Range of this CU's DIE bytes within the `.debug_info` section, with the
+    /// [`COMPILE_UNIT_HEADER_SIZE`]-byte header already stripped. All offsets stored
+    /// in this module (DIE `position`/`next`, `attr_locations`) are indices into the
+    /// slice this range resolves to (see [`Dwarf::cu_data`]).
+    data_range: std::ops::Range<usize>,
 }
 
 struct IndexEntry {
@@ -126,9 +129,13 @@ pub struct RangeListIterator<'elf> {
 
 impl<'elf> Dwarf<'elf> {
     pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
-        let compile_units = parse_compile_units(elf)?;
+        let debug_info = elf
+            .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_info\0")?)
+            .context("Failed to find .debug_info section")?;
+        let compile_units = parse_compile_units(debug_info)?;
         let mut dwarf = Dwarf {
             elf,
+            debug_info,
             compile_units,
             function_index: HashMap::new(),
             abbrev_table_cache: RefCell::new(HashMap::new()),
@@ -140,8 +147,13 @@ impl<'elf> Dwarf<'elf> {
         Ok(dwarf)
     }
 
-    pub fn compile_units(&self) -> &[CompileUnit<'elf>] {
+    pub fn compile_units(&self) -> &[CompileUnit] {
         &self.compile_units
+    }
+
+    /// Resolves a CU's DIE bytes (header stripped) within the `.debug_info` section.
+    fn cu_data(&self, cu_index: usize) -> &'elf [u8] {
+        &self.debug_info[self.compile_units[cu_index].data_range.clone()]
     }
 
     fn get_abbrev_table(&self, offset: usize) -> Result<Rc<AbbrevTable>> {
@@ -156,9 +168,8 @@ impl<'elf> Dwarf<'elf> {
     }
 
     pub fn root_of<'dw>(&'dw self, cu_index: usize) -> Result<Die<'dw, 'elf>> {
-        let cu = &self.compile_units[cu_index];
-        let table = self.get_abbrev_table(cu.abbrev_offset)?;
-        let mut cursor = Cursor::new(cu.data);
+        let table = self.get_abbrev_table(self.compile_units[cu_index].abbrev_offset)?;
+        let mut cursor = Cursor::new(self.cu_data(cu_index));
         parse_die_raw(&mut cursor, self, cu_index, table)
     }
 
@@ -182,11 +193,10 @@ impl<'elf> Dwarf<'elf> {
             .collect();
 
         for (cu_index, offset) in entries {
-            let cu = &self.compile_units[cu_index];
             let abbrev_table = self
-                .get_abbrev_table(cu.abbrev_offset)
+                .get_abbrev_table(self.compile_units[cu_index].abbrev_offset)
                 .expect("Failed to get abbrev table");
-            let mut cursor = Cursor::new(&cu.data[offset..]);
+            let mut cursor = Cursor::new(&self.cu_data(cu_index)[offset..]);
             let die = parse_die_raw(&mut cursor, self, cu_index, abbrev_table)
                 .expect("Failed to parse DIE");
             match (die.contains(address), &die) {
@@ -213,11 +223,10 @@ impl<'elf> Dwarf<'elf> {
         entries
             .into_iter()
             .map(|(cu_index, offset)| {
-                let cu = &self.compile_units[cu_index];
                 let abbrev_table = self
-                    .get_abbrev_table(cu.abbrev_offset)
+                    .get_abbrev_table(self.compile_units[cu_index].abbrev_offset)
                     .expect("Failed to get abbrev table");
-                let mut cursor = Cursor::new(&cu.data[offset..]);
+                let mut cursor = Cursor::new(&self.cu_data(cu_index)[offset..]);
                 parse_die_raw(&mut cursor, self, cu_index, abbrev_table)
                     .expect("Failed to parse DIE")
             })
@@ -282,18 +291,16 @@ fn find_cu_containing(dwarf: &Dwarf<'_>, abs_offset: usize) -> Result<(usize, us
             // `data` no longer includes the CU header, so the CU's footprint
             // in .debug_info is `[debug_info_offset, debug_info_offset + header + data)`.
             abs_offset >= cu.debug_info_offset
-                && abs_offset < cu.debug_info_offset + COMPILE_UNIT_HEADER_SIZE + cu.data.len()
+                && abs_offset
+                    < cu.debug_info_offset + COMPILE_UNIT_HEADER_SIZE + cu.data_range.len()
         })
         .ok_or_else(|| anyhow!("RefAddr {:#x} not in any compile unit", abs_offset))?;
     let cu = &dwarf.compile_units[cu_index];
     Ok((cu_index, abs_offset - cu.debug_info_offset))
 }
 
-fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
-    let debug_info_data = elf
-        .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_info\0")?)
-        .context("Failed to find .debug_info section")?;
-    let mut cursor = Cursor::new(debug_info_data);
+fn parse_compile_units(debug_info: &[u8]) -> Result<Vec<CompileUnit>> {
+    let mut cursor = Cursor::new(debug_info);
     let mut compile_units = Vec::new();
     while !cursor.is_at_end() {
         compile_units.push(parse_compile_unit(&mut cursor)?);
@@ -301,7 +308,7 @@ fn parse_compile_units<'elf>(elf: &'elf Elf) -> Result<Vec<CompileUnit<'elf>>> {
     Ok(compile_units)
 }
 
-fn parse_compile_unit<'elf>(cursor: &mut Cursor<'elf>) -> Result<CompileUnit<'elf>> {
+fn parse_compile_unit(cursor: &mut Cursor<'_>) -> Result<CompileUnit> {
     let start = cursor.position();
     let mut size: u32 = cursor
         .read_u32()
@@ -327,26 +334,23 @@ fn parse_compile_unit<'elf>(cursor: &mut Cursor<'elf>) -> Result<CompileUnit<'el
     // "because the reported size in the compile unit header doesn't include the size field itself"
     size += std::mem::size_of::<u32>() as u32;
     let end = start + size as usize;
-    // `data` is the DIE stream only — the CU header has already been consumed
-    // by the reads above, so we slice from `cursor.position()` (which sits just
-    // past the header) to `end`. This keeps all downstream offsets header-free.
-    let compile_unit_data: &'elf [u8] = &cursor.bytes[cursor.position()..end];
+    // `data_range` covers the DIE stream only — the CU header has already been
+    // consumed by the reads above, so we start at `cursor.position()` (which sits
+    // just past the header). This keeps all downstream offsets header-free.
+    let data_range = cursor.position()..end;
     cursor.increment_cursor_by(end - cursor.position());
     Ok(CompileUnit {
         abbrev_offset: abbrev as usize,
         debug_info_offset: start,
-        data: compile_unit_data,
+        data_range,
     })
 }
 
 // --- CompileUnit ---
 
-impl<'elf> CompileUnit<'elf> {
+impl CompileUnit {
     pub fn debug_info_offset(&self) -> usize {
         self.debug_info_offset
-    }
-    pub fn data(&self) -> &'elf [u8] {
-        self.data
     }
     pub fn abbrev_offset(&self) -> usize {
         self.abbrev_offset
@@ -557,7 +561,7 @@ impl<'dw, 'elf> DiePayload<'dw, 'elf> {
         &self.abbrev.attr_specs
     }
 
-    pub fn compile_unit(&self) -> &'dw CompileUnit<'elf> {
+    pub fn compile_unit(&self) -> &'dw CompileUnit {
         &self.dwarf.compile_units[self.cu_index]
     }
 }
@@ -569,7 +573,7 @@ impl<'dw, 'elf> Iterator for DieChildrenIter<'dw, 'elf> {
         if self.done {
             return None;
         }
-        let die_data = self.dwarf.compile_units[self.cu_index].data;
+        let die_data = self.dwarf.cu_data(self.cu_index);
         let mut cursor = Cursor::new(die_data);
         cursor.increment_cursor_by(self.current_offset);
 
@@ -691,10 +695,6 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
         self.attr_type
     }
 
-    fn cu(&self) -> &'dw CompileUnit<'elf> {
-        &self.dwarf.compile_units[self.cu_index]
-    }
-
     fn dw_form(&self) -> Result<DwForm> {
         u8::try_from(self.form)
             .ok()
@@ -706,7 +706,7 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
         if self.dw_form()? != DwForm::Addr {
             return Err(anyhow!("Invalid attr type. Expected DwForm::Addr"));
         }
-        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.dwarf.cu_data(self.cu_index)[self.location_offset..]);
         let address = cursor.read_u64().context("Failed to extract u64")? as usize;
         Ok(FileAddress {
             elf_handle: self.dwarf.elf,
@@ -718,12 +718,12 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
         if self.dw_form()? != DwForm::SecOffset {
             return Err(anyhow!("Invalid attr type. Expected DwForm::SecOffset"));
         }
-        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.dwarf.cu_data(self.cu_index)[self.location_offset..]);
         Ok(cursor.read_u32().context("Failed to extract u32")?)
     }
 
     pub fn as_int(&self) -> Result<u64> {
-        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.dwarf.cu_data(self.cu_index)[self.location_offset..]);
         match self.dw_form()? {
             DwForm::Data1 => Ok(cursor.read_u8()? as u64),
             DwForm::Data2 => Ok(cursor.read_u16()? as u64),
@@ -736,7 +736,7 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
     }
 
     pub fn as_block(&self) -> Result<&[u8]> {
-        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.dwarf.cu_data(self.cu_index)[self.location_offset..]);
         let size = match self.dw_form()? {
             DwForm::Block1 => cursor.read_u8()? as usize,
             DwForm::Block2 => cursor.read_u16()? as usize,
@@ -751,15 +751,15 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
             .checked_add(size)
             .ok_or_else(|| anyhow!("Block size overflow"))?;
         let buffer = self
-            .cu()
-            .data
+            .dwarf
+            .cu_data(self.cu_index)
             .get(start..end)
             .ok_or_else(|| anyhow!("Block extends past compile unit data"))?;
         Ok(buffer)
     }
 
     pub fn as_reference(&self) -> Result<Die<'dw, 'elf>> {
-        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.dwarf.cu_data(self.cu_index)[self.location_offset..]);
         let (target_cu_index, cu_relative_offset): (usize, usize) = match self.dw_form()? {
             DwForm::Ref1 => (self.cu_index, cursor.read_u8()? as usize),
             DwForm::Ref2 => (self.cu_index, cursor.read_u16()? as usize),
@@ -798,9 +798,9 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
         // The target CU may use a different abbrev table than this attr's CU
         // (DW_FORM_ref_addr can cross CU boundaries), so look it up by the target's
         // abbrev_offset rather than reusing the caller's table.
-        let target_cu = &self.dwarf.compile_units[target_cu_index];
-        let abbrev_table = self.dwarf.get_abbrev_table(target_cu.abbrev_offset)?;
-        let mut reference_cursor = Cursor::new(target_cu.data);
+        let target_abbrev_offset = self.dwarf.compile_units[target_cu_index].abbrev_offset;
+        let abbrev_table = self.dwarf.get_abbrev_table(target_abbrev_offset)?;
+        let mut reference_cursor = Cursor::new(self.dwarf.cu_data(target_cu_index));
         reference_cursor.increment_cursor_by(data_offset);
         parse_die_raw(
             &mut reference_cursor,
@@ -814,7 +814,7 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
     /// the CU's `data`. Rejects `DW_FORM_ref_addr` (which may cross CU
     /// boundaries) — callers needing cross-CU references must use [`Attr::as_reference`].
     pub fn as_cu_local_reference_position(&self) -> Result<usize> {
-        let mut cursor = Cursor::new(&self.cu().data[self.location_offset..]);
+        let mut cursor = Cursor::new(&self.dwarf.cu_data(self.cu_index)[self.location_offset..]);
         let cu_relative_offset = match self.dw_form()? {
             DwForm::Ref1 => cursor.read_u8()? as usize,
             DwForm::Ref2 => cursor.read_u16()? as usize,
@@ -836,7 +836,7 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
     }
 
     pub fn as_string(&self) -> Result<&'elf CStr> {
-        let mut cursor: Cursor<'elf> = Cursor::new(&self.cu().data[self.location_offset..]);
+        let mut cursor: Cursor<'elf> = Cursor::new(&self.dwarf.cu_data(self.cu_index)[self.location_offset..]);
         match self.dw_form()? {
             DwForm::String => {
                 return cursor.read_string();
@@ -870,7 +870,7 @@ impl<'dw, 'elf> Attr<'dw, 'elf> {
         let offset = self.as_section_offset()? as usize;
         let data = &debug_ranges_bytes[offset..];
         let base_address = {
-            let mut root_cursor = Cursor::new(self.cu().data);
+            let mut root_cursor = Cursor::new(self.dwarf.cu_data(self.cu_index));
             let root = parse_die_raw(
                 &mut root_cursor,
                 self.dwarf,
