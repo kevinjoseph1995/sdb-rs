@@ -129,11 +129,19 @@ pub struct RangeListIterator<'elf> {
 // --- Dwarf ---
 
 impl Dwarf {
-    pub fn new(elf: Rc<Elf>) -> Result<Dwarf> {
+    /// Parses the DWARF info for `elf`.
+    ///
+    /// Returns `Ok(None)` when the ELF has no `.debug_info` section (a stripped
+    /// binary, or one built without debug info), and `Err` only when the section
+    /// is present but cannot be parsed.
+    pub fn new(elf: Rc<Elf>) -> Result<Option<Dwarf>> {
         let compile_units = {
-            let debug_info = elf
+            let debug_info = match elf
                 .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_info\0")?)
-                .context("Failed to find .debug_info section")?;
+            {
+                Some(debug_info) => debug_info,
+                None => return Ok(None),
+            };
             parse_compile_units(debug_info)?
         };
         let mut dwarf = Dwarf {
@@ -146,7 +154,7 @@ impl Dwarf {
         // and the abbrev cache, so the (empty) `function_index` is never observed
         // before it is assigned.
         dwarf.function_index = dwarf.build_function_index();
-        Ok(dwarf)
+        Ok(Some(dwarf))
     }
 
     pub fn elf(&self) -> &Elf {
