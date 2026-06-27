@@ -14,7 +14,7 @@ pub const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 pub struct Dwarf<'elf> {
     elf: &'elf Elf,
     compile_units: Vec<CompileUnit<'elf>>,
-    function_index: RefCell<HashMap<String, Vec<IndexEntry>>>,
+    function_index: HashMap<String, Vec<IndexEntry>>,
     abbrev_table_cache: RefCell<HashMap<usize, Rc<AbbrevTable>>>,
 }
 
@@ -127,12 +127,17 @@ pub struct RangeListIterator<'elf> {
 impl<'elf> Dwarf<'elf> {
     pub fn new(elf: &'elf Elf) -> Result<Dwarf<'elf>> {
         let compile_units = parse_compile_units(elf)?;
-        Ok(Dwarf {
+        let mut dwarf = Dwarf {
             elf,
             compile_units,
-            function_index: RefCell::new(HashMap::new()),
+            function_index: HashMap::new(),
             abbrev_table_cache: RefCell::new(HashMap::new()),
-        })
+        };
+        // Build the function index eagerly. The walk only reads `compile_units`
+        // and the abbrev cache, so the (empty) `function_index` is never observed
+        // before it is assigned.
+        dwarf.function_index = dwarf.build_function_index();
+        Ok(dwarf)
     }
 
     pub fn compile_units(&self) -> &[CompileUnit<'elf>] {
@@ -169,11 +174,8 @@ impl<'elf> Dwarf<'elf> {
         &'dw self,
         address: FileAddress<'elf>,
     ) -> Option<Die<'dw, 'elf>> {
-        self.index();
-
         let entries: Vec<(usize, usize)> = self
             .function_index
-            .borrow()
             .values()
             .flatten()
             .map(|e| (e.cu_index, e.offset))
@@ -200,9 +202,7 @@ impl<'elf> Dwarf<'elf> {
     }
 
     pub fn find_functions<'dw>(&'dw self, function_name: &str) -> Vec<Die<'dw, 'elf>> {
-        self.index();
-
-        let entries: Vec<(usize, usize)> = match self.function_index.borrow().get(function_name) {
+        let entries: Vec<(usize, usize)> = match self.function_index.get(function_name) {
             Some(index_entries) => index_entries
                 .iter()
                 .map(|e| (e.cu_index, e.offset))
@@ -224,19 +224,18 @@ impl<'elf> Dwarf<'elf> {
             .collect()
     }
 
-    fn index(&self) {
-        if !self.function_index.borrow().is_empty() {
-            return;
-        }
+    fn build_function_index(&self) -> HashMap<String, Vec<IndexEntry>> {
+        let mut index = HashMap::new();
         for cu_index in 0..self.compile_units.len() {
             let die = self
                 .root_of(cu_index)
                 .expect("Failed to get root of compile unit");
-            self.index_die(die);
+            Self::index_die(die, &mut index);
         }
+        index
     }
 
-    fn index_die(&self, die: Die<'_, 'elf>) {
+    fn index_die(die: Die<'_, 'elf>, index: &mut HashMap<String, Vec<IndexEntry>>) {
         let has_range: bool = match die.get_attr(DwAt::LowPc as u64) {
             Some(_) => true,
             None => false,
@@ -261,11 +260,7 @@ impl<'elf> Dwarf<'elf> {
                     cu_index: die_payload.cu_index,
                     offset: die_payload.position,
                 };
-                self.function_index
-                    .borrow_mut()
-                    .entry(name)
-                    .or_insert_with(Vec::new)
-                    .push(entry);
+                index.entry(name).or_insert_with(Vec::new).push(entry);
             }
         }
 
@@ -274,7 +269,7 @@ impl<'elf> Dwarf<'elf> {
             None => return,
         } {
             let child = child.expect("Failed to parse children of DIE");
-            self.index_die(child);
+            Self::index_die(child, index);
         }
     }
 }
