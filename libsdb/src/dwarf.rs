@@ -951,11 +951,8 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
 
 /// Resolves the `.debug_ranges` section bytes.
 fn debug_ranges_section(elf: &Elf) -> Result<&[u8]> {
-    elf.get_section_content_by_name(
-        &CStr::from_bytes_until_nul(b".debug_ranges")
-            .expect("Bytes -> &CStr conversion failed"),
-    )
-    .ok_or_else(|| anyhow!("Failed to find .debug_ranges"))
+    elf.get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_ranges\0")?)
+        .ok_or_else(|| anyhow!("Failed to find .debug_ranges"))
 }
 
 impl<'elf> RangeList<'elf> {
@@ -979,52 +976,135 @@ impl<'elf> RangeListEntry<'elf> {
     }
 }
 
+/// A concrete range-list entry decoded from `.debug_ranges`, with the effective
+/// base address carried forward from any base-address selectors consumed.
+struct RawRangeEntry {
+    /// Effective base address after applying any base-address selectors.
+    base: u64,
+    /// Range start/end offsets, relative to `base`.
+    low: u64,
+    high: u64,
+    /// Position just past this entry, relative to the start of the range list.
+    next_position: usize,
+}
+
+/// Steps through a `.debug_ranges` range list and returns the next concrete entry.
+///
+/// `data` starts at the range list; `position` is the byte offset of the next
+/// entry within it; `base` is the current base address. The section consists of
+/// 8-byte (on x64) integer pairs of three kinds:
+///   - regular entries: `low`/`high` offsets relative to the current base address,
+///   - base-address selectors: a `u64::MAX` sentinel followed by the new base,
+///   - an end-of-list indicator: two zero integers.
+///
+/// Selectors are applied and skipped; the returned `base` reflects them. Returns
+/// `Ok(None)` at the end-of-list indicator.
+fn next_raw_range_entry(
+    data: &[u8],
+    mut position: usize,
+    mut base: u64,
+) -> Result<Option<RawRangeEntry>> {
+    const BASE_ADDRESS_FLAG: u64 = u64::MAX;
+    let mut cursor = Cursor::new(&data[position..]);
+    loop {
+        let low = cursor
+            .read_u64()
+            .context("Failed to extract range-list entry low")?;
+        let high = cursor
+            .read_u64()
+            .context("Failed to extract range-list entry high")?;
+        if low == BASE_ADDRESS_FLAG {
+            base = high;
+        } else if low == 0 && high == 0 {
+            return Ok(None);
+        } else {
+            position += cursor.position();
+            return Ok(Some(RawRangeEntry {
+                base,
+                low,
+                high,
+                next_position: position,
+            }));
+        }
+    }
+}
+
 impl<'elf> Iterator for RangeListIterator<'elf> {
     type Item = RangeListEntry<'elf>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        /*
-        * The .debug_range section consists of a series of entries of three possible kinds:
-            - regular range list entries
-            - base address selectors(which change how we should interpret regular entries)
-            - end-of-list indicators
-        * All range list entries consist of two integers with a byte size identical to the address size of the machine(8 bytes, on x64).
-            - Regular entries:
-                - A beginning address offset relative to the current base address.
-                - An ending address offset relative to the current base address.
-            - Base address selectors
-                - An integer with all bits set, which indicates that this entry is a base address selector.
-                - An integer that sets the base address from which all future range list entries should be considered an offset.
-                  (until the base address is changed again or the list ends)
-            - End-of-list indicator has both integers set to 0.
-
-         */
-        const BASE_ADDRESS_FLAG: u64 = u64::MAX;
-        let debug_ranges = debug_ranges_section(self.elf).expect("Failed to find .debug_ranges");
+        let debug_ranges =
+            debug_ranges_section(self.elf).expect("Failed to find .debug_ranges");
         let data = &debug_ranges[self.offset..];
-        let mut cursor = Cursor::new(&data[self.position..]);
-        loop {
-            let low: u64 = cursor
-                .read_u64()
-                .expect("Failed to extract range-list entry low");
-            let high: u64 = cursor
-                .read_u64()
-                .expect("Failed to extract range-list entry high");
-            if low == BASE_ADDRESS_FLAG {
-                self.base_address = FileAddress {
-                    elf_handle: self.elf,
-                    address: high as usize,
-                };
-            } else if low == 0 && high == 0 {
-                // Should end iteration as we're at the End-of-list indicator.
-                return None;
-            } else {
-                self.position = cursor.position();
-                return Some(RangeListEntry {
-                    low: self.base_address + low as usize,
-                    high: self.base_address + high as usize,
-                });
-            }
-        }
+        let entry = next_raw_range_entry(data, self.position, self.base_address.address as u64)
+            .expect("Failed to read range-list entry")?;
+        self.base_address = FileAddress {
+            elf_handle: self.elf,
+            address: entry.base as usize,
+        };
+        self.position = entry.next_position;
+        Some(RangeListEntry {
+            low: self.base_address + entry.low as usize,
+            high: self.base_address + entry.high as usize,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Encodes one `.debug_ranges` integer pair (low, high) as little-endian bytes.
+    fn pair(low: u64, high: u64) -> Vec<u8> {
+        let mut v = Vec::with_capacity(16);
+        v.extend_from_slice(&low.to_le_bytes());
+        v.extend_from_slice(&high.to_le_bytes());
+        v
+    }
+
+    #[test]
+    fn range_list_advances_across_multiple_entries() {
+        let mut data = Vec::new();
+        data.extend(pair(0x10, 0x20));
+        data.extend(pair(0x30, 0x40));
+        data.extend(pair(0, 0)); // end-of-list
+
+        let e1 = next_raw_range_entry(&data, 0, 0).unwrap().unwrap();
+        assert_eq!((e1.base, e1.low, e1.high), (0, 0x10, 0x20));
+        assert_eq!(e1.next_position, 16);
+
+        // Regression: the position must advance to the *second* entry rather than
+        // re-reading the first (the old `self.position = cursor.position()` bug).
+        let e2 = next_raw_range_entry(&data, e1.next_position, e1.base)
+            .unwrap()
+            .unwrap();
+        assert_eq!((e2.base, e2.low, e2.high), (0, 0x30, 0x40));
+        assert_eq!(e2.next_position, 32);
+
+        assert!(
+            next_raw_range_entry(&data, e2.next_position, e2.base)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn range_list_applies_base_address_selector() {
+        let mut data = Vec::new();
+        data.extend(pair(u64::MAX, 0x1000)); // base-address selector
+        data.extend(pair(0x10, 0x20)); // offsets relative to the new base
+        data.extend(pair(0, 0)); // end-of-list
+
+        let e = next_raw_range_entry(&data, 0, 0).unwrap().unwrap();
+        assert_eq!(e.base, 0x1000);
+        assert_eq!((e.low, e.high), (0x10, 0x20));
+        // Selector (16 bytes) + entry (16 bytes) consumed.
+        assert_eq!(e.next_position, 32);
+
+        assert!(
+            next_raw_range_entry(&data, e.next_position, e.base)
+                .unwrap()
+                .is_none()
+        );
     }
 }
