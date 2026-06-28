@@ -518,12 +518,9 @@ impl<'dw> Die<'dw> {
     }
 
     pub fn name(&self) -> Option<String> {
-        let payload = match &self {
-            Die::Null(_) => {
-                return None;
-            }
-            Die::NonNull(die_payload) => die_payload,
-        };
+        if let Die::Null(_) = self {
+            return None;
+        }
 
         if let Some(attr) = self.get_attr(DwAt::Name as u64) {
             return Some(
@@ -940,7 +937,14 @@ fn parse_abbrev_table(elf: &Elf, offset: usize) -> Result<AbbrevTable> {
             "Failed to find the .debug_abbrev section in {:?}",
             &elf.path
         ))?;
-    let mut cursor = Cursor::new(&section_buffer);
+    parse_abbrev_table_from_section(section_buffer, offset)
+}
+
+/// Parses one abbreviation table out of the raw `.debug_abbrev` bytes, starting
+/// at `offset`. Split out from [`parse_abbrev_table`] so the decoding can be
+/// exercised without an [`Elf`].
+fn parse_abbrev_table_from_section(section_buffer: &[u8], offset: usize) -> Result<AbbrevTable> {
+    let mut cursor = Cursor::new(section_buffer);
     cursor.increment_cursor_by(offset);
     let mut table = HashMap::<u64, Rc<Abbrev>>::new();
     loop {
@@ -1138,5 +1142,262 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // --- Compile-unit header parsing -----------------------------------------
+
+    /// Encodes a DWARF32 CU header followed by `die_bytes`. `unit_length` is
+    /// written verbatim so malformed-length cases can be exercised; use
+    /// [`cu_bytes`] for a self-consistent header.
+    fn cu_bytes_raw(
+        unit_length: u32,
+        version: u16,
+        abbrev_offset: u32,
+        address_size: u8,
+        die_bytes: &[u8],
+    ) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend_from_slice(&unit_length.to_le_bytes());
+        v.extend_from_slice(&version.to_le_bytes());
+        v.extend_from_slice(&abbrev_offset.to_le_bytes());
+        v.push(address_size);
+        v.extend_from_slice(die_bytes);
+        v
+    }
+
+    /// A well-formed DWARF32 v4 header (version 4, 8-byte addresses) wrapping
+    /// `die_bytes`, with a self-consistent `unit_length`.
+    fn cu_bytes(abbrev_offset: u32, die_bytes: &[u8]) -> Vec<u8> {
+        // unit_length counts everything after the length field itself:
+        // version (2) + abbrev_offset (4) + address_size (1) + DIE bytes.
+        let unit_length = (2 + 4 + 1 + die_bytes.len()) as u32;
+        cu_bytes_raw(unit_length, 4, abbrev_offset, 8, die_bytes)
+    }
+
+    #[test]
+    fn parse_compile_unit_reads_well_formed_header() {
+        let die_bytes = [0xAA, 0xBB, 0xCC];
+        let bytes = cu_bytes(0x1234, &die_bytes);
+        let mut cursor = Cursor::new(&bytes);
+
+        let cu = parse_compile_unit(&mut cursor).expect("valid CU header parses");
+        assert_eq!(cu.abbrev_offset, 0x1234);
+        assert_eq!(cu.debug_info_offset, 0);
+        // data_range strips the header and covers only the DIE bytes.
+        assert_eq!(cu.data_range, COMPILE_UNIT_HEADER_SIZE..bytes.len());
+        assert_eq!(cu.data_range.len(), die_bytes.len());
+        // The cursor is left just past the whole CU.
+        assert_eq!(cursor.position(), bytes.len());
+    }
+
+    #[test]
+    fn parse_compile_unit_rejects_dwarf64() {
+        // A unit_length of 0xffffffff signals the (unsupported) 64-bit format.
+        let bytes = cu_bytes_raw(0xffff_ffff, 4, 0, 8, &[]);
+        let mut cursor = Cursor::new(&bytes);
+        assert!(parse_compile_unit(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_compile_unit_rejects_unsupported_version() {
+        let die_bytes = [0u8; 2];
+        let unit_length = (2 + 4 + 1 + die_bytes.len()) as u32;
+        let bytes = cu_bytes_raw(unit_length, 5, 0, 8, &die_bytes); // version 5
+        let mut cursor = Cursor::new(&bytes);
+        assert!(parse_compile_unit(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_compile_unit_rejects_non_8_byte_addresses() {
+        let die_bytes = [0u8; 2];
+        let unit_length = (2 + 4 + 1 + die_bytes.len()) as u32;
+        let bytes = cu_bytes_raw(unit_length, 4, 0, 4, &die_bytes); // 4-byte addresses
+        let mut cursor = Cursor::new(&bytes);
+        assert!(parse_compile_unit(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_compile_units_tracks_offsets_across_units() {
+        // Two back-to-back CUs with 3- and 5-byte DIE bodies.
+        let first = cu_bytes(0x10, &[1, 2, 3]);
+        let second = cu_bytes(0x20, &[4, 5, 6, 7, 8]);
+        let mut section = first.clone();
+        section.extend_from_slice(&second);
+
+        let cus = parse_compile_units(&section).expect("two CUs parse");
+        assert_eq!(cus.len(), 2);
+
+        assert_eq!(cus[0].debug_info_offset, 0);
+        assert_eq!(cus[0].abbrev_offset, 0x10);
+        assert_eq!(cus[0].data_range, COMPILE_UNIT_HEADER_SIZE..first.len());
+
+        // The second CU's footprint starts exactly where the first ends, and its
+        // data_range skips its own header.
+        assert_eq!(cus[1].debug_info_offset, first.len());
+        assert_eq!(cus[1].abbrev_offset, 0x20);
+        let second_data_start = first.len() + COMPILE_UNIT_HEADER_SIZE;
+        assert_eq!(cus[1].data_range, second_data_start..section.len());
+    }
+
+    // --- Abbreviation table parsing ------------------------------------------
+
+    /// Unsigned LEB128 encoding of `value`.
+    fn uleb(mut value: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        loop {
+            let mut byte = (value & 0x7f) as u8;
+            value >>= 7;
+            if value != 0 {
+                byte |= 0x80;
+            }
+            out.push(byte);
+            if value == 0 {
+                break;
+            }
+        }
+        out
+    }
+
+    /// Encodes one abbreviation declaration: code, tag, children flag, and its
+    /// (attr, form) specs terminated by the 0,0 pair.
+    fn abbrev_decl(code: u64, tag: u64, has_children: bool, specs: &[(u64, u64)]) -> Vec<u8> {
+        let mut v = Vec::new();
+        v.extend(uleb(code));
+        v.extend(uleb(tag));
+        v.push(if has_children { 1 } else { 0 });
+        for &(attr, form) in specs {
+            v.extend(uleb(attr));
+            v.extend(uleb(form));
+        }
+        v.extend(uleb(0)); // attr terminator
+        v.extend(uleb(0)); // form terminator
+        v
+    }
+
+    #[test]
+    fn parse_abbrev_table_round_trips_declarations() {
+        let mut section = Vec::new();
+        section.extend(abbrev_decl(
+            1,
+            DwTag::CompileUnit as u64,
+            true,
+            &[
+                (DwAt::Name as u64, DwForm::Strp as u64),
+                (DwAt::Language as u64, DwForm::Data1 as u64),
+            ],
+        ));
+        section.extend(abbrev_decl(
+            2,
+            DwTag::BaseType as u64,
+            false,
+            &[(DwAt::ByteSize as u64, DwForm::Data1 as u64)],
+        ));
+        section.push(0); // table terminator (code 0)
+
+        let table = parse_abbrev_table_from_section(&section, 0).expect("table parses");
+        assert_eq!(table.len(), 2);
+
+        let a1 = &table[&1];
+        assert_eq!(a1.code, 1);
+        assert_eq!(a1.tag, DwTag::CompileUnit as u64);
+        assert!(a1.has_children);
+        assert_eq!(a1.attr_specs.len(), 2);
+        assert_eq!(a1.attr_specs[0].attr, DwAt::Name as u64);
+        assert_eq!(a1.attr_specs[0].form, DwForm::Strp as u64);
+        assert_eq!(a1.attr_specs[1].attr, DwAt::Language as u64);
+        assert_eq!(a1.attr_specs[1].form, DwForm::Data1 as u64);
+
+        let a2 = &table[&2];
+        assert_eq!(a2.tag, DwTag::BaseType as u64);
+        assert!(!a2.has_children);
+        assert_eq!(a2.attr_specs.len(), 1);
+    }
+
+    #[test]
+    fn parse_abbrev_table_honors_offset() {
+        let mut section = vec![0xde, 0xad, 0xbe, 0xef]; // padding before the table
+        let offset = section.len();
+        section.extend(abbrev_decl(7, DwTag::Variable as u64, false, &[]));
+        section.push(0); // table terminator
+
+        let table = parse_abbrev_table_from_section(&section, offset).expect("table parses");
+        assert_eq!(table.len(), 1);
+        assert_eq!(table[&7].tag, DwTag::Variable as u64);
+    }
+
+    #[test]
+    fn parse_abbrev_table_truncated_input_errors() {
+        // A declaration code with no following tag byte: the stream ends mid-entry.
+        let section = uleb(1);
+        assert!(parse_abbrev_table_from_section(&section, 0).is_err());
+    }
+
+    // --- skip_children --------------------------------------------------------
+
+    fn abbrev(code: u64, tag: u64, has_children: bool, specs: &[(u64, u64)]) -> Rc<Abbrev> {
+        Rc::new(Abbrev {
+            code,
+            tag,
+            has_children,
+            attr_specs: specs
+                .iter()
+                .map(|&(attr, form)| AttrSpec { attr, form })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn skip_children_walks_nested_dies() {
+        // Abbrev 1: one Data1 attribute, has children. Abbrev 2: empty leaf.
+        let mut table: AbbrevTable = HashMap::new();
+        table.insert(
+            1,
+            abbrev(
+                1,
+                DwTag::LexicalBlock as u64,
+                true,
+                &[(DwAt::LowPc as u64, DwForm::Data1 as u64)],
+            ),
+        );
+        table.insert(2, abbrev(2, DwTag::Variable as u64, false, &[]));
+
+        // One abbrev-1 DIE (with its data byte) containing one abbrev-2 child, a
+        // null closing those children, and a null closing the sibling list.
+        let mut data = Vec::new();
+        data.extend(uleb(1)); // abbrev 1
+        data.push(0xFF); //      its Data1 attribute value
+        data.extend(uleb(2)); // child: abbrev 2
+        data.extend(uleb(0)); // end of abbrev-1's children
+        data.extend(uleb(0)); // end of the sibling list
+
+        let mut cursor = Cursor::new(&data);
+        skip_children(&mut cursor, &table).expect("nested children are skipped");
+        assert_eq!(cursor.position(), data.len());
+    }
+
+    #[test]
+    fn skip_children_unknown_code_errors() {
+        let table: AbbrevTable = HashMap::new(); // empty: every code is unknown
+        let data = uleb(9);
+        let mut cursor = Cursor::new(&data);
+        assert!(skip_children(&mut cursor, &table).is_err());
+    }
+
+    #[test]
+    fn skip_children_truncated_attribute_errors() {
+        // Abbrev 1 promises a Data1 byte, but the stream ends right after the code.
+        let mut table: AbbrevTable = HashMap::new();
+        table.insert(
+            1,
+            abbrev(
+                1,
+                DwTag::Variable as u64,
+                false,
+                &[(DwAt::LowPc as u64, DwForm::Data1 as u64)],
+            ),
+        );
+        let data = uleb(1); // code only, no attribute byte
+        let mut cursor = Cursor::new(&data);
+        assert!(skip_children(&mut cursor, &table).is_err());
     }
 }
