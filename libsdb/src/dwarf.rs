@@ -220,7 +220,12 @@ impl Dwarf {
             let abbrev_table = self
                 .get_abbrev_table(self.compile_units[cu_index].abbrev_offset)
                 .expect("Failed to get abbrev table");
-            let mut cursor = Cursor::new(&self.cu_data(cu_index)[offset..]);
+            // Parse over the whole CU data (advancing the cursor to `offset`)
+            // rather than a `[offset..]` sub-slice: the parsed DIE's
+            // `attr_locations` must stay absolute within `cu_data` because
+            // `Attr` accessors index back into the full slice.
+            let mut cursor = Cursor::new(self.cu_data(cu_index));
+            cursor.increment_cursor_by(offset);
             let die = parse_die_raw(&mut cursor, self, cu_index, abbrev_table)
                 .expect("Failed to parse DIE");
             match (die.contains(address), &die) {
@@ -250,7 +255,12 @@ impl Dwarf {
                 let abbrev_table = self
                     .get_abbrev_table(self.compile_units[cu_index].abbrev_offset)
                     .expect("Failed to get abbrev table");
-                let mut cursor = Cursor::new(&self.cu_data(cu_index)[offset..]);
+                // Parse over the whole CU data (advancing the cursor to `offset`)
+                // rather than a `[offset..]` sub-slice, so the DIE's
+                // `attr_locations` stay absolute within `cu_data` — `Attr`
+                // accessors index back into the full slice.
+                let mut cursor = Cursor::new(self.cu_data(cu_index));
+                cursor.increment_cursor_by(offset);
                 parse_die_raw(&mut cursor, self, cu_index, abbrev_table)
                     .expect("Failed to parse DIE")
             })
