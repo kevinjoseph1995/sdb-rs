@@ -349,4 +349,57 @@ mod tests {
         );
         assert!(cursor.is_at_end());
     }
+
+    // The following tests stress the slice bounds of the `unsafe`
+    // `CStr::from_bytes_with_nul_unchecked` call in `read_string`. They are
+    // designed to surface off-by-one errors in the inclusive range
+    // `old_position..=old_position + null_byte_position` under Miri.
+
+    #[test]
+    fn read_string_empty() {
+        // A lone null terminator: null_byte_position == 0, so the unsafe slice
+        // is exactly the single byte `b"\0"`.
+        let mut cursor = Cursor::new(b"\0");
+        assert_eq!(
+            cursor.read_string().expect("Failed to extract empty string"),
+            &CString::from_vec_with_nul(b"\0".to_vec()).unwrap()
+        );
+        assert!(cursor.is_at_end());
+    }
+
+    #[test]
+    fn read_string_terminator_at_buffer_end() {
+        // The null terminator is the final byte of the buffer, so the unsafe
+        // slice's inclusive upper bound must be exactly the last valid index.
+        // An off-by-one here would read one past the end.
+        let mut cursor = Cursor::new(b"ABC\0");
+        assert_eq!(
+            cursor.read_string().expect("Failed to extract \"ABC\""),
+            &CString::from_vec_with_nul(b"ABC\0".to_vec()).unwrap()
+        );
+        assert!(cursor.is_at_end());
+    }
+
+    #[test]
+    fn read_string_leaves_cursor_mid_buffer() {
+        // Reading a string from the middle of a buffer must produce a slice
+        // bounded to that string and leave the cursor pointing at the byte
+        // after its terminator (not at the end).
+        let mut cursor = Cursor::new(b"hi\0\x2a");
+        assert_eq!(
+            cursor.read_string().expect("Failed to extract \"hi\""),
+            &CString::from_vec_with_nul(b"hi\0".to_vec()).unwrap()
+        );
+        assert!(!cursor.is_at_end());
+        assert_eq!(cursor.read_u8().unwrap(), 0x2a);
+        assert!(cursor.is_at_end());
+    }
+
+    #[test]
+    fn read_string_missing_terminator_errors() {
+        // No null terminator: read_string must return an error and never reach
+        // the unsafe block.
+        let mut cursor = Cursor::new(b"no terminator");
+        assert!(cursor.read_string().is_err());
+    }
 }
