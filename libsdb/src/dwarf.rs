@@ -124,6 +124,26 @@ pub struct RangeListIterator<'elf> {
     base_address: FileAddress<'elf>,
 }
 
+struct FileEntry {
+    path: std::path::PathBuf,
+    modification_time: usize,
+    file_length: usize,
+}
+
+struct LineTable {
+    /// The range into .debug_line that stores the bytes of the stream of opcodes that follows the line-table header.
+    data_range: std::ops::Range<usize>,
+    default_is_statement: bool,
+    /// The minimum value that special opcodes can add to the line register.
+    line_base: i8,
+    /// The range of values that special opcodes can add to the line register.
+    line_range: u8,
+    /// The number assigned to the first special opcode.
+    opcode_base: u8,
+    include_directories: Vec<std::path::PathBuf>,
+    file_names: Vec<FileEntry>,
+}
+
 // ===================================================================
 
 // --- Dwarf ---
@@ -1069,8 +1089,7 @@ impl<'elf> Iterator for RangeListIterator<'elf> {
     type Item = RangeListEntry<'elf>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let debug_ranges =
-            debug_ranges_section(self.elf).expect("Failed to find .debug_ranges");
+        let debug_ranges = debug_ranges_section(self.elf).expect("Failed to find .debug_ranges");
         let data = &debug_ranges[self.offset..];
         let entry = next_raw_range_entry(data, self.position, self.base_address.address as u64)
             .expect("Failed to read range-list entry")?;
