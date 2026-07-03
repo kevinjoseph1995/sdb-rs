@@ -77,18 +77,28 @@ fn test_process_resume() {
     target_process
         .resume_process()
         .expect("Failed to resume process");
+    // After resuming, the process runs normally and may be either Running or
+    // Sleeping (blocked on its stdout pipe); both prove it left TracingStopped.
+    let state = get_process_state(target_process.pid).expect("Failed to get process state");
     assert!(
-        get_process_state(target_process.pid).expect("Failed to get process state")
-            == ProcessState::Running
+        state == ProcessState::Running || state == ProcessState::Sleeping,
+        "unexpected state after resume: {:?}",
+        state
     );
 }
 #[test]
 fn test_process_resume_not_attached() {
     let target_process = Process::launch(&PathBuf::from("yes"), None, false, None)
         .expect("Process failed to launch");
+    // The process is un-traced, so it is scheduled normally. A live process
+    // legitimately alternates between Running and Sleeping; `yes` in particular
+    // spends most of its time Sleeping because it blocks in write() once its
+    // stdout pipe buffer fills. Either state proves it is not TracingStopped.
+    let state = get_process_state(target_process.pid).expect("Failed to get process state");
     assert!(
-        get_process_state(target_process.pid).expect("Failed to get process state")
-            == ProcessState::Running
+        state == ProcessState::Running || state == ProcessState::Sleeping,
+        "unexpected state before attach: {:?}",
+        state
     );
 
     let mut attached_handle = Process::attach(target_process.pid).expect("Failed to attach");
@@ -101,9 +111,13 @@ fn test_process_resume_not_attached() {
     attached_handle
         .resume_process()
         .expect("Failed to resume process");
-    assert_eq!(
-        get_process_state(attached_handle.pid).unwrap(),
-        ProcessState::Running
+    // After resuming, the process runs normally again and may be either Running
+    // or Sleeping (blocked on its stdout pipe); both prove it left TracingStopped.
+    let state = get_process_state(attached_handle.pid).unwrap();
+    assert!(
+        state == ProcessState::Running || state == ProcessState::Sleeping,
+        "unexpected state after resume: {:?}",
+        state
     );
 }
 
