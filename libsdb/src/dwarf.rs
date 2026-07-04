@@ -1554,6 +1554,21 @@ impl<'l, 'elf> LineTableIterator<'l, 'elf> {
                     panic!("Unexpected extended opcode");
                 }
             }
+        } else {
+            // Special opcode
+            assert!(opcode >= self.line_table.opcode_base);
+            let adjusted_opcode = opcode - self.line_table.opcode_base;
+            self.registers.address =
+                self.registers.address + (adjusted_opcode / self.line_table.line_range) as usize;
+            self.registers.line = self.registers.line
+                + (self.line_table.line_base as u64
+                    + (adjusted_opcode % self.line_table.line_range) as u64);
+            self.current = self.registers.clone();
+            self.registers.basic_block_start = false;
+            self.registers.prologue_end = false;
+            self.registers.epilogue_begin = false;
+            self.registers.discriminator = 0;
+            emitted = true;
         }
         // `cursor.position()` is relative to `self.position`, so advance by it to
         // keep `position` absolute within the `.debug_line` section.
