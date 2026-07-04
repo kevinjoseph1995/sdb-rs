@@ -2,7 +2,9 @@ use crate::dwarf_constants::{DwAt, DwForm, DwTag};
 use crate::elf::Elf;
 use crate::{address::FileAddress, cursor::Cursor};
 use anyhow::{Context, Result, anyhow};
+use nix::NixPath;
 use std::cell::RefCell;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{collections::HashMap, ffi::CStr};
 
@@ -13,7 +15,18 @@ pub const COMPILE_UNIT_HEADER_SIZE: usize = 11;
 // --- Top-level DWARF handle
 pub struct Dwarf {
     elf: Rc<Elf>,
+    /// The compile units parsed from `.debug_info`.
+    ///
+    /// `compile_units` and `line_tables` are always the same length, and
+    /// entries at the same index are tied together: `line_tables[i]` is the
+    /// line table for `compile_units[i]` (or `None` when that compile unit has
+    /// no line program). This parallel-vector design deviates from the book,
+    /// which nests the line table inside the compile unit, but it keeps the
+    /// lifetimes easier to work with and reason about at the `Dwarf` level.
     compile_units: Vec<CompileUnit>,
+    /// The line table for each compile unit, indexed in lockstep with
+    /// `compile_units`. See the note on `compile_units`.
+    line_tables: Vec<Option<LineTable>>,
     function_index: HashMap<String, Vec<IndexEntry>>,
     abbrev_table_cache: RefCell<HashMap<usize, Rc<AbbrevTable>>>,
 }
@@ -141,7 +154,7 @@ struct LineTable {
     /// The number assigned to the first special opcode.
     opcode_base: u8,
     include_directories: Vec<std::path::PathBuf>,
-    file_names: Vec<FileEntry>,
+    file_entries: Vec<FileEntry>,
 }
 
 // ===================================================================
@@ -155,20 +168,21 @@ impl Dwarf {
     /// binary, or one built without debug info), and `Err` only when the section
     /// is present but cannot be parsed.
     pub fn new(elf: Rc<Elf>) -> Result<Option<Dwarf>> {
-        let compile_units = {
-            let debug_info = match elf
-                .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_info\0")?)
-            {
-                Some(debug_info) => debug_info,
-                None => return Ok(None),
-            };
-            parse_compile_units(debug_info)?
-        };
         let mut dwarf = Dwarf {
-            elf,
-            compile_units,
+            elf: Rc::clone(&elf),
+            compile_units: Vec::new(),
+            line_tables: Vec::new(),
             function_index: HashMap::new(),
             abbrev_table_cache: RefCell::new(HashMap::new()),
+        };
+        dwarf.compile_units = match dwarf.build_compile_units()? {
+            Some(compile_units) => compile_units,
+            None => return Ok(None),
+        };
+
+        dwarf.line_tables = match dwarf.build_line_tables()? {
+            Some(line_tables) => line_tables,
+            None => return Ok(None),
         };
         // Build the function index eagerly. The walk only reads `compile_units`
         // and the abbrev cache, so the (empty) `function_index` is never observed
@@ -296,6 +310,192 @@ impl Dwarf {
             Self::index_die(die, &mut index);
         }
         index
+    }
+
+    /// Parses the compile units from the `.debug_info` section.
+    ///
+    /// Returns `Ok(None)` when the ELF has no `.debug_info` section.
+    fn build_compile_units(&self) -> Result<Option<Vec<CompileUnit>>> {
+        let debug_info_bytes = match self
+            .elf
+            .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_info\0")?)
+        {
+            Some(debug_info_bytes) => debug_info_bytes,
+            None => return Ok(None),
+        };
+        Ok(Some(parse_compile_units(debug_info_bytes)?))
+    }
+
+    fn build_line_tables(&self) -> Result<Option<Vec<Option<LineTable>>>> {
+        assert!(!self.compile_units.is_empty());
+        let debug_line_bytes = match self
+            .elf
+            .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_line\0")?)
+        {
+            Some(debug_line_bytes) => debug_line_bytes,
+            None => return Ok(None),
+        };
+
+        let line_tables = self
+            .compile_units
+            .iter()
+            .enumerate()
+            .map(|(cu_index, _compile_unit)| {
+                self.build_line_table_for_compile_unit(cu_index, debug_line_bytes)
+            })
+            .collect::<Result<Vec<_>>>()?; // Will short circuit and return an error early if build_line_table_for_compile_unit fails even once
+
+        assert!(line_tables.len() == self.compile_units.len());
+        Ok(Some(line_tables))
+    }
+
+    fn cstr_to_pathbuf_unix(c_str: &CStr) -> PathBuf {
+        let os_str =
+            <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(c_str.to_bytes());
+        PathBuf::from(os_str) // Correct way to instantiate an owned PathBuf
+    }
+
+    fn build_line_table_for_compile_unit(
+        &self,
+        cu_index: usize,
+        debug_line_bytes: &[u8],
+    ) -> Result<Option<LineTable>> {
+        let root_die_payload = match self.root_of(cu_index)? {
+            Die::Null(_) => return Err(anyhow!("Expected non-null DIE")),
+            Die::NonNull(die_payload) => die_payload,
+        };
+
+        let attr = match root_die_payload.get_attr(DwAt::StmtList as u64) {
+            Some(attr) => attr,
+            None => return Ok(None),
+        };
+        let section_offset = attr.as_section_offset()? as usize;
+
+        let mut cursor = Cursor::new(&debug_line_bytes[section_offset..]);
+
+        // unit_length (uint32_t) The byte size of the line number information for this compile unit,
+        // not including the unit_length field itself.
+        let size: usize = cursor.read_u32()? as usize;
+        let end: usize = cursor.position() + size;
+
+        if cursor.read_u16()? != 4 {
+            return Err(anyhow!("Only DWARF 4 is supported"));
+        }
+
+        let _header_length = cursor.read_u32()?;
+
+        let minimum_instruction_length = cursor.read_u8()?;
+        if minimum_instruction_length != 1 {
+            return Err(anyhow!("Invalid minimum instruction length"));
+        }
+
+        let maximum_operations_per_instruction = cursor.read_u8()?;
+        if maximum_operations_per_instruction != 1 {
+            return Err(anyhow!("Invalid maximum operations per instruction"));
+        }
+
+        let default_is_statement: bool = cursor.read_u8()? > 0;
+        let line_base: i8 = cursor.read_i8()?;
+        let line_range: u8 = cursor.read_u8()?;
+        let opcode_base: u8 = cursor.read_u8()?;
+
+        const EXPECTED_OPCODE_LENGTHS: &'static [u8; 12] = &[0, 1, 1, 1, 1, 0, 0, 0, 1, 0, 0, 1];
+
+        if (opcode_base as usize - 1) > EXPECTED_OPCODE_LENGTHS.len() {
+            return Err(anyhow!("Invalid value for op_code_base"));
+        }
+
+        for i in 0..(opcode_base - 1) as usize {
+            if cursor.read_u8()? != EXPECTED_OPCODE_LENGTHS[i] {
+                return Err(anyhow!("Unexpected opcode length"));
+            }
+        }
+
+        // Next we parse the include directories
+        let compilation_dir = Self::cstr_to_pathbuf_unix(
+            root_die_payload
+                .get_attr(DwAt::CompDir as u64)
+                .ok_or(anyhow!("Root does not contain DwAt::CompDir"))?
+                .as_string()?,
+        );
+
+        // Read null-terminated directory entries until the empty string terminator,
+        // resolving each relative path against the compilation directory.
+        let include_directories =
+            std::iter::from_fn(
+                || match cursor.read_string().map(Self::cstr_to_pathbuf_unix) {
+                    Ok(dir) if dir.is_empty() => None, // Terminate the iteration, we hit a null byte
+                    other => Some(other),
+                },
+            )
+            .map(|dir| {
+                dir.map(|dir| {
+                    if dir.is_absolute() {
+                        dir
+                    } else {
+                        compilation_dir.join(dir)
+                    }
+                })
+            })
+            .collect::<Result<Vec<PathBuf>>>()?;
+
+        // Read null-terminated file entries until the null-byte terminator.
+        let file_entries = std::iter::from_fn(|| match cursor.peek() {
+            0 => None, // Terminate the iteration, we hit the null byte
+            _ => Some(self.parse_line_table_file(
+                &mut cursor,
+                &compilation_dir,
+                &include_directories,
+            )),
+        })
+        .collect::<Result<Vec<FileEntry>>>()?;
+
+        // Consume the null byte that terminates the file-name list; the cursor now
+        // points at the first byte of the opcode stream. Cursor positions are
+        // relative to `section_offset`, so shift by it to index the whole section.
+        cursor.increment_cursor_by(1);
+        let data_range = (section_offset + cursor.position())..(section_offset + end);
+
+        Ok(Some(LineTable {
+            data_range,
+            default_is_statement,
+            line_base,
+            line_range,
+            opcode_base,
+            include_directories,
+            file_entries,
+        }))
+    }
+
+    fn parse_line_table_file(
+        &self,
+        cursor: &mut Cursor,
+        compilation_dir: &Path,
+        include_directories: &Vec<PathBuf>,
+    ) -> Result<FileEntry> {
+        let file_name = cursor.read_string()?;
+        let dir_index = cursor.uleb128()? as usize;
+        let modification_time = cursor.uleb128()? as usize;
+        let file_length = cursor.uleb128()? as usize;
+
+        let file_path: PathBuf = {
+            let file_path = Self::cstr_to_pathbuf_unix(file_name);
+            if !file_path.is_absolute() {
+                if dir_index == 0 {
+                    compilation_dir.join(file_path)
+                } else {
+                    include_directories[dir_index - 1].join(file_path)
+                }
+            } else {
+                file_path
+            }
+        };
+
+        Ok(FileEntry {
+            path: file_path,
+            modification_time,
+            file_length,
+        })
     }
 
     fn index_die(die: Die<'_>, index: &mut HashMap<String, Vec<IndexEntry>>) {

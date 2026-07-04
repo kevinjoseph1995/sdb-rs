@@ -12,6 +12,10 @@ impl<'a> Cursor<'a> {
         Cursor { bytes, position: 0 }
     }
 
+    pub fn peek(&self) -> u8 {
+        return self.bytes[self.position];
+    }
+
     pub fn position(&self) -> usize {
         self.position
     }
@@ -361,7 +365,9 @@ mod tests {
         // is exactly the single byte `b"\0"`.
         let mut cursor = Cursor::new(b"\0");
         assert_eq!(
-            cursor.read_string().expect("Failed to extract empty string"),
+            cursor
+                .read_string()
+                .expect("Failed to extract empty string"),
             &CString::from_vec_with_nul(b"\0".to_vec()).unwrap()
         );
         assert!(cursor.is_at_end());
