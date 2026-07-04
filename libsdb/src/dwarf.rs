@@ -1,4 +1,4 @@
-use crate::dwarf_constants::{DwAt, DwForm, DwTag};
+use crate::dwarf_constants::{DwAt, DwForm, DwLne, DwLns, DwTag};
 use crate::elf::Elf;
 use crate::{address::FileAddress, cursor::Cursor};
 use anyhow::{Context, Result, anyhow};
@@ -154,7 +154,67 @@ struct LineTable {
     /// The number assigned to the first special opcode.
     opcode_base: u8,
     include_directories: Vec<std::path::PathBuf>,
+    /// The compilation directory (DW_AT_comp_dir of the owning CU's root DIE),
+    /// used to resolve relative file paths — including those introduced at
+    /// runtime by DW_LNE_define_file during iteration.
+    comp_dir: std::path::PathBuf,
+    /// Set once the first iteration has appended any DW_LNE_define_file entries
+    /// to `file_entries`. Later iterations still parse those opcodes but skip the
+    /// push, so re-iterating never accumulates duplicate entries.
+    define_files_loaded: bool,
     file_entries: Vec<FileEntry>,
+}
+#[derive(Clone)]
+struct LineTableEntry<'elf> {
+    /// Address of the machine instruction this row describes.
+    address: FileAddress<'elf>,
+    /// 1-based index into the line table's `file_entries` list identifying the
+    /// source file. DWARF starts file numbering at 1.
+    file_index: u64,
+    /// Source line number (1-based; 0 means the instruction cannot be attributed
+    /// to any source line).
+    line: u64,
+    /// Source column number (0 means the whole line / no column info).
+    column: u64,
+    /// Whether this row is a recommended breakpoint location (a statement boundary).
+    is_stmt: bool,
+    /// Whether this row starts a basic block.
+    basic_block_start: bool,
+    /// Whether this row is the end of a sequence of instructions, so `address` is
+    /// the first byte past the sequence and the other fields carry no meaning.
+    end_sequence: bool,
+    /// Whether this row is a recommended breakpoint location just after a
+    /// function's prologue.
+    prologue_end: bool,
+    /// Whether this row is a recommended breakpoint location just before a
+    /// function's epilogue.
+    epilogue_begin: bool,
+    /// Discriminator distinguishing multiple blocks associated with the same
+    /// source line.
+    discriminator: u64,
+    /// Resolved file entry for `file_index`, indexing into the owning
+    /// [`LineTable::file_entries`].
+    file_entry: Option<usize>,
+}
+
+struct LineTableIterator<'l, 'elf> {
+    /// Mutably borrowed so DW_LNE_define_file can append to `file_entries`
+    /// during iteration; the emitted entries reference files by index into it.
+    line_table: &'l mut LineTable,
+    /// The ELF owning the `.debug_line` bytes referenced by `line_table.data_range`.
+    /// `LineTable` is stored owned inside `Dwarf`, so the iterator carries the
+    /// `&Elf` instead, matching `RangeListIterator`.
+    elf: &'elf Elf,
+    // For the entire matrix entry to which it’s currently pointing
+    current: LineTableEntry<'elf>,
+    /// For the current state of the abstract machine registers
+    registers: LineTableEntry<'elf>,
+    /// A byte position inside the .debug_line section pointing to the data to parse next
+    position: usize,
+    /// Whether this iterator is responsible for appending DW_LNE_define_file
+    /// entries to the table. Only the first iterator created for a table does so;
+    /// later ones parse the opcode but leave `file_entries` untouched.
+    should_load_files: bool,
 }
 
 // ===================================================================
@@ -442,7 +502,7 @@ impl Dwarf {
         // Read null-terminated file entries until the null-byte terminator.
         let file_entries = std::iter::from_fn(|| match cursor.peek() {
             0 => None, // Terminate the iteration, we hit the null byte
-            _ => Some(self.parse_line_table_file(
+            _ => Some(Self::parse_line_table_file(
                 &mut cursor,
                 &compilation_dir,
                 &include_directories,
@@ -463,12 +523,13 @@ impl Dwarf {
             line_range,
             opcode_base,
             include_directories,
+            comp_dir: compilation_dir,
+            define_files_loaded: false,
             file_entries,
         }))
     }
 
     fn parse_line_table_file(
-        &self,
         cursor: &mut Cursor,
         compilation_dir: &Path,
         include_directories: &Vec<PathBuf>,
@@ -1302,6 +1363,217 @@ impl<'elf> Iterator for RangeListIterator<'elf> {
             low: self.base_address + entry.low as usize,
             high: self.base_address + entry.high as usize,
         })
+    }
+}
+
+impl<'elf> PartialEq for LineTableEntry<'elf> {
+    fn eq(&self, other: &Self) -> bool {
+        self.address == other.address
+            && self.file_index == other.file_index
+            && self.line == other.line
+            && self.column == other.column
+            && self.discriminator == other.discriminator
+    }
+
+    fn ne(&self, other: &Self) -> bool {
+        !self.eq(other)
+    }
+}
+
+impl<'elf> LineTableEntry<'elf> {
+    /// The initial register state at the start of a line-number program, per the
+    /// DWARF spec: address 0, file 1, line 1, everything else cleared. `is_stmt`
+    /// is seeded from the line table's `default_is_statement`.
+    fn reset(elf: &'elf Elf, default_is_stmt: bool) -> Self {
+        LineTableEntry {
+            address: FileAddress::new(elf, 0),
+            file_index: 1,
+            line: 1,
+            column: 0,
+            is_stmt: default_is_stmt,
+            basic_block_start: false,
+            end_sequence: false,
+            prologue_end: false,
+            epilogue_begin: false,
+            discriminator: 0,
+            file_entry: None,
+        }
+    }
+}
+
+impl LineTable {
+    /// Iterates the rows of this line-number program.
+    ///
+    /// `elf` supplies the `.debug_line` bytes (via `data_range`) and anchors the
+    /// `FileAddress` lifetime of the produced entries. `LineTable` is stored owned
+    /// inside `Dwarf`, so it can't hold the `&Elf` itself; the caller threads it in
+    /// here, mirroring `RangeList::iter`.
+    fn iter<'l, 'elf>(&'l mut self, elf: &'elf Elf) -> LineTableIterator<'l, 'elf> {
+        // Read the fields needed to seed the iterator before moving the mutable
+        // borrow of `self` into `line_table`. The first iterator to run loads the
+        // DW_LNE_define_file entries; subsequent iterators leave them in place.
+        let default_is_statement = self.default_is_statement;
+        let position = self.data_range.start;
+        let should_load_files = !self.define_files_loaded;
+        self.define_files_loaded = true;
+        LineTableIterator {
+            elf,
+            current: LineTableEntry::reset(elf, default_is_statement),
+            registers: LineTableEntry::reset(elf, default_is_statement),
+            position,
+            should_load_files,
+            line_table: self,
+        }
+    }
+}
+
+/// Resolves the `.debug_line` section bytes.
+fn debug_line_section(elf: &Elf) -> Result<&[u8]> {
+    elf.get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_line\0")?)
+        .ok_or_else(|| anyhow!("Failed to find .debug_line"))
+}
+
+impl<'l, 'elf> LineTableIterator<'l, 'elf> {
+    /// Decodes and applies the next opcode of the line-number program, advancing
+    /// `position`. Returns `true` when the opcode emits a row into `current`.
+    fn execute_instruction(&mut self) -> bool {
+        let debug_line = debug_line_section(self.elf).expect("Failed to find .debug_line");
+        // Cursor over this table's remaining opcode bytes: from the current
+        // position up to the end of the table's slice of the section.
+        let mut cursor = Cursor::new(&debug_line[self.position..self.line_table.data_range.end]);
+        let opcode = cursor.read_u8().expect("Failed to read line-table opcode");
+        let mut emitted = false;
+        if opcode > 0 && opcode < self.line_table.opcode_base {
+            // Handle standard opcode
+            let opcode = DwLns::try_from(opcode).expect("Failed to convert opcode to DwLns type");
+            match opcode {
+                DwLns::Copy => {
+                    self.current = self.registers.clone();
+                    self.registers.basic_block_start = false;
+                    self.registers.prologue_end = false;
+                    self.registers.epilogue_begin = false;
+                    self.registers.discriminator = 0;
+                    emitted = true;
+                }
+                DwLns::AdvancePc => {
+                    let offset = cursor.uleb128().expect("Failed to get PC offset") as usize;
+                    self.registers.address = self.registers.address + offset;
+                }
+                DwLns::AdvanceLine => {
+                    let offset = cursor.sleb128().expect("Failed to get line offset");
+                    self.registers.line = (self.registers.line as i64 + offset) as u64;
+                }
+                DwLns::SetFile => {
+                    self.registers.file_index = cursor.uleb128().expect("Failed to get file index");
+                }
+                DwLns::SetColumn => {
+                    self.registers.column = cursor.uleb128().expect("Failed to get column");
+                }
+                DwLns::NegateStmt => {
+                    self.registers.is_stmt = !self.registers.is_stmt;
+                }
+                DwLns::SetBasicBlock => {
+                    self.registers.basic_block_start = true;
+                }
+                DwLns::ConstAddPc => {
+                    // Advance the address by the amount a special opcode 255 would,
+                    // without touching the line register.
+                    let advance = (255 - self.line_table.opcode_base) as usize
+                        / self.line_table.line_range as usize;
+                    self.registers.address = self.registers.address + advance;
+                }
+                DwLns::FixedAdvancePc => {
+                    let advance = cursor.read_u16().expect("Failed to get fixed PC advance");
+                    self.registers.address = self.registers.address + advance as usize;
+                }
+                DwLns::SetPrologueEnd => {
+                    self.registers.prologue_end = true;
+                }
+                DwLns::SetEpilogueBegin => {
+                    self.registers.epilogue_begin = true;
+                }
+                DwLns::SetIsa => {
+                    // The `isa` register is not modeled, so nothing is applied.
+                    // DW_LNS_set_isa carries a ULEB128 operand that we don't consume
+                    // here; if a producer ever emits it, the unread operand desyncs
+                    // the cursor for the next opcode. Warn so it's noticed.
+                    eprintln!(
+                        "Warning: DW_LNS_set_isa encountered in .debug_line at offset {}; \
+                         operand not consumed, subsequent opcodes may be misparsed",
+                        self.position
+                    );
+                }
+            }
+        } else if opcode == 0 {
+            // The length (sub-opcode byte plus operands) is read to advance the
+            // cursor past it; each opcode below consumes its own operands.
+            let _length = cursor
+                .uleb128()
+                .expect("Failed to get length of extended opcode");
+            let extended_opcode =
+                DwLne::try_from(cursor.read_u8().expect("Failed to read extended opcode"))
+                    .expect("Found unexpected extended opcode");
+            match extended_opcode {
+                DwLne::EndSequence => {
+                    // Mark the closing row, emit it, then reset the registers to
+                    // their initial state for any following sequence.
+                    self.registers.end_sequence = true;
+                    self.current = self.registers.clone();
+                    self.registers =
+                        LineTableEntry::reset(self.elf, self.line_table.default_is_statement);
+                    emitted = true;
+                }
+                DwLne::SetAddress => {
+                    let address = cursor
+                        .read_u64()
+                        .expect("Failed to read set_address operand");
+                    self.registers.address = FileAddress::new(self.elf, address as usize);
+                }
+                DwLne::DefineFile => {
+                    // Parse the inline file definition (advancing the cursor past
+                    // its operands regardless), resolving relative paths against
+                    // the CU's compilation directory. Only the first iteration
+                    // appends it; later ones leave `file_entries` untouched so
+                    // re-iterating never duplicates entries.
+                    let file = Dwarf::parse_line_table_file(
+                        &mut cursor,
+                        &self.line_table.comp_dir,
+                        &self.line_table.include_directories,
+                    )
+                    .expect("Failed to parse DW_LNE_define_file entry");
+                    if self.should_load_files {
+                        self.line_table.file_entries.push(file);
+                    }
+                }
+                DwLne::SetDiscriminator => {
+                    self.registers.discriminator = cursor
+                        .uleb128()
+                        .expect("Failed to read set_discriminator operand");
+                }
+                DwLne::LoUser | DwLne::HiUser => {
+                    panic!("Unexpected extended opcode");
+                }
+            }
+        }
+        // `cursor.position()` is relative to `self.position`, so advance by it to
+        // keep `position` absolute within the `.debug_line` section.
+        self.position += cursor.position();
+        emitted
+    }
+}
+
+impl<'l, 'elf> Iterator for LineTableIterator<'l, 'elf> {
+    type Item = LineTableEntry<'elf>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.position == self.line_table.data_range.end {
+            return None;
+        }
+        // Step through opcodes until one emits a row
+        while !self.execute_instruction() {}
+        let mut next = self.current.clone();
+        next.file_entry = Some((self.current.file_index - 1) as usize);
+        Some(next)
     }
 }
 
