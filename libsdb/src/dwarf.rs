@@ -137,6 +137,12 @@ pub struct RangeListIterator<'elf> {
     base_address: FileAddress<'elf>,
 }
 
+pub struct SourceLocation {
+    /// Index into LineTable::file_entries
+    file_entry_index: usize,
+    line: u64,
+}
+
 struct FileEntry {
     path: std::path::PathBuf,
     modification_time: usize,
@@ -896,6 +902,57 @@ impl<'dw> Die<'dw> {
             return referenced_die.name();
         }
         return None;
+    }
+
+    pub fn source_location(&self) -> Result<SourceLocation> {
+        Ok(SourceLocation {
+            file_entry_index: self.file()?,
+            line: self.line()?,
+        })
+    }
+
+    /// Returns index into LineTable::file_entries
+    pub fn file(&self) -> Result<usize> {
+        let tag: u64 = match self {
+            Die::Null(_) => return Err(anyhow!("Can't retrieve file index for null attr")),
+            Die::NonNull(die_payload) => die_payload.tag(),
+        };
+        let one_based_index: u64 = {
+            if tag == DwTag::InlinedSubroutine as u64 {
+                self.get_attr(DwAt::CallFile as u64)
+                    .expect("Failed to get attr DwAt::CallFile")
+                    .as_int()
+                    .expect("Failed to interpret DwAt::CallFile attr as int")
+            } else {
+                self.get_attr(DwAt::DeclFile as u64)
+                    .expect("Failed to get attr DwAt::DeclFile")
+                    .as_int()
+                    .expect("Failed to interpret DwAt::DeclFile attr as int")
+            }
+        };
+
+        // Note the -1
+        Ok(one_based_index as usize - 1)
+    }
+
+    pub fn line(&self) -> Result<u64> {
+        let tag: u64 = match self {
+            Die::Null(_) => return Err(anyhow!("Can't retrieve file index for null attr")),
+            Die::NonNull(die_payload) => die_payload.tag(),
+        };
+        if tag == (DwTag::InlinedSubroutine as u64) {
+            Ok(self
+                .get_attr(DwAt::CallLine as u64)
+                .expect("Failed to get attr DwAt::CallLine")
+                .as_int()
+                .expect("Failed to interpret DwAt::CallLine attr as int"))
+        } else {
+            Ok(self
+                .get_attr(DwAt::DeclLine as u64)
+                .expect("Failed to get attr DwAt::DeclLine")
+                .as_int()
+                .expect("Failed to interpret DwAt::DeclLine attr as int"))
+        }
     }
 }
 
