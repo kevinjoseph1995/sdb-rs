@@ -1507,8 +1507,28 @@ impl LineTable {
         None
     }
 
-    fn get_entries_by_line<'elf>(path: &Path, line: usize) -> Result<Vec<LineTableEntry<'elf>>> {
-        todo!()
+    fn get_entries_by_line<'elf>(
+        &self,
+        path: &Path,
+        line: usize,
+        elf: &'elf Elf,
+    ) -> Result<Vec<LineTableEntry<'elf>>> {
+        Ok(self
+            .iter(elf)
+            .filter(|entry| entry.line as usize == line)
+            .filter(|entry| {
+                entry.file_entry.is_some_and(|index| {
+                    let entry_path = &self.file_entries[index].path;
+                    // An absolute query must match the file's full path exactly;
+                    // a relative one matches any trailing run of components.
+                    if path.is_absolute() {
+                        entry_path == path
+                    } else {
+                        path_ends_in(entry_path, path)
+                    }
+                })
+            })
+            .collect())
     }
 }
 
