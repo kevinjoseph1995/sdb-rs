@@ -1488,16 +1488,50 @@ impl LineTable {
         }
     }
 
+    /// Returns the row covering `address`, i.e. the entry whose address is the
+    /// greatest one not exceeding `address` while the following row starts past
+    /// it. Rows marking the end of a sequence never cover an address, so they are
+    /// skipped. Returns `None` when no row covers `address`.
     fn get_entry_by_address<'elf>(
         &self,
         address: FileAddress<'elf>,
-    ) -> Result<LineTableEntry<'elf>> {
-        todo!()
+    ) -> Option<LineTableEntry<'elf>> {
+        let mut rows = self.iter(address.elf_handle);
+        let mut prev = rows.next()?;
+        for entry in rows {
+            if prev.address <= address && entry.address > address && !prev.end_sequence {
+                return Some(prev);
+            }
+            prev = entry;
+        }
+        None
     }
 
     fn get_entries_by_line<'elf>(path: &Path, line: usize) -> Result<Vec<LineTableEntry<'elf>>> {
         todo!()
     }
+}
+
+/// Returns `true` when `lhs` ends with the trailing components of `rhs`.
+///
+/// Comparison runs component-wise from the end, so a user can name a source
+/// file by any suffix of its full path: `find_treats.cpp`,
+/// `marshmallow/find_treats.cpp`, `home/marshmallow/find_treats.cpp`, and
+/// `/home/marshmallow/find_treats.cpp` all end in
+/// `/home/marshmallow/find_treats.cpp`. Working on whole components (rather than
+/// raw string suffixes) keeps `treats.cpp` from matching `find_treats.cpp`. An
+/// empty `rhs`, or one with more components than `lhs`, never matches.
+fn path_ends_in(lhs: &Path, rhs: &Path) -> bool {
+    let lhs_components: Vec<_> = lhs.components().collect();
+    let rhs_components: Vec<_> = rhs.components().collect();
+    if rhs_components.is_empty() || rhs_components.len() > lhs_components.len() {
+        return false;
+    }
+    lhs_components
+        .iter()
+        .rev()
+        .zip(rhs_components.iter().rev())
+        .all(|(l, r)| l == r)
 }
 
 /// Resolves the `.debug_line` section bytes.
@@ -1974,5 +2008,57 @@ mod tests {
         let data = uleb(1); // code only, no attribute byte
         let mut cursor = Cursor::new(&data);
         assert!(skip_children(&mut cursor, &table).is_err());
+    }
+
+    #[test]
+    fn path_ends_in_matches_any_trailing_component_suffix() {
+        let full = Path::new("/home/marshmallow/find_treats.cpp");
+        // All the forms a user might type at a breakpoint prompt.
+        assert!(path_ends_in(full, Path::new("find_treats.cpp")));
+        assert!(path_ends_in(full, Path::new("marshmallow/find_treats.cpp")));
+        assert!(path_ends_in(
+            full,
+            Path::new("home/marshmallow/find_treats.cpp")
+        ));
+        assert!(path_ends_in(
+            full,
+            Path::new("/home/marshmallow/find_treats.cpp")
+        ));
+    }
+
+    #[test]
+    fn path_ends_in_requires_whole_component_match() {
+        let full = Path::new("/home/marshmallow/find_treats.cpp");
+        // A raw string suffix that isn't a whole component must not match.
+        assert!(!path_ends_in(full, Path::new("treats.cpp")));
+        // A partial directory-name suffix must not match either.
+        assert!(!path_ends_in(full, Path::new("mallow/find_treats.cpp")));
+    }
+
+    #[test]
+    fn path_ends_in_rejects_non_suffixes() {
+        let full = Path::new("/home/marshmallow/find_treats.cpp");
+        // Right file name, wrong parent directory.
+        assert!(!path_ends_in(full, Path::new("kitchen/find_treats.cpp")));
+        // A prefix is not a suffix.
+        assert!(!path_ends_in(full, Path::new("home/marshmallow")));
+    }
+
+    #[test]
+    fn path_ends_in_rejects_longer_and_empty_rhs() {
+        let full = Path::new("/home/marshmallow/find_treats.cpp");
+        // `rhs` has more components than `lhs`.
+        assert!(!path_ends_in(
+            full,
+            Path::new("/var/home/marshmallow/find_treats.cpp")
+        ));
+        // An empty `rhs` never matches.
+        assert!(!path_ends_in(full, Path::new("")));
+    }
+
+    #[test]
+    fn path_ends_in_matches_identical_and_self() {
+        let full = Path::new("/home/marshmallow/find_treats.cpp");
+        assert!(path_ends_in(full, full));
     }
 }
