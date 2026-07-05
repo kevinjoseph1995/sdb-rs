@@ -143,10 +143,24 @@ pub struct SourceLocation {
     line: u64,
 }
 
-struct FileEntry {
+pub struct FileEntry {
     path: std::path::PathBuf,
     modification_time: usize,
     file_length: usize,
+}
+
+impl FileEntry {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn modification_time(&self) -> usize {
+        self.modification_time
+    }
+
+    pub fn file_length(&self) -> usize {
+        self.file_length
+    }
 }
 
 struct LineTable {
@@ -373,6 +387,25 @@ impl Dwarf {
             None => return None,
         };
         return line_table.get_entry_by_address(address);
+    }
+
+    /// Iterates the rows of `cu_index`'s line-number program, mirroring
+    /// `root_of(cu_index)`. Returns `None` when that compile unit has no line
+    /// program. The rows borrow `self` (both the `.debug_line` bytes and the
+    /// `&Elf` anchoring each row's `FileAddress` come from here), so resolve a
+    /// row's source file with [`Dwarf::line_table_file`].
+    pub fn lines(&self, cu_index: usize) -> Option<impl Iterator<Item = LineTableEntry<'_>> + '_> {
+        Some(self.line_tables[cu_index].as_ref()?.iter(&self.elf))
+    }
+
+    /// Resolves a row's [`LineTableEntry::file_entry`] index to the file it
+    /// names within `cu_index`'s line table. Returns `None` when the CU has no
+    /// line program or the index is out of range.
+    pub fn line_table_file(&self, cu_index: usize, file_index: usize) -> Option<&FileEntry> {
+        self.line_tables[cu_index]
+            .as_ref()?
+            .file_entries
+            .get(file_index)
     }
 
     fn build_function_index(&self) -> HashMap<String, Vec<IndexEntry>> {
@@ -1538,6 +1571,52 @@ impl<'elf> LineTableEntry<'elf> {
             file_entry: None,
         }
     }
+
+    pub fn address(&self) -> FileAddress<'elf> {
+        self.address
+    }
+
+    pub fn file_index(&self) -> u64 {
+        self.file_index
+    }
+
+    pub fn line(&self) -> u64 {
+        self.line
+    }
+
+    pub fn column(&self) -> u64 {
+        self.column
+    }
+
+    pub fn is_stmt(&self) -> bool {
+        self.is_stmt
+    }
+
+    pub fn basic_block_start(&self) -> bool {
+        self.basic_block_start
+    }
+
+    pub fn end_sequence(&self) -> bool {
+        self.end_sequence
+    }
+
+    pub fn prologue_end(&self) -> bool {
+        self.prologue_end
+    }
+
+    pub fn epilogue_begin(&self) -> bool {
+        self.epilogue_begin
+    }
+
+    pub fn discriminator(&self) -> u64 {
+        self.discriminator
+    }
+
+    /// Index into the owning line table's file list; resolve via
+    /// [`Dwarf::line_table_file`].
+    pub fn file_entry(&self) -> Option<usize> {
+        self.file_entry
+    }
 }
 
 impl LineTable {
@@ -1752,9 +1831,11 @@ impl<'l, 'elf> LineTableIterator<'l, 'elf> {
             let adjusted_opcode = opcode - self.line_table.opcode_base;
             self.registers.address =
                 self.registers.address + (adjusted_opcode / self.line_table.line_range) as usize;
-            self.registers.line = self.registers.line
-                + (self.line_table.line_base as u64
-                    + (adjusted_opcode % self.line_table.line_range) as u64);
+            // line_base is signed (commonly negative), so the line advance must be
+            // computed in signed arithmetic before folding back into the register.
+            let line_advance = self.line_table.line_base as i64
+                + (adjusted_opcode % self.line_table.line_range) as i64;
+            self.registers.line = (self.registers.line as i64 + line_advance) as u64;
             self.current = self.registers.clone();
             self.registers.basic_block_start = false;
             self.registers.prologue_end = false;

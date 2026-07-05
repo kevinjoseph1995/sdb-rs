@@ -4,7 +4,14 @@ use libsdb::{
     dwarf_constants::{DwAt, DwAte, DwForm, DwLang, DwTag},
     elf::Elf,
 };
-use std::{collections::HashMap, ffi::CStr, path::PathBuf, rc::Rc, sync::LazyLock, thread::LocalKey};
+use std::{
+    collections::HashMap,
+    ffi::{CStr, OsStr},
+    path::PathBuf,
+    rc::Rc,
+    sync::LazyLock,
+    thread::LocalKey,
+};
 
 fn get_test_fixture() -> &'static LocalKey<Dwarf> {
     thread_local! {
@@ -695,5 +702,186 @@ fn test_dwarf_compile_unit_range_entry_counts() {
         assert_eq!(counts["src/lib_a.c"], 3);
         assert_eq!(counts["src/lib_b.c"], 2);
         assert_eq!(counts["src/main.c"], 1);
+    });
+}
+
+// --- Line table ---------------------------------------------------------------
+//
+// The facts asserted below are hand-derived from the fixture C sources
+// (`tools/dwarf_fixture/src/*.c`) and cross-checked against an independent
+// decoder (`readelf --debug-dump=decodedline`), never against our own parser:
+//
+//   lib_a.c  add_a {@56  compute_a {@61  entry_a {@78   (lines 56-85)
+//   lib_b.c  sum_b {@35  entry_b  {@40                  (lines 35-47)
+//   main.c   main  {@10                                 (lines 10-14)
+//
+// With -ffunction-sections each defined function is compiled into its own text
+// section, so a CU's line program holds one sequence (one end_sequence row) per
+// defined function.
+
+/// CU index of the fixture translation unit whose root `DW_AT_name` is
+/// `src/<file>`. CU order is not guaranteed, so callers look CUs up by name.
+fn line_table_cu(dwarf: &Dwarf, file: &str) -> usize {
+    let want = format!("src/{file}");
+    (0..dwarf.compile_units().len())
+        .find(|&i| dwarf.root_of(i).unwrap().name().as_deref() == Some(want.as_str()))
+        .unwrap_or_else(|| panic!("fixture has a {want} compile unit"))
+}
+
+#[test]
+fn test_dwarf_line_table_main() {
+    get_test_fixture().with(|dwarf| {
+        let cu_index = line_table_cu(dwarf, "main.c");
+        let rows: Vec<_> = dwarf
+            .lines(cu_index)
+            .expect("main.c has a line program")
+            .collect();
+        assert!(rows.len() >= 2, "line program has body rows plus an end row");
+
+        // The first row is main's opening line (main.c:10), attributed to main.c.
+        let first = &rows[0];
+        assert_eq!(first.line(), 10);
+        let file = dwarf
+            .line_table_file(cu_index, first.file_entry().expect("row has a file"))
+            .expect("file index resolves to a file entry");
+        assert_eq!(file.path().file_name().unwrap(), OsStr::new("main.c"));
+
+        // Every non-terminal row maps to a line in main's body (10-14).
+        for row in &rows[..rows.len() - 1] {
+            assert!(!row.end_sequence(), "only the final row ends the sequence");
+            assert!(
+                (10..=14).contains(&row.line()),
+                "row line {} outside main's body",
+                row.line()
+            );
+        }
+
+        // The program terminates with exactly one end_sequence row.
+        assert!(rows.last().unwrap().end_sequence());
+        assert_eq!(rows.iter().filter(|r| r.end_sequence()).count(), 1);
+    });
+}
+
+#[test]
+fn test_dwarf_line_table_one_sequence_per_function() {
+    get_test_fixture().with(|dwarf| {
+        // One end_sequence row per defined function (see the range-entry-count
+        // test), and the program always ends on an end_sequence row.
+        for (file, expected_sequences) in [("lib_a.c", 3), ("lib_b.c", 2), ("main.c", 1)] {
+            let cu_index = line_table_cu(dwarf, file);
+            let rows: Vec<_> = dwarf.lines(cu_index).expect("CU has a line program").collect();
+            assert!(
+                rows.last().expect("line program is non-empty").end_sequence(),
+                "{file}: line program must end on an end_sequence row"
+            );
+            assert_eq!(
+                rows.iter().filter(|r| r.end_sequence()).count(),
+                expected_sequences,
+                "{file}: one sequence per defined function"
+            );
+        }
+    });
+}
+
+#[test]
+fn test_dwarf_line_entry_at_function_opening_line() {
+    get_test_fixture().with(|dwarf| {
+        // Each function's entry address (DW_AT_low_pc) resolves to the row for
+        // its opening `{` line in the source. This ties the function index to
+        // the line table via get_line_entry_at_address.
+        let opening_line: &[(&str, u64, &str)] = &[
+            ("add_a", 56, "lib_a.c"),
+            ("compute_a", 61, "lib_a.c"),
+            ("entry_a", 78, "lib_a.c"),
+            ("sum_b", 35, "lib_b.c"),
+            ("entry_b", 40, "lib_b.c"),
+            ("main", 10, "main.c"),
+        ];
+        for &(name, line, source) in opening_line {
+            let dies = dwarf.find_functions(name);
+            let low = dies.first().expect("function defined").low_pc().expect("low_pc");
+            let entry = dwarf
+                .get_line_entry_at_address(low)
+                .unwrap_or_else(|| panic!("{name} low_pc maps to a line entry"));
+            assert_eq!(entry.line(), line, "{name} opens at line {line}");
+            assert!(!entry.end_sequence(), "{name}: entry row is not a sequence terminator");
+
+            let cu_index = dwarf
+                .compile_unit_containing_address(low)
+                .expect("low_pc belongs to a CU");
+            let file = dwarf
+                .line_table_file(cu_index, entry.file_entry().expect("row has a file"))
+                .expect("file index resolves");
+            assert_eq!(file.path().file_name().unwrap(), OsStr::new(source));
+        }
+    });
+}
+
+#[test]
+fn test_dwarf_line_table_rows_attributed_to_own_source() {
+    get_test_fixture().with(|dwarf| {
+        // Every non-terminal row in a CU names that CU's own .c file and lies
+        // within the line span its function definitions occupy.
+        for (file, bounds) in [("lib_a.c", 56..=85), ("lib_b.c", 35..=47), ("main.c", 10..=14)] {
+            let cu_index = line_table_cu(dwarf, file);
+            for row in dwarf.lines(cu_index).expect("CU has a line program") {
+                if row.end_sequence() {
+                    continue;
+                }
+                assert!(
+                    bounds.contains(&row.line()),
+                    "{file}: row line {} outside {bounds:?}",
+                    row.line()
+                );
+                let entry = dwarf
+                    .line_table_file(cu_index, row.file_entry().expect("row has a file"))
+                    .expect("file index resolves");
+                assert_eq!(entry.path().file_name().unwrap(), OsStr::new(file));
+            }
+        }
+    });
+}
+
+#[test]
+fn test_dwarf_line_table_contains_known_statement_lines() {
+    get_test_fixture().with(|dwarf| {
+        // Specific source lines that must produce at least one row: each
+        // function's opening `{` line and a statement line inside its body.
+        let expected: &[(&str, &[u64])] = &[
+            ("lib_a.c", &[56, 57, 61, 74, 78, 84]),
+            ("lib_b.c", &[35, 37, 40, 46]),
+            ("main.c", &[10, 11, 12, 13]),
+        ];
+        for &(file, lines) in expected {
+            let cu_index = line_table_cu(dwarf, file);
+            let present: std::collections::HashSet<u64> = dwarf
+                .lines(cu_index)
+                .expect("CU has a line program")
+                .filter(|r| !r.end_sequence())
+                .map(|r| r.line())
+                .collect();
+            for &line in lines {
+                assert!(present.contains(&line), "{file}: expected a row for line {line}");
+            }
+        }
+    });
+}
+
+#[test]
+fn test_dwarf_line_table_addresses_monotonic_within_sequence() {
+    get_test_fixture().with(|dwarf| {
+        // Rows advance by non-decreasing address within a sequence; an
+        // end_sequence row closes the run and resets the expectation.
+        for file in ["lib_a.c", "lib_b.c", "main.c"] {
+            let cu_index = line_table_cu(dwarf, file);
+            let mut prev: Option<u64> = None;
+            for row in dwarf.lines(cu_index).expect("CU has a line program") {
+                let addr = row.address().address as u64;
+                if let Some(p) = prev {
+                    assert!(addr >= p, "{file}: address {addr:#x} < previous {p:#x}");
+                }
+                prev = if row.end_sequence() { None } else { Some(addr) };
+            }
+        }
     });
 }
