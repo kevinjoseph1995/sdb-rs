@@ -170,7 +170,7 @@ struct LineTable {
     file_entries: Vec<FileEntry>,
 }
 #[derive(Clone)]
-struct LineTableEntry<'elf> {
+pub struct LineTableEntry<'elf> {
     /// Address of the machine instruction this row describes.
     address: FileAddress<'elf>,
     /// 1-based index into the line table's `file_entries` list identifying the
@@ -361,6 +361,18 @@ impl Dwarf {
                     .expect("Failed to parse DIE")
             })
             .collect()
+    }
+
+    pub fn get_line_entry_at_address<'dw, 'elf>(
+        &'dw self,
+        address: FileAddress<'elf>,
+    ) -> Option<LineTableEntry<'elf>> {
+        let cu_index = self.compile_unit_containing_address(address)?;
+        let line_table = match &self.line_tables[cu_index] {
+            Some(line_table) => line_table,
+            None => return None,
+        };
+        return line_table.get_entry_by_address(address);
     }
 
     fn build_function_index(&self) -> HashMap<String, Vec<IndexEntry>> {
