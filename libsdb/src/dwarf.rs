@@ -155,13 +155,12 @@ struct LineTable {
     opcode_base: u8,
     include_directories: Vec<std::path::PathBuf>,
     /// The compilation directory (DW_AT_comp_dir of the owning CU's root DIE),
-    /// used to resolve relative file paths — including those introduced at
-    /// runtime by DW_LNE_define_file during iteration.
+    /// used to resolve relative file paths — including those introduced by
+    /// DW_LNE_define_file, which are collected up front at construction.
     comp_dir: std::path::PathBuf,
-    /// Set once the first iteration has appended any DW_LNE_define_file entries
-    /// to `file_entries`. Later iterations still parse those opcodes but skip the
-    /// push, so re-iterating never accumulates duplicate entries.
-    define_files_loaded: bool,
+    /// Static file list from the header followed by any files introduced by
+    /// DW_LNE_define_file, appended in program order during construction so
+    /// iteration can stay read-only.
     file_entries: Vec<FileEntry>,
 }
 #[derive(Clone)]
@@ -198,9 +197,10 @@ struct LineTableEntry<'elf> {
 }
 
 struct LineTableIterator<'l, 'elf> {
-    /// Mutably borrowed so DW_LNE_define_file can append to `file_entries`
-    /// during iteration; the emitted entries reference files by index into it.
-    line_table: &'l mut LineTable,
+    /// The table being iterated. Borrowed immutably: DW_LNE_define_file entries
+    /// are collected once at construction, so iteration never mutates the table,
+    /// and the emitted entries reference files by index into `file_entries`.
+    line_table: &'l LineTable,
     /// The ELF owning the `.debug_line` bytes referenced by `line_table.data_range`.
     /// `LineTable` is stored owned inside `Dwarf`, so the iterator carries the
     /// `&Elf` instead, matching `RangeListIterator`.
@@ -211,10 +211,6 @@ struct LineTableIterator<'l, 'elf> {
     registers: LineTableEntry<'elf>,
     /// A byte position inside the .debug_line section pointing to the data to parse next
     position: usize,
-    /// Whether this iterator is responsible for appending DW_LNE_define_file
-    /// entries to the table. Only the first iterator created for a table does so;
-    /// later ones parse the opcode but leave `file_entries` untouched.
-    should_load_files: bool,
 }
 
 // ===================================================================
@@ -500,7 +496,7 @@ impl Dwarf {
             .collect::<Result<Vec<PathBuf>>>()?;
 
         // Read null-terminated file entries until the null-byte terminator.
-        let file_entries = std::iter::from_fn(|| match cursor.peek() {
+        let mut file_entries = std::iter::from_fn(|| match cursor.peek() {
             0 => None, // Terminate the iteration, we hit the null byte
             _ => Some(Self::parse_line_table_file(
                 &mut cursor,
@@ -516,6 +512,16 @@ impl Dwarf {
         cursor.increment_cursor_by(1);
         let data_range = (section_offset + cursor.position())..(section_offset + end);
 
+        // Append any files introduced mid-program by DW_LNE_define_file, in
+        // program order, so the whole file list is known before iteration and
+        // iteration can borrow the table immutably.
+        file_entries.extend(Self::collect_define_file_entries(
+            &debug_line_bytes[data_range.clone()],
+            opcode_base,
+            &compilation_dir,
+            &include_directories,
+        )?);
+
         Ok(Some(LineTable {
             data_range,
             default_is_statement,
@@ -524,9 +530,73 @@ impl Dwarf {
             opcode_base,
             include_directories,
             comp_dir: compilation_dir,
-            define_files_loaded: false,
             file_entries,
         }))
+    }
+
+    /// Scans a line-number program's opcode stream for `DW_LNE_define_file`
+    /// entries, resolving each against `comp_dir`/`include_directories`, and
+    /// returns them in program order.
+    ///
+    /// This is a byte-layout-only walk: it advances past every opcode's operands
+    /// without running the abstract machine, since only the inline file
+    /// definitions matter here. Register values never affect operand sizes, so
+    /// nothing else needs to be tracked.
+    fn collect_define_file_entries(
+        program: &[u8],
+        opcode_base: u8,
+        comp_dir: &Path,
+        include_directories: &Vec<PathBuf>,
+    ) -> Result<Vec<FileEntry>> {
+        let mut cursor = Cursor::new(program);
+        let mut files = Vec::new();
+        while !cursor.is_at_end() {
+            let opcode = cursor.read_u8()?;
+            if opcode == 0 {
+                // Extended opcode: <ULEB length><sub-opcode><operands...>. The
+                // length spans the sub-opcode byte and its operands, so it bounds
+                // the skip regardless of whether we decode the payload.
+                let length = cursor.uleb128()? as usize;
+                let payload_start = cursor.position();
+                let sub_opcode = DwLne::try_from(cursor.read_u8()?)?;
+                if sub_opcode == DwLne::DefineFile {
+                    files.push(Self::parse_line_table_file(
+                        &mut cursor,
+                        comp_dir,
+                        include_directories,
+                    )?);
+                }
+                cursor.increment_cursor_by(payload_start + length - cursor.position());
+            } else if opcode < opcode_base {
+                // Standard opcode: skip its operands by type, mirroring the
+                // abstract machine's consumption in `execute_instruction`.
+                match DwLns::try_from(opcode)? {
+                    DwLns::AdvancePc | DwLns::SetFile | DwLns::SetColumn => {
+                        cursor.uleb128()?;
+                    }
+                    DwLns::AdvanceLine => {
+                        cursor.sleb128()?;
+                    }
+                    DwLns::FixedAdvancePc => {
+                        cursor.read_u16()?;
+                    }
+                    // DW_LNS_set_isa's ULEB operand is deliberately left
+                    // unconsumed to match `execute_instruction`, which doesn't
+                    // read it either. Both are wrong per spec, but staying
+                    // consistent means the two walks desync identically rather
+                    // than one silently diverging from the other.
+                    DwLns::SetIsa
+                    | DwLns::Copy
+                    | DwLns::NegateStmt
+                    | DwLns::SetBasicBlock
+                    | DwLns::ConstAddPc
+                    | DwLns::SetPrologueEnd
+                    | DwLns::SetEpilogueBegin => {}
+                }
+            }
+            // Special opcodes (>= opcode_base) carry no operands.
+        }
+        Ok(files)
     }
 
     fn parse_line_table_file(
@@ -1408,22 +1478,25 @@ impl LineTable {
     /// `FileAddress` lifetime of the produced entries. `LineTable` is stored owned
     /// inside `Dwarf`, so it can't hold the `&Elf` itself; the caller threads it in
     /// here, mirroring `RangeList::iter`.
-    fn iter<'l, 'elf>(&'l mut self, elf: &'elf Elf) -> LineTableIterator<'l, 'elf> {
-        // Read the fields needed to seed the iterator before moving the mutable
-        // borrow of `self` into `line_table`. The first iterator to run loads the
-        // DW_LNE_define_file entries; subsequent iterators leave them in place.
-        let default_is_statement = self.default_is_statement;
-        let position = self.data_range.start;
-        let should_load_files = !self.define_files_loaded;
-        self.define_files_loaded = true;
+    fn iter<'l, 'elf>(&'l self, elf: &'elf Elf) -> LineTableIterator<'l, 'elf> {
         LineTableIterator {
             elf,
-            current: LineTableEntry::reset(elf, default_is_statement),
-            registers: LineTableEntry::reset(elf, default_is_statement),
-            position,
-            should_load_files,
+            current: LineTableEntry::reset(elf, self.default_is_statement),
+            registers: LineTableEntry::reset(elf, self.default_is_statement),
+            position: self.data_range.start,
             line_table: self,
         }
+    }
+
+    fn get_entry_by_address<'elf>(
+        &self,
+        address: FileAddress<'elf>,
+    ) -> Result<LineTableEntry<'elf>> {
+        todo!()
+    }
+
+    fn get_entries_by_line<'elf>(path: &Path, line: usize) -> Result<Vec<LineTableEntry<'elf>>> {
+        todo!()
     }
 }
 
@@ -1530,20 +1603,16 @@ impl<'l, 'elf> LineTableIterator<'l, 'elf> {
                     self.registers.address = FileAddress::new(self.elf, address as usize);
                 }
                 DwLne::DefineFile => {
-                    // Parse the inline file definition (advancing the cursor past
-                    // its operands regardless), resolving relative paths against
-                    // the CU's compilation directory. Only the first iteration
-                    // appends it; later ones leave `file_entries` untouched so
-                    // re-iterating never duplicates entries.
-                    let file = Dwarf::parse_line_table_file(
+                    // The file was already appended to `line_table.file_entries`
+                    // by `collect_define_file_entries` at construction, so rows
+                    // referencing it resolve by index. Re-parse only to advance
+                    // the cursor past its operands.
+                    Dwarf::parse_line_table_file(
                         &mut cursor,
                         &self.line_table.comp_dir,
                         &self.line_table.include_directories,
                     )
                     .expect("Failed to parse DW_LNE_define_file entry");
-                    if self.should_load_files {
-                        self.line_table.file_entries.push(file);
-                    }
                 }
                 DwLne::SetDiscriminator => {
                     self.registers.discriminator = cursor
