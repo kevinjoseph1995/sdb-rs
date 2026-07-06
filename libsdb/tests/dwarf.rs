@@ -735,7 +735,8 @@ fn test_dwarf_line_table_main() {
         let rows: Vec<_> = dwarf
             .lines(cu_index)
             .expect("main.c has a line program")
-            .collect();
+            .collect::<anyhow::Result<Vec<_>>>()
+            .expect("line program parses");
         assert!(rows.len() >= 2, "line program has body rows plus an end row");
 
         // The first row is main's opening line (main.c:10), attributed to main.c.
@@ -769,7 +770,11 @@ fn test_dwarf_line_table_one_sequence_per_function() {
         // test), and the program always ends on an end_sequence row.
         for (file, expected_sequences) in [("lib_a.c", 3), ("lib_b.c", 2), ("main.c", 1)] {
             let cu_index = line_table_cu(dwarf, file);
-            let rows: Vec<_> = dwarf.lines(cu_index).expect("CU has a line program").collect();
+            let rows: Vec<_> = dwarf
+                .lines(cu_index)
+                .expect("CU has a line program")
+                .collect::<anyhow::Result<Vec<_>>>()
+                .expect("line program parses");
             assert!(
                 rows.last().expect("line program is non-empty").end_sequence(),
                 "{file}: line program must end on an end_sequence row"
@@ -802,6 +807,7 @@ fn test_dwarf_line_entry_at_function_opening_line() {
             let low = dies.first().expect("function defined").low_pc().expect("low_pc");
             let entry = dwarf
                 .get_line_entry_at_address(low)
+                .expect("line lookup succeeds")
                 .unwrap_or_else(|| panic!("{name} low_pc maps to a line entry"));
             assert_eq!(entry.line(), line, "{name} opens at line {line}");
             assert!(!entry.end_sequence(), "{name}: entry row is not a sequence terminator");
@@ -825,6 +831,7 @@ fn test_dwarf_line_table_rows_attributed_to_own_source() {
         for (file, bounds) in [("lib_a.c", 56..=85), ("lib_b.c", 35..=47), ("main.c", 10..=14)] {
             let cu_index = line_table_cu(dwarf, file);
             for row in dwarf.lines(cu_index).expect("CU has a line program") {
+                let row = row.expect("row parses");
                 if row.end_sequence() {
                     continue;
                 }
@@ -857,6 +864,7 @@ fn test_dwarf_line_table_contains_known_statement_lines() {
             let present: std::collections::HashSet<u64> = dwarf
                 .lines(cu_index)
                 .expect("CU has a line program")
+                .map(|r| r.expect("row parses"))
                 .filter(|r| !r.end_sequence())
                 .map(|r| r.line())
                 .collect();
@@ -876,6 +884,7 @@ fn test_dwarf_line_table_addresses_monotonic_within_sequence() {
             let cu_index = line_table_cu(dwarf, file);
             let mut prev: Option<u64> = None;
             for row in dwarf.lines(cu_index).expect("CU has a line program") {
+                let row = row.expect("row parses");
                 let addr = row.address().address as u64;
                 if let Some(p) = prev {
                     assert!(addr >= p, "{file}: address {addr:#x} < previous {p:#x}");
