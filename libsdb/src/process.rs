@@ -551,7 +551,7 @@ impl Process {
             && self.is_attached
         {
             if let Some(target_state) = self.target_state.upgrade() {
-                target_state.notify_stop(&stop_reason);
+                target_state.notify_stop(&self, &stop_reason)?;
             }
         }
         Ok(stop_reason)

@@ -877,15 +877,12 @@ impl<'dw> Die<'dw> {
             let first_entry = range_list
                 .iter()
                 .next()
-                .ok_or(anyhow!(
-                    "Failed to get the first entry out of the range list"
-                ))
-                .context("Failed to extract the first entry from the range list iterator")?;
+                .ok_or(anyhow!("Range list is empty"))?;
             Ok(first_entry.low)
         } else if let Some(attr) = self.get_attr(DwAt::LowPc) {
             attr.as_address()
         } else {
-            Err(anyhow!("Failed to get DwAt::LowPc for attr"))
+            Err(anyhow!("DIE has neither DW_AT_ranges nor DW_AT_low_pc"))
         }
     }
 
@@ -1089,6 +1086,21 @@ impl<'dw> DiePayload<'dw> {
 
     pub fn compile_unit(&self) -> &'dw CompileUnit {
         &self.dwarf.compile_units[self.cu_index]
+    }
+
+    pub fn low_pc(&self) -> Result<FileAddress<'dw>> {
+        if let Some(attr) = self.get_attr(DwAt::Ranges) {
+            let range_list = attr.as_range_list()?;
+            let first_entry = range_list
+                .iter()
+                .next()
+                .ok_or(anyhow!("Range list is empty"))?;
+            Ok(first_entry.low)
+        } else if let Some(attr) = self.get_attr(DwAt::LowPc) {
+            attr.as_address()
+        } else {
+            Err(anyhow!("DIE has neither DW_AT_ranges nor DW_AT_low_pc"))
+        }
     }
 }
 

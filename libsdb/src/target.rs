@@ -1,15 +1,18 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::address::FileAddress;
 use crate::process::StopReason;
+use crate::stack::Stack;
 use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use libc::AT_ENTRY;
 
 pub struct TargetState {
     pub elf: Rc<Elf>,
     /// DWARF debug info, or `None` for a binary without a `.debug_info` section.
     pub dwarf: Option<Dwarf>,
+    pub stack: Stack,
 }
 
 pub struct Target {
@@ -31,7 +34,11 @@ impl Target {
             stdout_replacement,
         )?;
         let (elf, dwarf) = Self::load(&process, executable_path)?;
-        let state = Rc::new(TargetState { elf, dwarf });
+        let state = Rc::new(TargetState {
+            elf,
+            dwarf,
+            stack: Stack::new(),
+        });
         process.target_state = Rc::downgrade(&state);
         Ok(Target { process, state })
     }
@@ -42,7 +49,11 @@ impl Target {
         let executable_path = PathBuf::from_iter(["/proc", &pid.to_string(), "exe"]);
         let mut process = Process::attach(pid)?;
         let (elf, dwarf) = Self::load(&process, &executable_path)?;
-        let state = Rc::new(TargetState { elf, dwarf });
+        let state = Rc::new(TargetState {
+            elf,
+            dwarf,
+            stack: Stack::new(),
+        });
         process.target_state = Rc::downgrade(&state);
         Ok(Target { process, state })
     }
@@ -82,7 +93,14 @@ impl Target {
 }
 
 impl TargetState {
-    pub fn notify_stop(&self, reason: &StopReason) {
-        todo!()
+    pub fn get_pc_file_address(&self, process: &Process) -> Result<FileAddress<'_>> {
+        let virt_address = process.get_pc()?;
+        virt_address
+            .to_file_address(&self.elf)
+            .ok_or(anyhow!("Failed to convert virt_address to file_address"))
+    }
+
+    pub fn notify_stop(&self, process: &Process, _reason: &StopReason) -> Result<()> {
+        self.stack.reset_inline_height(self, process)
     }
 }
