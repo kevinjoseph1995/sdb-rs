@@ -5,11 +5,15 @@ use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
 use anyhow::{Context, Result};
 use libc::AT_ENTRY;
 
-pub struct Target {
-    pub process: Process,
+pub struct TargetState {
     pub elf: Rc<Elf>,
     /// DWARF debug info, or `None` for a binary without a `.debug_info` section.
     pub dwarf: Option<Dwarf>,
+}
+
+pub struct Target {
+    pub process: Process,
+    pub state: Rc<TargetState>,
 }
 
 impl Target {
@@ -19,31 +23,27 @@ impl Target {
         debug_process_being_launched: bool,
         stdout_replacement: Option<std::os::fd::OwnedFd>,
     ) -> Result<Self> {
-        let process = Process::launch(
+        let mut process = Process::launch(
             executable_path,
             args,
             debug_process_being_launched,
             stdout_replacement,
         )?;
         let (elf, dwarf) = Self::load(&process, executable_path)?;
-        Ok(Target {
-            process,
-            elf,
-            dwarf,
-        })
+        let state = Rc::new(TargetState { elf, dwarf });
+        process.target_state = Rc::downgrade(&state);
+        Ok(Target { process, state })
     }
 
     pub fn attach(pid: crate::Pid) -> Result<Self> {
         // https://docs.kernel.org/filesystems/proc.html
         // exe: Link to the executable of this process
         let executable_path = PathBuf::from_iter(["/proc", &pid.to_string(), "exe"]);
-        let process = Process::attach(pid)?;
+        let mut process = Process::attach(pid)?;
         let (elf, dwarf) = Self::load(&process, &executable_path)?;
-        Ok(Target {
-            process,
-            elf,
-            dwarf,
-        })
+        let state = Rc::new(TargetState { elf, dwarf });
+        process.target_state = Rc::downgrade(&state);
+        Ok(Target { process, state })
     }
 
     /// Loads the executable's ELF (with load bias applied) and its DWARF info, if any.

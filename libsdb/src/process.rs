@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::path::Path;
 use std::path::PathBuf;
+use std::rc::Weak;
 use std::u64;
 /////////////////////////////////////////
 use anyhow::{Context, Result, anyhow};
@@ -37,6 +38,7 @@ use crate::register_info::RegisterFormat;
 use crate::register_info::RegisterInfo;
 use crate::register_info::RegisterType;
 use crate::register_info::RegisterValue;
+use crate::target::TargetState;
 
 type Pid = nix::unistd::Pid;
 
@@ -134,6 +136,7 @@ pub struct Process {
     expecting_syscall_exit: bool,
     pub breakpoints: Vec<Breakpoint>,
     pub watchpoints: Vec<Watchpoint>,
+    pub target_state: Weak<TargetState>,
 }
 
 impl Process {
@@ -159,6 +162,7 @@ impl Process {
             expecting_syscall_exit: false,
             breakpoints: Vec::new(),
             watchpoints: Vec::new(),
+            target_state: Weak::default(),
         };
         let _stop_reason = child_process_handle.wait_on_signal(None)?;
         Self::set_ptrace_options(pid)?;
@@ -191,6 +195,7 @@ impl Process {
                     expecting_syscall_exit: false,
                     breakpoints: Vec::new(),
                     watchpoints: Vec::new(),
+                    target_state: Weak::default(),
                 };
                 println!("Launching process with PID: {}", child_process_handle.pid);
                 if debug_process_being_launched {

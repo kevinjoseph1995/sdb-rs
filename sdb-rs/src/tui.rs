@@ -148,15 +148,17 @@ impl Application {
     // #define ELF_ST_TYPE(x) (((unsigned int) x) & 0xf)
     fn get_function_name_at(&self, pc: libsdb::address::VirtAddress) -> Result<Option<String>> {
         let file_addr = pc
-            .to_file_address(&self.target.elf)
+            .to_file_address(&self.target.state.elf)
             .ok_or_else(|| anyhow::anyhow!("Failed to convert to file address"))?;
         self.target
+            .state
             .elf
             .get_symbol_at_address(file_addr)
             .filter(|sym| sym.st_info & 0xf == elf::abi::STT_FUNC)
             .map(|sym| -> Result<String> {
                 Ok(self
                     .target
+                    .state
                     .elf
                     .get_string(sym.st_name as usize)
                     .context("Failed to get symbol name")?
@@ -180,7 +182,10 @@ impl Application {
 
                 match stop_reason.trap_type {
                     Some(libsdb::process::TrapType::SoftwareBreakpoint) => {
-                        println!("Process stopped at software breakpoint{}. rip={}", func_info, pc);
+                        println!(
+                            "Process stopped at software breakpoint{}. rip={}",
+                            func_info, pc
+                        );
                     }
                     Some(libsdb::process::TrapType::HardwareBreakpoint) => {
                         if let HardwareStopPointId::WatchpointId(id) =
@@ -195,10 +200,16 @@ impl Application {
                                 .expect("Watchpoint not found");
                             println!(
                                 "Process stopped at hardware watchpoint{}. rip={}, data={:#x}, previous_data={:#x}",
-                                func_info, pc, wp.get_data().unwrap_or(0), wp.get_previous_data().unwrap_or(0)
+                                func_info,
+                                pc,
+                                wp.get_data().unwrap_or(0),
+                                wp.get_previous_data().unwrap_or(0)
                             );
                         } else {
-                            println!("Process stopped at hardware breakpoint{}. rip={}", func_info, pc);
+                            println!(
+                                "Process stopped at hardware breakpoint{}. rip={}",
+                                func_info, pc
+                            );
                         }
                     }
                     Some(libsdb::process::TrapType::SingleStep) => {
