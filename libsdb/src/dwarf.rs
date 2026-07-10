@@ -640,10 +640,7 @@ impl Dwarf {
                 // Standard opcode: skip its operands by type, mirroring the
                 // abstract machine's consumption in `execute_instruction`.
                 match DwLns::try_from(opcode)? {
-                    DwLns::AdvancePc
-                    | DwLns::SetFile
-                    | DwLns::SetColumn
-                    | DwLns::SetIsa => {
+                    DwLns::AdvancePc | DwLns::SetFile | DwLns::SetColumn | DwLns::SetIsa => {
                         cursor.uleb128()?;
                     }
                     DwLns::AdvanceLine => {
@@ -731,6 +728,32 @@ impl Dwarf {
             let child = child.expect("Failed to parse children of DIE");
             Self::index_die(child, index);
         }
+    }
+
+    pub fn inline_stack_at_address(&self, address: FileAddress<'_>) -> Vec<DiePayload<'_>> {
+        let func = match self.function_containing_address(address) {
+            Some(Die::NonNull(die_payload)) => die_payload,
+            _ => return Vec::new(),
+        };
+
+        let mut stack = vec![func];
+        loop {
+            let inlined = stack
+                .last()
+                .expect("stack always has the enclosing function at the bottom")
+                .children()
+                .filter_map(Result::ok) // TODO: Not sure if we should ever handle die's that failed to parse here. Note for future self if we ever need to revisit this
+                .find(|child| {
+                    child.tag() == Some(DwTag::InlinedSubroutine as u64) && child.contains(address)
+                });
+
+            match inlined {
+                Some(Die::NonNull(die_payload)) => stack.push(die_payload),
+                _ => break,
+            }
+        }
+
+        stack
     }
 }
 

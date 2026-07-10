@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
+use crate::process::StopReason;
 use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
 use anyhow::{Context, Result};
 use libc::AT_ENTRY;
@@ -77,5 +78,11 @@ impl Target {
                 .context("create_loaded_elf offset calculation underflow")?,
         ));
         return Ok(elf);
+    }
+}
+
+impl TargetState {
+    pub fn notify_stop(&self, reason: &StopReason) {
+        todo!()
     }
 }

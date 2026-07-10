@@ -546,6 +546,14 @@ impl Process {
                 stop_reason = self.maybe_resume_from_syscall_stop(stop_reason)?;
             }
         }
+
+        if let WaitStatus::Stopped(_, _) = stop_reason.wait_status
+            && self.is_attached
+        {
+            if let Some(target_state) = self.target_state.upgrade() {
+                target_state.notify_stop(&stop_reason);
+            }
+        }
         Ok(stop_reason)
     }
 
