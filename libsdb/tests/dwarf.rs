@@ -72,7 +72,7 @@ fn find_in_subtree<'dw>(die: Die<'dw>, pred: &dyn Fn(&Die<'dw>) -> bool) -> Opti
 /// First DIE anywhere in the program with the given tag and `DW_AT_name`.
 fn find_named<'dw>(dwarf: &'dw Dwarf, tag: DwTag, name: &str) -> Option<Die<'dw>> {
     find_die(dwarf, &|die| {
-        die.tag() == Some(tag as u64) && die.name().as_deref() == Some(name)
+        die.tag() == Some(tag) && die.name().as_deref() == Some(name)
     })
 }
 
@@ -80,7 +80,7 @@ fn find_named<'dw>(dwarf: &'dw Dwarf, tag: DwTag, name: &str) -> Option<Die<'dw>
 fn child_named<'dw>(die: &Die<'dw>, tag: DwTag, name: &str) -> Option<Die<'dw>> {
     for child in die.children()? {
         let child = child.expect("failed to parse child DIE");
-        if child.tag() == Some(tag as u64) && child.name().as_deref() == Some(name) {
+        if child.tag() == Some(tag) && child.name().as_deref() == Some(name) {
             return Some(child);
         }
     }
@@ -89,7 +89,7 @@ fn child_named<'dw>(die: &Die<'dw>, tag: DwTag, name: &str) -> Option<Die<'dw>> 
 
 /// Resolves a DIE's `DW_AT_type` reference to the type DIE it points at.
 fn follow_type<'dw>(die: &Die<'dw>) -> Die<'dw> {
-    die.get_attr(DwAt::Type as u64)
+    die.get_attr(DwAt::Type)
         .expect("DIE has a DW_AT_type attribute")
         .as_reference()
         .expect("DW_AT_type resolves to a DIE")
@@ -101,7 +101,7 @@ fn children_of_tag<'dw>(die: &Die<'dw>, tag: DwTag) -> Vec<Die<'dw>> {
     if let Some(children) = die.children() {
         for child in children {
             let child = child.expect("failed to parse child DIE");
-            if child.tag() == Some(tag as u64) {
+            if child.tag() == Some(tag) {
                 out.push(child);
             }
         }
@@ -119,8 +119,8 @@ fn child_names(die: &Die<'_>, tag: DwTag) -> Vec<String> {
 
 /// Reads `die`'s attribute `at` as an integer.
 fn int_attr(die: &Die<'_>, at: DwAt) -> u64 {
-    die.get_attr(at as u64)
-        .unwrap_or_else(|| panic!("DIE missing attribute {:#x}", at as u64))
+    die.get_attr(at)
+        .unwrap_or_else(|| panic!("DIE missing attribute {:#x}", at as u16))
         .as_int()
         .expect("attribute decodes as an int")
 }
@@ -150,7 +150,7 @@ fn test_dwarf_correct_dwarf_language() {
             .root_of(0)
             .expect("Failed to get the root of the 0'th compile unit");
         let attr = root
-            .get_attr(DwAt::Language as u64)
+            .get_attr(DwAt::Language)
             .expect("Failed to get the Language attr of the 0th compile unit");
         // ISO C99 (the 1999 standard)
         assert_eq!(
@@ -168,12 +168,12 @@ fn test_dwarf_compile_units_identify_sources() {
                 let root = dwarf.root_of(cu_index).expect("Failed to get CU root");
                 assert_eq!(
                     root.tag(),
-                    Some(DwTag::CompileUnit as u64),
+                    Some(DwTag::CompileUnit),
                     "every CU root is a DW_TAG_compile_unit"
                 );
                 // Every fixture translation unit is compiled as C99.
                 let lang = root
-                    .get_attr(DwAt::Language as u64)
+                    .get_attr(DwAt::Language)
                     .expect("CU has DW_AT_language");
                 assert_eq!(lang.as_int().expect("language is an int"), DwLang::C99 as u64);
                 // The CU name comes from .debug_str (DW_FORM_strp).
@@ -226,8 +226,8 @@ fn test_dwarf_find_main() {
                 .find(|die| match die {
                     libsdb::dwarf::Die::Null(_) => false,
                     NonNull(die_payload) => {
-                        if let Some(name_attr) = die.get_attr(DwAt::Name as u64) {
-                            if die_payload.tag() == DwTag::Subprogram as u64 {
+                        if let Some(name_attr) = die.get_attr(DwAt::Name) {
+                            if die_payload.tag() == Some(DwTag::Subprogram) {
                                 let name = name_attr
                                     .as_string()
                                     .expect("Failed to interpret attr as string");
@@ -253,7 +253,7 @@ fn test_dwarf_find_functions_locates_definitions() {
             for die in &dies {
                 assert_eq!(
                     die.tag(),
-                    Some(DwTag::Subprogram as u64),
+                    Some(DwTag::Subprogram),
                     "`{name}` should be a DW_TAG_subprogram"
                 );
                 let low = die
@@ -290,7 +290,7 @@ fn test_dwarf_function_containing_address() {
         let found = dwarf
             .function_containing_address(low)
             .expect("an address inside compute_a resolves to a function");
-        assert_eq!(found.tag(), Some(DwTag::Subprogram as u64));
+        assert_eq!(found.tag(), Some(DwTag::Subprogram));
         assert_eq!(found.name().as_deref(), Some("compute_a"));
 
         // An address far above every function maps to no function.
@@ -333,12 +333,12 @@ fn test_dwarf_enumeration_const_values() {
         let mut values = HashMap::new();
         for enumerator in color_a.children().expect("enum has children") {
             let enumerator = enumerator.expect("enumerator parse");
-            if enumerator.tag() != Some(DwTag::Enumerator as u64) {
+            if enumerator.tag() != Some(DwTag::Enumerator) {
                 continue;
             }
             let name = enumerator.name().expect("enumerator name");
             let value = enumerator
-                .get_attr(DwAt::ConstValue as u64)
+                .get_attr(DwAt::ConstValue)
                 .expect("enumerator DW_AT_const_value")
                 .as_int()
                 .expect("const value as int");
@@ -365,7 +365,7 @@ fn test_dwarf_struct_members_and_bitfields() {
             .children()
             .expect("struct has members")
             .map(|m| m.expect("member parse"))
-            .filter(|m| m.tag() == Some(DwTag::Member as u64))
+            .filter(|m| m.tag() == Some(DwTag::Member))
             .map(|m| m.name().expect("member name"))
             .collect();
         assert_eq!(members, vec!["a_low", "a_high", "a_wide", "a_word"]);
@@ -374,7 +374,7 @@ fn test_dwarf_struct_members_and_bitfields() {
         let a_low = child_named(&flags_a, DwTag::Member, "a_low").expect("a_low member");
         assert_eq!(
             a_low
-                .get_attr(DwAt::BitSize as u64)
+                .get_attr(DwAt::BitSize)
                 .expect("a_low DW_AT_bit_size")
                 .as_int()
                 .expect("bit_size as int"),
@@ -383,7 +383,7 @@ fn test_dwarf_struct_members_and_bitfields() {
         let a_high = child_named(&flags_a, DwTag::Member, "a_high").expect("a_high member");
         assert_eq!(
             a_high
-                .get_attr(DwAt::BitSize as u64)
+                .get_attr(DwAt::BitSize)
                 .expect("a_high DW_AT_bit_size")
                 .as_int()
                 .expect("bit_size as int"),
@@ -404,11 +404,11 @@ fn test_dwarf_typedef_chain_resolves() {
             find_named(dwarf, DwTag::Typedef, "flags_alias_t").expect("flags_alias_t typedef");
 
         let flags_a_t = follow_type(&alias);
-        assert_eq!(flags_a_t.tag(), Some(DwTag::Typedef as u64));
+        assert_eq!(flags_a_t.tag(), Some(DwTag::Typedef));
         assert_eq!(flags_a_t.name().as_deref(), Some("flags_a_t"));
 
         let flags_a = follow_type(&flags_a_t);
-        assert_eq!(flags_a.tag(), Some(DwTag::StructureType as u64));
+        assert_eq!(flags_a.tag(), Some(DwTag::StructureType));
         assert_eq!(flags_a.name().as_deref(), Some("flags_a"));
     });
 }
@@ -422,10 +422,10 @@ fn test_dwarf_self_referential_struct() {
 
         let next = child_named(&node_b, DwTag::Member, "next").expect("next member");
         let ptr = follow_type(&next);
-        assert_eq!(ptr.tag(), Some(DwTag::PointerType as u64));
+        assert_eq!(ptr.tag(), Some(DwTag::PointerType));
 
         let pointee = follow_type(&ptr);
-        assert_eq!(pointee.tag(), Some(DwTag::StructureType as u64));
+        assert_eq!(pointee.tag(), Some(DwTag::StructureType));
         assert_eq!(pointee.name().as_deref(), Some("node_b"));
     });
 }
@@ -436,7 +436,7 @@ fn test_dwarf_global_variable_location() {
         // The fixture (GCC, DWARF 4) emits variable locations as DW_FORM_exprloc.
         let hello = find_named(dwarf, DwTag::Variable, "hello_a").expect("hello_a global");
         let location = hello
-            .get_attr(DwAt::Location as u64)
+            .get_attr(DwAt::Location)
             .expect("hello_a has DW_AT_location");
         assert_eq!(location.form(), DwForm::Exprloc as u64);
     });
@@ -448,7 +448,7 @@ fn test_dwarf_name_string_forms() {
         // DW_FORM_string: short base-type names are stored inline in .debug_info.
         let int_type = find_named(dwarf, DwTag::BaseType, "int").expect("int base type");
         let inline = int_type
-            .get_attr(DwAt::Name as u64)
+            .get_attr(DwAt::Name)
             .expect("base type has DW_AT_name");
         assert_eq!(inline.form(), DwForm::String as u64);
         assert_eq!(
@@ -459,7 +459,7 @@ fn test_dwarf_name_string_forms() {
         // DW_FORM_strp: the CU name is an offset into .debug_str.
         let root = dwarf.root_of(0).expect("CU root");
         let strp = root
-            .get_attr(DwAt::Name as u64)
+            .get_attr(DwAt::Name)
             .expect("CU has DW_AT_name");
         assert_eq!(strp.form(), DwForm::Strp as u64);
         assert!(
@@ -549,7 +549,7 @@ fn test_dwarf_union_type() {
         );
         // Every union member starts at offset 0 (no DW_AT_data_member_location).
         for member in children_of_tag(&maybe_a, DwTag::Member) {
-            assert!(member.get_attr(DwAt::DataMemberLocation as u64).is_none());
+            assert!(member.get_attr(DwAt::DataMemberLocation).is_none());
         }
     });
 }
@@ -578,9 +578,9 @@ fn test_dwarf_array_type_dimensions() {
         // `static const int matrix_a[3][4]` -> const -> array with two subranges.
         let matrix = find_named(dwarf, DwTag::Variable, "matrix_a").expect("matrix_a variable");
         let const_ty = follow_type(&matrix);
-        assert_eq!(const_ty.tag(), Some(DwTag::ConstType as u64));
+        assert_eq!(const_ty.tag(), Some(DwTag::ConstType));
         let array_ty = follow_type(&const_ty);
-        assert_eq!(array_ty.tag(), Some(DwTag::ArrayType as u64));
+        assert_eq!(array_ty.tag(), Some(DwTag::ArrayType));
 
         // DW_AT_upper_bound is one less than the dimension length.
         let bounds: Vec<u64> = children_of_tag(&array_ty, DwTag::SubrangeType)
@@ -591,7 +591,7 @@ fn test_dwarf_array_type_dimensions() {
 
         // The element type is `const int`: a const_type wrapping the int base type.
         let element = follow_type(&array_ty);
-        assert_eq!(element.tag(), Some(DwTag::ConstType as u64));
+        assert_eq!(element.tag(), Some(DwTag::ConstType));
         assert_eq!(follow_type(&element).name().as_deref(), Some("int"));
     });
 }
@@ -602,9 +602,9 @@ fn test_dwarf_subroutine_type_signature() {
         // typedef int (*binop_a)(int, int) -> pointer -> subroutine_type.
         let binop = find_named(dwarf, DwTag::Typedef, "binop_a").expect("binop_a typedef");
         let ptr = follow_type(&binop);
-        assert_eq!(ptr.tag(), Some(DwTag::PointerType as u64));
+        assert_eq!(ptr.tag(), Some(DwTag::PointerType));
         let subr = follow_type(&ptr);
-        assert_eq!(subr.tag(), Some(DwTag::SubroutineType as u64));
+        assert_eq!(subr.tag(), Some(DwTag::SubroutineType));
 
         // Returns int, takes two unnamed int parameters.
         assert_eq!(follow_type(&subr).name().as_deref(), Some("int"));
@@ -644,7 +644,7 @@ fn test_dwarf_external_vs_static_linkage() {
             let dies = dwarf.find_functions(name);
             let die = dies.first().unwrap_or_else(|| panic!("{name} defined"));
             let external = die
-                .get_attr(DwAt::External as u64)
+                .get_attr(DwAt::External)
                 .unwrap_or_else(|| panic!("{name} should be external"));
             assert_eq!(external.form(), DwForm::FlagPresent as u64);
         }
@@ -653,7 +653,7 @@ fn test_dwarf_external_vs_static_linkage() {
             let dies = dwarf.find_functions(name);
             let die = dies.first().unwrap_or_else(|| panic!("{name} defined"));
             assert!(
-                die.get_attr(DwAt::External as u64).is_none(),
+                die.get_attr(DwAt::External).is_none(),
                 "{name} is static and should not be external"
             );
         }
@@ -693,7 +693,7 @@ fn test_dwarf_compile_unit_range_entry_counts() {
             let root = dwarf.root_of(cu_index).expect("CU root");
             let name = root.name().expect("CU name");
             let ranges = root
-                .get_attr(DwAt::Ranges as u64)
+                .get_attr(DwAt::Ranges)
                 .expect("CU has DW_AT_ranges")
                 .as_range_list()
                 .expect("DW_AT_ranges resolves to a range list");

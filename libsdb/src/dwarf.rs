@@ -342,7 +342,7 @@ impl Dwarf {
                 .expect("Failed to parse DIE");
             match (die.contains(address), &die) {
                 (true, Die::NonNull(die_payload)) => {
-                    if die_payload.abbrev.tag == crate::dwarf_constants::DwTag::Subprogram as u64 {
+                    if die_payload.tag() == Some(DwTag::Subprogram) {
                         return Some(die);
                     }
                 }
@@ -482,7 +482,7 @@ impl Dwarf {
             Die::NonNull(die_payload) => die_payload,
         };
 
-        let attr = match root_die_payload.get_attr(DwAt::StmtList as u64) {
+        let attr = match root_die_payload.get_attr(DwAt::StmtList) {
             Some(attr) => attr,
             None => return Ok(None),
         };
@@ -538,7 +538,7 @@ impl Dwarf {
         // Next we parse the include directories
         let compilation_dir = Self::cstr_to_pathbuf_unix(
             root_die_payload
-                .get_attr(DwAt::CompDir as u64)
+                .get_attr(DwAt::CompDir)
                 .ok_or(anyhow!("Root does not contain DwAt::CompDir"))?
                 .as_string()?,
         );
@@ -693,10 +693,10 @@ impl Dwarf {
     }
 
     fn index_die(die: Die<'_>, index: &mut HashMap<String, Vec<IndexEntry>>) {
-        let has_range: bool = match die.get_attr(DwAt::LowPc as u64) {
+        let has_range: bool = match die.get_attr(DwAt::LowPc) {
             Some(_) => true,
             None => false,
-        } || match die.get_attr(DwAt::Ranges as u64) {
+        } || match die.get_attr(DwAt::Ranges) {
             Some(_) => true,
             None => false,
         };
@@ -704,8 +704,8 @@ impl Dwarf {
         let (is_function, die_payload): (bool, Option<&DiePayload>) = match &die {
             Die::Null(_) => (false, None),
             Die::NonNull(die_payload) => (
-                die_payload.abbrev.tag == DwTag::Subprogram as u64
-                    || die_payload.abbrev.tag == DwTag::InlinedSubroutine as u64,
+                die_payload.tag() == Some(DwTag::Subprogram)
+                    || die_payload.tag() == Some(DwTag::InlinedSubroutine),
                 Some(die_payload),
             ),
         };
@@ -744,7 +744,7 @@ impl Dwarf {
                 .children()
                 .filter_map(Result::ok) // TODO: Not sure if we should ever handle die's that failed to parse here. Note for future self if we ever need to revisit this
                 .find(|child| {
-                    child.tag() == Some(DwTag::InlinedSubroutine as u64) && child.contains(address)
+                    child.tag() == Some(DwTag::InlinedSubroutine) && child.contains(address)
                 });
 
             match inlined {
@@ -849,10 +849,10 @@ impl<'dw> Die<'dw> {
         }
     }
 
-    pub fn tag(&self) -> Option<u64> {
+    pub fn tag(&self) -> Option<DwTag> {
         match self {
             Die::Null(_) => None,
-            Die::NonNull(payload) => Some(payload.tag()),
+            Die::NonNull(payload) => payload.tag(),
         }
     }
 
@@ -863,7 +863,7 @@ impl<'dw> Die<'dw> {
         }
     }
 
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'dw>> {
+    pub fn get_attr(&self, attr: DwAt) -> Option<Attr<'dw>> {
         let payload = match &self {
             Die::Null(_) => return None,
             Die::NonNull(die_payload) => die_payload,
@@ -872,7 +872,7 @@ impl<'dw> Die<'dw> {
     }
 
     pub fn low_pc(&self) -> Result<FileAddress<'dw>> {
-        if let Some(attr) = self.get_attr(DwAt::Ranges as u64) {
+        if let Some(attr) = self.get_attr(DwAt::Ranges) {
             let range_list = attr.as_range_list()?;
             let first_entry = range_list
                 .iter()
@@ -882,7 +882,7 @@ impl<'dw> Die<'dw> {
                 ))
                 .context("Failed to extract the first entry from the range list iterator")?;
             Ok(first_entry.low)
-        } else if let Some(attr) = self.get_attr(DwAt::LowPc as u64) {
+        } else if let Some(attr) = self.get_attr(DwAt::LowPc) {
             attr.as_address()
         } else {
             Err(anyhow!("Failed to get DwAt::LowPc for attr"))
@@ -890,7 +890,7 @@ impl<'dw> Die<'dw> {
     }
 
     pub fn high_pc(&self) -> Result<FileAddress<'dw>> {
-        if let Some(attr) = self.get_attr(DwAt::Ranges as u64) {
+        if let Some(attr) = self.get_attr(DwAt::Ranges) {
             /*
             Building a Debugger. Page 329
             If we encounter a DW_AT_ranges attribute, we get the high address of the
@@ -908,7 +908,7 @@ impl<'dw> Die<'dw> {
                 .ok_or(anyhow!("Failed to get the last entry of the range_list"))
                 .context("The last entry in the range list failed to parse")?;
             Ok(last_entry.high)
-        } else if let Some(attr) = self.get_attr(DwAt::HighPc as u64) {
+        } else if let Some(attr) = self.get_attr(DwAt::HighPc) {
             /*
             Building a Debugger. Page 322
             For the high program counter value, we check the form. If the form is
@@ -942,12 +942,12 @@ impl<'dw> Die<'dw> {
                     // FileAddress need not be constructed using the same Elf object as the Die.
                     return false;
                 }
-                if let Some(attr) = self.get_attr(DwAt::Ranges as u64) {
+                if let Some(attr) = self.get_attr(DwAt::Ranges) {
                     let range_list = attr
                         .as_range_list()
                         .expect("Expected to get range_list attr");
                     return range_list.contains(address);
-                } else if let Some(_attr) = self.get_attr(DwAt::LowPc as u64) {
+                } else if let Some(_attr) = self.get_attr(DwAt::LowPc) {
                     return self.low_pc().expect("Expected to get low_pc attr") <= address
                         && address < self.high_pc().expect("Expected to get high_pc attr");
                 } else {
@@ -962,7 +962,7 @@ impl<'dw> Die<'dw> {
             return None;
         }
 
-        if let Some(attr) = self.get_attr(DwAt::Name as u64) {
+        if let Some(attr) = self.get_attr(DwAt::Name) {
             return Some(
                 attr.as_string()
                     .expect("Failed to get string attribute")
@@ -971,14 +971,14 @@ impl<'dw> Die<'dw> {
                     .to_string(),
             );
         }
-        if let Some(attr) = self.get_attr(DwAt::Specification as u64) {
+        if let Some(attr) = self.get_attr(DwAt::Specification) {
             let referenced_die: Die<'dw> = attr
                 .as_reference()
                 .expect("Failed to get referenced DIE with DwAt::Specification");
             return referenced_die.name();
         }
 
-        if let Some(attr) = self.get_attr(DwAt::AbstractOrigin as u64) {
+        if let Some(attr) = self.get_attr(DwAt::AbstractOrigin) {
             let referenced_die: Die<'dw> = attr
                 .as_reference()
                 .expect("Failed to get referenced DIE with DwAt::AbstractOrigin");
@@ -996,18 +996,17 @@ impl<'dw> Die<'dw> {
 
     /// Returns index into LineTable::file_entries
     pub fn file(&self) -> Result<usize> {
-        let tag: u64 = match self {
-            Die::Null(_) => return Err(anyhow!("Can't retrieve file index for null attr")),
-            Die::NonNull(die_payload) => die_payload.tag(),
-        };
+        if matches!(self, Die::Null(_)) {
+            return Err(anyhow!("Can't retrieve file index for null attr"));
+        }
         let one_based_index: u64 = {
-            if tag == DwTag::InlinedSubroutine as u64 {
-                self.get_attr(DwAt::CallFile as u64)
+            if self.tag() == Some(DwTag::InlinedSubroutine) {
+                self.get_attr(DwAt::CallFile)
                     .expect("Failed to get attr DwAt::CallFile")
                     .as_int()
                     .expect("Failed to interpret DwAt::CallFile attr as int")
             } else {
-                self.get_attr(DwAt::DeclFile as u64)
+                self.get_attr(DwAt::DeclFile)
                     .expect("Failed to get attr DwAt::DeclFile")
                     .as_int()
                     .expect("Failed to interpret DwAt::DeclFile attr as int")
@@ -1022,19 +1021,18 @@ impl<'dw> Die<'dw> {
     }
 
     pub fn line(&self) -> Result<u64> {
-        let tag: u64 = match self {
-            Die::Null(_) => return Err(anyhow!("Can't retrieve file index for null attr")),
-            Die::NonNull(die_payload) => die_payload.tag(),
-        };
-        if tag == (DwTag::InlinedSubroutine as u64) {
+        if matches!(self, Die::Null(_)) {
+            return Err(anyhow!("Can't retrieve file index for null attr"));
+        }
+        if self.tag() == Some(DwTag::InlinedSubroutine) {
             Ok(self
-                .get_attr(DwAt::CallLine as u64)
+                .get_attr(DwAt::CallLine)
                 .expect("Failed to get attr DwAt::CallLine")
                 .as_int()
                 .expect("Failed to interpret DwAt::CallLine attr as int"))
         } else {
             Ok(self
-                .get_attr(DwAt::DeclLine as u64)
+                .get_attr(DwAt::DeclLine)
                 .expect("Failed to get attr DwAt::DeclLine")
                 .as_int()
                 .expect("Failed to interpret DwAt::DeclLine attr as int"))
@@ -1053,8 +1051,9 @@ impl<'dw> DiePayload<'dw> {
         }
     }
 
-    pub fn get_attr(&self, attr: u64) -> Option<Attr<'dw>> {
+    pub fn get_attr(&self, attr: DwAt) -> Option<Attr<'dw>> {
         let specs = &self.abbrev.attr_specs;
+        let attr = u64::from(attr as u16);
         for (index, spec) in specs.iter().enumerate() {
             if spec.attr == attr {
                 return Some(Attr {
@@ -1070,8 +1069,10 @@ impl<'dw> DiePayload<'dw> {
         None
     }
 
-    pub fn tag(&self) -> u64 {
-        self.abbrev.tag
+    pub fn tag(&self) -> Option<DwTag> {
+        u16::try_from(self.abbrev.tag)
+            .ok()
+            .and_then(|t| DwTag::try_from(t).ok())
     }
 
     pub fn has_children(&self) -> bool {
@@ -1118,7 +1119,7 @@ impl<'dw> Iterator for DieChildrenIter<'dw> {
             }
             Ok(Die::NonNull(payload)) => {
                 let next_sibling_offset: usize = if payload.abbrev.has_children {
-                    if let Some(attr) = payload.get_attr(DwAt::Sibling as u64) {
+                    if let Some(attr) = payload.get_attr(DwAt::Sibling) {
                         // DW_AT_sibling is guaranteed to reference a DIE within the
                         // same CU, so a CU-local form lookup suffices and we avoid
                         // needing an AbbrevTableCache here.
@@ -1397,7 +1398,7 @@ impl<'dw> Attr<'dw> {
                 self.cu_index,
                 Rc::clone(&self.abbrev_table),
             )?;
-            match root.get_attr(DwAt::LowPc as u64) {
+            match root.get_attr(DwAt::LowPc) {
                 Some(attr) => attr.as_address()?,
                 None => FileAddress {
                     elf_handle: self.dwarf.elf(),
