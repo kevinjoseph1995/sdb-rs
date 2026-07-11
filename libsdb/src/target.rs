@@ -7,6 +7,8 @@ use crate::stack::Stack;
 use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
 use anyhow::{Context, Result, anyhow};
 use libc::AT_ENTRY;
+use nix::sys::signal::Signal;
+use nix::sys::wait::WaitStatus;
 
 pub struct TargetState {
     pub elf: Rc<Elf>,
@@ -89,6 +91,33 @@ impl Target {
                 .context("create_loaded_elf offset calculation underflow")?,
         ));
         return Ok(elf);
+    }
+
+    /* "The basic idea behind the step in operation is to step through single machine instructions until
+    the program counter lands on an instruction that belongs to a different line of source code from the
+    one at which it began. When the program counter arrives at a new source line, it might have entered a
+    new function. In that case, we also skip over the prologue of that function, which sets up the stack". */
+    pub fn step_in(&mut self) -> Result<StopReason> {
+        let stack = &self.state.stack;
+        if stack.get_inline_height() > 0 {
+            stack.simulate_inlined_step_in();
+            return Ok(StopReason {
+                wait_status: WaitStatus::Stopped(self.process.pid, Signal::SIGTRAP),
+                trap_type: Some(crate::process::TrapType::SingleStep),
+                syscall_info: None,
+            });
+        }
+        // Next handle the process of stepping to a new line of source code
+
+        todo!()
+    }
+
+    pub fn step_out(&mut self) -> Result<StopReason> {
+        todo!()
+    }
+
+    pub fn step_over(&mut self) -> Result<StopReason> {
+        todo!()
     }
 }
 

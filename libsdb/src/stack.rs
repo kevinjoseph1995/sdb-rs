@@ -39,6 +39,15 @@ impl Stack {
         Ok(())
     }
 
+    pub fn simulate_inlined_step_in(&self) {
+        let old_height = self.inline_height.get();
+        assert!(
+            old_height > 1,
+            "Precondition of simulate_inlined_step_in not met"
+        );
+        self.inline_height.set(old_height - 1);
+    }
+
     pub fn inline_stack_at_pc<'elf>(
         &self,
         state: &'elf TargetState,
