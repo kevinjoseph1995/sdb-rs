@@ -4,6 +4,7 @@ use crate::{address::FileAddress, cursor::Cursor};
 use anyhow::{Context, Result, anyhow};
 use nix::NixPath;
 use std::cell::RefCell;
+use std::iter::Peekable;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{collections::HashMap, ffi::CStr};
@@ -379,10 +380,24 @@ impl Dwarf {
             .collect()
     }
 
+    /// Returns the line-table row covering `address`, together with an iterator
+    /// positioned immediately after it. The iterator lets callers walk forward
+    /// over nearby rows (for example, to skip a function prologue while
+    /// stepping); it yields the trailing `end_sequence` row for the last real
+    /// entry, so callers should check [`LineTableEntry::end_sequence`] as they go.
+    #[allow(clippy::type_complexity)]
     pub fn get_line_entry_at_address<'dw, 'elf>(
         &'dw self,
         address: FileAddress<'elf>,
-    ) -> Result<Option<LineTableEntry<'elf>>> {
+    ) -> Result<
+        Option<(
+            LineTableEntry<'elf>,
+            impl Iterator<Item = Result<LineTableEntry<'elf>>> + 'dw,
+        )>,
+    >
+    where
+        'elf: 'dw,
+    {
         let cu_index = match self.compile_unit_containing_address(address) {
             Some(cu_index) => cu_index,
             None => return Ok(None),
@@ -1694,26 +1709,45 @@ impl LineTable {
     /// greatest one not exceeding `address` while the following row starts past
     /// it. Rows marking the end of a sequence never cover an address, so they are
     /// skipped. Returns `None` when no row covers `address`.
-    fn get_entry_by_address<'elf>(
-        &self,
+    ///
+    /// The covering entry is returned together with an iterator positioned
+    /// immediately after it, so callers can walk forward to inspect nearby rows
+    /// (for example, to skip a function prologue while stepping). This mirrors
+    /// the C++ `get_entry_by_address`, which returns an iterator for the same
+    /// reason; our iterator is forward-only, which is all the prologue-skip and
+    /// step-over algorithms need.
+    fn get_entry_by_address<'l, 'elf>(
+        &'l self,
         address: FileAddress<'elf>,
-    ) -> Result<Option<LineTableEntry<'elf>>> {
-        let mut rows = self.iter(address.elf_handle);
+    ) -> Result<Option<(LineTableEntry<'elf>, Peekable<LineTableIterator<'l, 'elf>>)>> {
+        let mut rows = self.iter(address.elf_handle).peekable();
         let mut prev = match rows.next() {
             Some(row) => row?,
             None => return Ok(None),
         };
-        for entry in rows {
-            let entry = entry?;
-            if prev.address <= address && entry.address > address && !prev.end_sequence {
-                return Ok(Some(prev));
+        loop {
+            // Peek at the next row without consuming it, so a match leaves the
+            // returned iterator sitting on the first entry past the covering one.
+            let next_address = match rows.peek() {
+                Some(Ok(entry)) => entry.address,
+                // Surface the decode error we just peeked at.
+                Some(Err(_)) => match rows.next() {
+                    Some(Err(e)) => return Err(e),
+                    _ => unreachable!("peek returned Some(Err)"),
+                },
+                None => return Ok(None),
+            };
+            if prev.address <= address && next_address > address && !prev.end_sequence {
+                return Ok(Some((prev, rows)));
             }
-            prev = entry;
+            prev = match rows.next() {
+                Some(entry) => entry?,
+                None => unreachable!("peek returned Some(Ok)"),
+            };
         }
-        Ok(None)
     }
 
-    fn get_entries_by_line<'elf>(
+    pub fn get_entries_by_line<'elf>(
         &self,
         path: &Path,
         line: usize,

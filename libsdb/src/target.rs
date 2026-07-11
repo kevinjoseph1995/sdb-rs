@@ -93,10 +93,11 @@ impl Target {
         return Ok(elf);
     }
 
-    /* "The basic idea behind the step in operation is to step through single machine instructions until
-    the program counter lands on an instruction that belongs to a different line of source code from the
-    one at which it began. When the program counter arrives at a new source line, it might have entered a
-    new function. In that case, we also skip over the prologue of that function, which sets up the stack". */
+    /// Step in:
+    /// The basic idea behind the step in operation is to step through single machine instructions until
+    /// the program counter lands on an instruction that belongs to a different line of source code from the
+    /// one at which it began. When the program counter arrives at a new source line, it might have entered a
+    /// new function. In that case, we also skip over the prologue of that function, which sets up the stack
     pub fn step_in(&mut self) -> Result<StopReason> {
         let stack = &self.state.stack;
         if stack.get_inline_height() > 0 {

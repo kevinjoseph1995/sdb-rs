@@ -805,7 +805,7 @@ fn test_dwarf_line_entry_at_function_opening_line() {
         for &(name, line, source) in opening_line {
             let dies = dwarf.find_functions(name);
             let low = dies.first().expect("function defined").low_pc().expect("low_pc");
-            let entry = dwarf
+            let (entry, _rows) = dwarf
                 .get_line_entry_at_address(low)
                 .expect("line lookup succeeds")
                 .unwrap_or_else(|| panic!("{name} low_pc maps to a line entry"));
