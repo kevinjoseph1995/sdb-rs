@@ -1,3 +1,4 @@
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -6,6 +7,7 @@ use crate::dwarf::LineTableEntry;
 use crate::process::{StopReason, TrapType};
 use crate::stack::Stack;
 use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
+use crate::{disassembler, stack};
 use anyhow::{Context, Result, anyhow};
 use libc::AT_ENTRY;
 use nix::sys::signal::Signal;
@@ -105,6 +107,22 @@ impl Target {
         return Ok(elf);
     }
 
+    /// Snapshots the line-table entry covering the current PC into an owned,
+    /// borrow-free value, so callers can compare across `&mut self` steps.
+    /// `None` when the PC has no covering line entry (the end iterator).
+    fn line_snapshot_at_pc(&self) -> Result<Option<LineSnapshot>> {
+        Ok(self.line_entry_at_pc()?.map(|entry| LineSnapshot {
+            line: (
+                entry.address().get(),
+                entry.file_index(),
+                entry.line(),
+                entry.column(),
+                entry.discriminator(),
+            ),
+            end_sequence: entry.end_sequence(),
+        }))
+    }
+
     /// Step in:
     /// The basic idea behind the step in operation is to step through single machine instructions until
     /// the program counter lands on an instruction that belongs to a different line of source code from the
@@ -179,27 +197,101 @@ impl Target {
         })
     }
 
-    /// Snapshots the line-table entry covering the current PC into an owned,
-    /// borrow-free value, so callers can compare across `&mut self` steps.
-    /// `None` when the PC has no covering line entry (the end iterator).
-    fn line_snapshot_at_pc(&self) -> Result<Option<LineSnapshot>> {
-        Ok(self.line_entry_at_pc()?.map(|entry| LineSnapshot {
-            line: (
-                entry.address().get(),
-                entry.file_index(),
-                entry.line(),
-                entry.column(),
-                entry.discriminator(),
-            ),
-            end_sequence: entry.end_sequence(),
-        }))
+    /// Run the inferior forward until it reaches `target`, treating arrival
+    /// there as one clean "unit" of a step-over.
+    ///
+    /// Returns `Continue(reason)` when the process single-stepped cleanly to
+    /// `target` (the step-over loop should keep going), or `Break(reason)` when
+    /// it stopped for any other reason — a breakpoint, a signal, an exit, or
+    /// landing somewhere other than `target`. In the `Break` case the step-over
+    /// is over and `reason` should be handed back to the caller verbatim.
+    fn run_over_to(&mut self, target: VirtAddress) -> Result<ControlFlow<StopReason, StopReason>> {
+        let reason = self.process.run_until_address(target)?;
+        if reason.is_step() && self.process.get_pc()? == target {
+            Ok(ControlFlow::Continue(reason))
+        } else {
+            Ok(ControlFlow::Break(reason))
+        }
+    }
+
+    /// Step over one source line.
+    ///
+    /// Like step-in, we advance one machine instruction at a time until the PC
+    /// lands on a different source line — but we never descend into callees.
+    /// Two things get stepped *over* rather than into:
+    ///
+    ///   * a `call` instruction, by running to the address of the instruction
+    ///     that follows it (where the call will return to), and
+    ///   * an inlined function whose body begins at the current PC, by running
+    ///     to that inline frame's end (its high PC).
+    ///
+    /// Anything else is a plain single-instruction step. If the inferior stops
+    /// for a reason other than a clean step to where we aimed, we abandon the
+    /// step-over and return that stop reason unchanged.
+    pub fn step_over(&mut self) -> Result<StopReason> {
+        // The line covering the starting PC; we keep stepping until we leave it.
+        let origin = self.line_snapshot_at_pc()?;
+        loop {
+            let outcome = if self.state.stack.get_inline_height() > 0 {
+                // The PC sits at the start of an inlined function, so skip its
+                // whole body by running to the frame's return address (its high
+                // PC). `inline_height` is how many inline frames deep the
+                // virtual PC is, so the frame to skip is that many entries up
+                // from the innermost one on the stack.
+                let inline_stack = self
+                    .state
+                    .stack
+                    .inline_stack_at_pc(&self.state, &self.process)?;
+                let frame_to_skip = &inline_stack
+                    [inline_stack.len() - self.state.stack.get_inline_height() as usize];
+                let return_address = frame_to_skip.high_pc()?.to_virt_address().ok_or(anyhow!(
+                    "Failed to get virt_address of return address of inlined function"
+                ))?;
+                self.run_over_to(return_address)?
+            } else {
+                // Disassemble the next two instructions: the one about to run,
+                // and the one after it (a `call`'s return site). Only reached
+                // when not at an inline-frame start, matching the original
+                // guard order.
+                let instructions = disassembler::disassemble(&self.process, 2, None)?;
+                if instructions.len() == 2 && instructions[0].text.starts_with("call") {
+                    // Step over the callee by running to the return site.
+                    self.run_over_to(instructions[1].address)?
+                } else {
+                    // An ordinary instruction: just single-step it. There is no
+                    // target address to check, so any non-step stop ends here.
+                    let reason = self.process.step_instruction()?;
+                    if reason.is_step() {
+                        ControlFlow::Continue(reason)
+                    } else {
+                        ControlFlow::Break(reason)
+                    }
+                }
+            };
+
+            // A `Break` means the inferior stopped for something other than the
+            // clean step we intended; surface that reason immediately.
+            let reason = match outcome {
+                ControlFlow::Break(reason) => return Ok(reason),
+                ControlFlow::Continue(reason) => reason,
+            };
+
+            // Finished once the PC reaches a genuinely different source line. An
+            // `end_sequence` row carries no real line, so we step past it, and a
+            // PC with no covering line entry at all also ends the walk.
+            match self.line_snapshot_at_pc()? {
+                None => return Ok(reason),
+                Some(current)
+                    if Some(current.line) != origin.map(|o| o.line) && !current.end_sequence =>
+                {
+                    return Ok(reason);
+                }
+                Some(_) => {}
+            }
+        }
     }
 
     pub fn step_out(&mut self) -> Result<StopReason> {
-        todo!()
-    }
-
-    pub fn step_over(&mut self) -> Result<StopReason> {
         todo!()
     }
 

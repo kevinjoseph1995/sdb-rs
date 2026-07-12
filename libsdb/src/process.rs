@@ -20,6 +20,7 @@ use nix::sys::ptrace;
 use nix::sys::ptrace::attach;
 use nix::sys::ptrace::traceme;
 use nix::sys::signal::Signal;
+use nix::sys::signal::Signal::SIGTRAP;
 use nix::sys::signal::kill;
 use nix::sys::uio::RemoteIoVec;
 use nix::sys::wait::WaitPidFlag;
@@ -1306,6 +1307,13 @@ impl Drop for Process {
             let _ = nix::sys::signal::kill(self.pid, nix::sys::signal::Signal::SIGKILL);
             let _ = self.wait_on_signal(None);
         }
+    }
+}
+
+impl StopReason {
+    pub fn is_step(&self) -> bool {
+        matches!(self.wait_status, WaitStatus::Stopped(_, SIGTRAP))
+            && matches!(self.trap_type, Some(TrapType::SingleStep))
     }
 }
 

@@ -887,60 +887,16 @@ impl<'dw> Die<'dw> {
     }
 
     pub fn low_pc(&self) -> Result<FileAddress<'dw>> {
-        if let Some(attr) = self.get_attr(DwAt::Ranges) {
-            let range_list = attr.as_range_list()?;
-            let first_entry = range_list
-                .iter()
-                .next()
-                .ok_or(anyhow!("Range list is empty"))?;
-            Ok(first_entry.low)
-        } else if let Some(attr) = self.get_attr(DwAt::LowPc) {
-            attr.as_address()
-        } else {
-            Err(anyhow!("DIE has neither DW_AT_ranges nor DW_AT_low_pc"))
+        match self {
+            Die::Null(_) => Err(anyhow!("DIE has neither DW_AT_ranges nor DW_AT_low_pc")),
+            Die::NonNull(payload) => payload.low_pc(),
         }
     }
 
     pub fn high_pc(&self) -> Result<FileAddress<'dw>> {
-        if let Some(attr) = self.get_attr(DwAt::Ranges) {
-            /*
-            Building a Debugger. Page 329
-            If we encounter a DW_AT_ranges attribute, we get the high address of the
-            highest pair of addresses. To do this, we get an iterator to the first range,
-            increment it until it points to the element before the end iterator (that is,
-            the last element of the list), and return the high range of that pair. If we en-
-            counter a DW_AT_high_pc attribute, we do the same as we used to, interpreting
-            the attribute as either an address or an offset from the low program counter.
-            Otherwise, we throw an exception.
-             */
-            let range_list = attr.as_range_list()?;
-            let last_entry = range_list
-                .iter()
-                .last()
-                .ok_or(anyhow!("Failed to get the last entry of the range_list"))
-                .context("The last entry in the range list failed to parse")?;
-            Ok(last_entry.high)
-        } else if let Some(attr) = self.get_attr(DwAt::HighPc) {
-            /*
-            Building a Debugger. Page 322
-            For the high program counter value, we check the form. If the form is
-            an address, we extract it. Otherwise, the form must be an offset from the
-            low program counter, so we extract the low program counter and then offset
-            it with the high program counter attribute as an integer.
-            */
-            let address: usize = {
-                if attr.dw_form()? == DwForm::Addr {
-                    attr.as_address()?.address
-                } else {
-                    self.low_pc()?.address + attr.as_int()? as usize
-                }
-            };
-            Ok(FileAddress {
-                elf_handle: attr.dwarf.elf(),
-                address,
-            })
-        } else {
-            Err(anyhow!("Failed to get DwAt::HighPc for attr"))
+        match self {
+            Die::Null(_) => Err(anyhow!("Failed to get DwAt::HighPc for attr")),
+            Die::NonNull(payload) => payload.high_pc(),
         }
     }
 
@@ -1101,6 +1057,49 @@ impl<'dw> DiePayload<'dw> {
 
     pub fn compile_unit(&self) -> &'dw CompileUnit {
         &self.dwarf.compile_units[self.cu_index]
+    }
+
+    pub fn high_pc(&self) -> Result<FileAddress<'dw>> {
+        if let Some(attr) = self.get_attr(DwAt::Ranges) {
+            /*
+            Building a Debugger. Page 329
+            If we encounter a DW_AT_ranges attribute, we get the high address of the
+            highest pair of addresses. To do this, we get an iterator to the first range,
+            increment it until it points to the element before the end iterator (that is,
+            the last element of the list), and return the high range of that pair. If we en-
+            counter a DW_AT_high_pc attribute, we do the same as we used to, interpreting
+            the attribute as either an address or an offset from the low program counter.
+            Otherwise, we throw an exception.
+             */
+            let range_list = attr.as_range_list()?;
+            let last_entry = range_list
+                .iter()
+                .last()
+                .ok_or(anyhow!("Failed to get the last entry of the range_list"))
+                .context("The last entry in the range list failed to parse")?;
+            Ok(last_entry.high)
+        } else if let Some(attr) = self.get_attr(DwAt::HighPc) {
+            /*
+            Building a Debugger. Page 322
+            For the high program counter value, we check the form. If the form is
+            an address, we extract it. Otherwise, the form must be an offset from the
+            low program counter, so we extract the low program counter and then offset
+            it with the high program counter attribute as an integer.
+            */
+            let address: usize = {
+                if attr.dw_form()? == DwForm::Addr {
+                    attr.as_address()?.address
+                } else {
+                    self.low_pc()?.address + attr.as_int()? as usize
+                }
+            };
+            Ok(FileAddress {
+                elf_handle: attr.dwarf.elf(),
+                address,
+            })
+        } else {
+            Err(anyhow!("Failed to get DwAt::HighPc for attr"))
+        }
     }
 
     pub fn low_pc(&self) -> Result<FileAddress<'dw>> {
