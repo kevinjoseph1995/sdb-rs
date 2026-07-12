@@ -733,7 +733,9 @@ fn test_watchpoints() {
         .expect("Failed to wait for process");
     // Process should have stopped at the watchpoint.
 
-    target_process.single_step().expect("Failed to single step"); // Single step over the watchpoint
+    target_process
+        .step_instruction()
+        .expect("Failed to single step"); // Single step over the watchpoint
     // Create a software breakpoint at the address where the watchpoint is set.
     target_process
         .create_breakpoint(VirtAddress::new(address), true, false)

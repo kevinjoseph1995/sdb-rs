@@ -326,7 +326,7 @@ impl Application {
                 &mut self.target.process,
             ),
             CommandCategory::Step => {
-                let stop_reason = self.target.process.single_step()?;
+                let stop_reason = self.target.process.step_instruction()?;
                 self.handle_stop_reason(stop_reason)?;
                 Ok(())
             }

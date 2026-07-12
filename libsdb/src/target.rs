@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::address::FileAddress;
-use crate::process::StopReason;
+use crate::dwarf::LineTableEntry;
+use crate::process::{StopReason, TrapType};
 use crate::stack::Stack;
 use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
 use anyhow::{Context, Result, anyhow};
@@ -20,6 +21,17 @@ pub struct TargetState {
 pub struct Target {
     pub process: Process,
     pub state: Rc<TargetState>,
+}
+
+/// Borrow-free identity of the line-table entry covering a PC, used to detect
+/// when single-stepping has crossed onto a different source line.
+#[derive(Clone, Copy)]
+struct LineSnapshot {
+    /// (address, file_index, line, column, discriminator) — the fields that
+    /// distinguish one line-table row from another.
+    line: (usize, u64, u64, u64, u64),
+    /// Whether this row is an `end_sequence` marker (no real source line).
+    end_sequence: bool,
 }
 
 impl Target {
@@ -108,9 +120,79 @@ impl Target {
                 syscall_info: None,
             });
         }
-        // Next handle the process of stepping to a new line of source code
+        // Single-step until we reach a different source line. `origin` is the
+        // line covering the starting PC; we keep stepping while the PC stays on
+        // that line or lands on an `end_sequence` row (which carries no real
+        // line), and stop once it has no covering line at all.
+        let origin = self.line_snapshot_at_pc()?;
+        loop {
+            let reason = self.process.step_instruction()?;
+            if reason.wait_status != WaitStatus::Stopped(self.process.pid, Signal::SIGTRAP)
+                || reason.trap_type != Some(TrapType::SingleStep)
+            {
+                return Ok(reason);
+            }
+            let Some(current) = self.line_snapshot_at_pc()? else {
+                break;
+            };
+            if Some(current.line) != origin.map(|o| o.line) && !current.end_sequence {
+                break;
+            }
+        }
+        // We are now at a different line of source code.
+        let pc = self
+            .process
+            .get_pc()?
+            .to_file_address(&self.state.elf)
+            .ok_or(anyhow!("Failed to get PC as file address"))?;
+        let dwarf = self
+            .state
+            .dwarf
+            .as_ref()
+            .ok_or(anyhow!("Failed to get dwarf handle"))?;
 
-        todo!()
+        // If we've stepped to the very start of a function, we've stepped into
+        // it. Skip its prologue by running to the next line-table entry (the
+        // first instruction past the stack-setup code).
+        let prologue_skip_target = match dwarf.function_containing_address(pc) {
+            Some(func_die) if func_die.low_pc()? == pc => {
+                match dwarf.get_line_entry_at_address(pc)? {
+                    // The iterator is positioned just after the covering entry,
+                    // so its first item is the first post-prologue line.
+                    Some((_entry, mut after)) => match after.next() {
+                        Some(next) => next?.address().to_virt_address(),
+                        None => None,
+                    },
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(target) = prologue_skip_target {
+            return self.process.run_until_address(target);
+        }
+
+        Ok(StopReason {
+            wait_status: WaitStatus::Stopped(self.process.pid, Signal::SIGTRAP),
+            trap_type: Some(TrapType::SingleStep),
+            syscall_info: None,
+        })
+    }
+
+    /// Snapshots the line-table entry covering the current PC into an owned,
+    /// borrow-free value, so callers can compare across `&mut self` steps.
+    /// `None` when the PC has no covering line entry (the end iterator).
+    fn line_snapshot_at_pc(&self) -> Result<Option<LineSnapshot>> {
+        Ok(self.line_entry_at_pc()?.map(|entry| LineSnapshot {
+            line: (
+                entry.address().get(),
+                entry.file_index(),
+                entry.line(),
+                entry.column(),
+                entry.discriminator(),
+            ),
+            end_sequence: entry.end_sequence(),
+        }))
     }
 
     pub fn step_out(&mut self) -> Result<StopReason> {
@@ -119,6 +201,25 @@ impl Target {
 
     pub fn step_over(&mut self) -> Result<StopReason> {
         todo!()
+    }
+
+    fn line_entry_at_pc(&self) -> Result<Option<LineTableEntry<'_>>> {
+        let pc = self
+            .process
+            .get_pc()?
+            .to_file_address(&self.state.elf)
+            .ok_or(anyhow!("Failed to get PC as file address"))?;
+
+        if let Some((entry, _iterator)) = self
+            .state
+            .dwarf
+            .as_ref()
+            .ok_or(anyhow!("Failed to get dwarf handle"))?
+            .get_line_entry_at_address(pc)?
+        {
+            return Ok(Some(entry));
+        }
+        return Ok(None);
     }
 }
 

@@ -614,7 +614,7 @@ impl Process {
         Ok(())
     }
 
-    pub fn single_step(&mut self) -> Result<StopReason> {
+    pub fn step_instruction(&mut self) -> Result<StopReason> {
         assert!(self.is_attached, "Process must be attached to single step");
 
         let mut breakpoint_to_reenable: Option<usize> = None;
@@ -638,6 +638,42 @@ impl Process {
             self.enable_breakpoint_at_index(breakpoint_site_index)
                 .context("Failed to re-enable breakpoint after single step")?;
         }
+        Ok(reason)
+    }
+
+    /// Resumes the process and runs until execution reaches `address`.
+    ///
+    /// If no breakpoint already covers `address`, a temporary one is set (and
+    /// removed again before returning) so we can stop exactly there. When we do
+    /// stop at that breakpoint, the stop is reported as a single step rather
+    /// than a breakpoint hit, since the caller is using this to step, not to
+    /// honor a user breakpoint.
+    pub fn run_until_address(&mut self, address: VirtAddress) -> Result<StopReason> {
+        let breakpoint_to_remove = if self
+            .breakpoints
+            .iter()
+            .any(|bp| bp.virtual_address == address)
+        {
+            None
+        } else {
+            Some(self.create_breakpoint(address, true, false)?.id)
+        };
+
+        self.resume_process()?;
+        let mut reason = self.wait_on_signal(None)?;
+
+        if matches!(
+            reason.trap_type,
+            Some(TrapType::SoftwareBreakpoint) | Some(TrapType::HardwareBreakpoint)
+        ) && self.get_pc()? == address
+        {
+            reason.trap_type = Some(TrapType::SingleStep);
+        }
+
+        if let Some(id) = breakpoint_to_remove {
+            self.remove_breakpoint_by_id(id)?;
+        }
+
         Ok(reason)
     }
 
