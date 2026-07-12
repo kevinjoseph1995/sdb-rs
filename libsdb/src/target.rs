@@ -5,6 +5,7 @@ use std::rc::Rc;
 use crate::address::FileAddress;
 use crate::dwarf::LineTableEntry;
 use crate::process::{StopReason, TrapType};
+use crate::register_info::RegisterValue;
 use crate::stack::Stack;
 use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
 use crate::{disassembler, stack};
@@ -144,12 +145,24 @@ impl Target {
         // line), and stop once it has no covering line at all.
         let origin = self.line_snapshot_at_pc()?;
         loop {
+            // Unlike step-over, step-in descends into callees, so every
+            // iteration is a plain single-instruction step — there is no target
+            // address to run over. Frame the result the same way step-over does:
+            // a clean step is `Continue`, anything else is `Break`.
             let reason = self.process.step_instruction()?;
-            if reason.wait_status != WaitStatus::Stopped(self.process.pid, Signal::SIGTRAP)
-                || reason.trap_type != Some(TrapType::SingleStep)
-            {
-                return Ok(reason);
+            let outcome = if reason.is_step() {
+                ControlFlow::Continue(reason)
+            } else {
+                ControlFlow::Break(reason)
+            };
+
+            // A `Break` means the inferior stopped for something other than the
+            // clean step we intended; surface that reason immediately.
+            match outcome {
+                ControlFlow::Break(reason) => return Ok(reason),
+                ControlFlow::Continue(_) => {}
             }
+
             let Some(current) = self.line_snapshot_at_pc()? else {
                 break;
             };
@@ -291,8 +304,45 @@ impl Target {
         }
     }
 
+    ///  It should make the process run up until the return address of the currently executing function.
     pub fn step_out(&mut self) -> Result<StopReason> {
-        todo!()
+        let stack = &self.state.stack;
+        let inline_stack = stack.inline_stack_at_pc(&self.state, &self.process)?;
+        let has_inline_frames = inline_stack.len() > 1;
+        let is_at_inline_frame = stack.get_inline_height() < (inline_stack.len() - 1) as u32;
+        if has_inline_frames && is_at_inline_frame {
+            let current_frame =
+                &inline_stack[inline_stack.len() - stack.get_inline_height() as usize - 1];
+            let return_address = current_frame
+                .high_pc()?
+                .to_virt_address()
+                .ok_or(anyhow!("Failed to get return address"))?;
+            return self.process.run_until_address(return_address);
+        } else {
+            let frame_pointer: usize = match self
+                .process
+                .get_registers()
+                .get_register_value(crate::register_info::RegisterId::rbp)?
+            {
+                RegisterValue::U64(value) => value as usize,
+                _ => {
+                    return Err(anyhow!("Failed to get register value of rbp"));
+                }
+            };
+            let return_address = VirtAddress {
+                address: usize::from_le_bytes(
+                    self.process.read_memory(
+                        VirtAddress {
+                            address: frame_pointer + 8,
+                        },
+                        8,
+                    )?[..8]
+                        .try_into()
+                        .unwrap(),
+                ),
+            };
+            return self.process.run_until_address(return_address);
+        }
     }
 
     fn line_entry_at_pc(&self) -> Result<Option<LineTableEntry<'_>>> {
