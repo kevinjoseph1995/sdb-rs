@@ -68,7 +68,10 @@ pub enum CommandCategory {
     DumpChildOutput,
     Breakpoint(BreakpointCommandCategory),
     Help,
-    Step,
+    StepIn,
+    StepOver,
+    StepOut,
+    StepSingleInstruction,
     Memory(MemoryCommandCategory),
     Disassemble,
     Watchpoint(WatchpointCommandCategory),
@@ -200,9 +203,33 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
     ),
     cmd!(
         ["step", "s"],
+        "Step into function",
+        [],
+        Some(StepIn),
+        None,
+        []
+    ),
+    cmd!(
+        ["next", "n"],
+        "Step over function",
+        [],
+        Some(StepOver),
+        None,
+        []
+    ),
+    cmd!(
+        ["finish", "f"],
+        "Step out of function",
+        [],
+        Some(StepOut),
+        None,
+        []
+    ),
+    cmd!(
+        ["stepi", "si"],
         "Step over a single instruction",
         [],
-        Some(Step),
+        Some(StepSingleInstruction),
         None,
         []
     ),

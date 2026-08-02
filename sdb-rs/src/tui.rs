@@ -325,8 +325,8 @@ impl Application {
                 command.args,
                 &mut self.target.process,
             ),
-            CommandCategory::Step => {
-                let stop_reason = self.target.process.step_instruction()?;
+            CommandCategory::StepIn => {
+                let stop_reason = self.target.step_in()?;
                 self.handle_stop_reason(stop_reason)?;
                 Ok(())
             }
@@ -344,6 +344,21 @@ impl Application {
                 ),
             CommandCategory::Catchpoint(catchpoint_command_category) => {
                 catchpoint_command_category.handle_command(command.args, &mut self.target.process)
+            }
+            CommandCategory::StepSingleInstruction => {
+                let stop_reason = self.target.process.step_instruction()?;
+                self.handle_stop_reason(stop_reason)?;
+                Ok(())
+            }
+            CommandCategory::StepOver => {
+                let stop_reason = self.target.step_over()?;
+                self.handle_stop_reason(stop_reason)?;
+                Ok(())
+            }
+            CommandCategory::StepOut => {
+                let stop_reason = self.target.step_out()?;
+                self.handle_stop_reason(stop_reason)?;
+                Ok(())
             }
         }
     }
