@@ -22,3 +22,4 @@ elf = "0.8.0"
 procfs = "0.17.0"
 object = "0.36"
 dwarf_fixture = { path = "../tools/dwarf_fixture" }
+no_debug_fixture = { path = "../tools/no_debug_fixture" }

@@ -538,6 +538,7 @@ dependencies = [
  "libc",
  "memmap",
  "nix 0.30.1",
+ "no_debug_fixture",
  "num_enum",
  "object",
  "procfs",
@@ -641,6 +642,13 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+]
+
+[[package]]
+name = "no_debug_fixture"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

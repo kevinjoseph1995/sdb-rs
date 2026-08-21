@@ -309,8 +309,11 @@ impl Target {
         let stack = &self.state.stack;
         let inline_stack = stack.inline_stack_at_pc(&self.state, &self.process)?;
         let has_inline_frames = inline_stack.len() > 1;
-        let is_at_inline_frame = stack.get_inline_height() < (inline_stack.len() - 1) as u32;
-        if has_inline_frames && is_at_inline_frame {
+        // Short-circuits before the `- 1` below, which would otherwise
+        // underflow when `inline_stack` is empty (e.g. no DWARF info at all).
+        let is_at_inline_frame =
+            has_inline_frames && stack.get_inline_height() < (inline_stack.len() - 1) as u32;
+        if is_at_inline_frame {
             let current_frame =
                 &inline_stack[inline_stack.len() - stack.get_inline_height() as usize - 1];
             let return_address = current_frame
