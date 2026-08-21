@@ -42,7 +42,7 @@ impl Stack {
     pub fn simulate_inlined_step_in(&self) {
         let old_height = self.inline_height.get();
         assert!(
-            old_height > 1,
+            old_height > 0,
             "Precondition of simulate_inlined_step_in not met"
         );
         self.inline_height.set(old_height - 1);
