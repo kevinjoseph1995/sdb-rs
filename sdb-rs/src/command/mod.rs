@@ -816,6 +816,27 @@ mod tests {
             parse("help reg").expect("Unable to parse command").args,
             vec!["reg"]
         );
+
+        for (aliases, category) in [
+            (["step", "s"], StepIn),
+            (["next", "n"], StepOver),
+            (["finish", "f"], StepOut),
+            (["stepi", "si"], StepSingleInstruction),
+        ] {
+            for alias in aliases {
+                assert_eq!(
+                    parse(alias)
+                        .expect("Unable to parse command")
+                        .parsed_nodes
+                        .last()
+                        .expect("No command in parse chain")
+                        .metadata
+                        .category,
+                    Some(category),
+                    "alias `{alias}` did not resolve to {category:?}"
+                );
+            }
+        }
     }
 
     #[test]
