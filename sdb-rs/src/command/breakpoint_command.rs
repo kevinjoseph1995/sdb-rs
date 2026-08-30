@@ -4,6 +4,7 @@ use anyhow::{Context, Ok, Result};
 use super::CommandMetadata;
 use libsdb::address::VirtAddress;
 use libsdb::process::{Process, StopPointMode};
+use libsdb::target::Target;
 /////////////////////////////////////////
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -30,7 +31,7 @@ pub enum WatchpointCommandCategory {
 fn set_breakpoint(
     metadata: &CommandMetadata,
     args: Vec<String>,
-    process: &mut Process,
+    target: &mut Target,
     is_hardware: bool,
 ) -> Result<()> {
     if args.is_empty() {
@@ -52,13 +53,18 @@ fn set_breakpoint(
             err, args[0]
         ))
     })?;
-    let breakpoint = process.create_breakpoint(VirtAddress::from(address), true, is_hardware)?;
-    println!(
-        "Breakpoint set at address: {}, ID: {}",
-        breakpoint.virtual_address(),
-        breakpoint.id()
-    );
+    let address = VirtAddress::from(address);
+    let id = target.set_breakpoint(address, is_hardware)?;
+    println!("Breakpoint set at address: {}, ID: {}", address, id);
     Ok(())
+}
+
+fn format_addresses(addresses: &[VirtAddress]) -> String {
+    addresses
+        .iter()
+        .map(|address| address.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl WatchpointCommandCategory {
@@ -224,25 +230,24 @@ impl BreakpointCommandCategory {
         &self,
         metadata: &CommandMetadata,
         args: Vec<String>,
-        process: &mut Process,
+        target: &mut Target,
     ) -> Result<()> {
         match self {
             BreakpointCommandCategory::List => {
-                if process.breakpoints.is_empty() {
+                let ids: Vec<_> = target.breakpoints().iter().map(|bp| bp.id()).collect();
+                if ids.is_empty() {
                     println!("No breakpoints set.");
                     return Ok(());
                 }
                 println!("Breakpoints:");
-                for breakpoint in process.breakpoints.iter() {
+                for id in ids {
+                    let addresses = target.breakpoint_addresses(id)?;
+                    let is_enabled = target.is_breakpoint_enabled(id)?;
                     println!(
                         "{}: address = {}, {}",
-                        breakpoint.id(),
-                        breakpoint.virtual_address(),
-                        if breakpoint.is_enabled() {
-                            "enabled"
-                        } else {
-                            "disabled"
-                        }
+                        id,
+                        format_addresses(&addresses),
+                        if is_enabled { "enabled" } else { "disabled" }
                     );
                 }
                 Ok(())
@@ -253,28 +258,23 @@ impl BreakpointCommandCategory {
                     return Ok(());
                 }
                 let break_point_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
-                let breakpoint = process
-                    .breakpoints
-                    .iter()
-                    .find(|bp| bp.id() == break_point_id)
-                    .ok_or(anyhow::Error::msg(format!(
+                let addresses = target.breakpoint_addresses(break_point_id).map_err(|_| {
+                    anyhow::Error::msg(format!(
                         "Breakpoint with ID {} not found.",
                         break_point_id
-                    )))?;
+                    ))
+                })?;
+                let is_enabled = target.is_breakpoint_enabled(break_point_id)?;
                 println!(
                     "Breakpoint ID: {}, Address: {}, Status: {}",
-                    breakpoint.id(),
-                    breakpoint.virtual_address(),
-                    if breakpoint.is_enabled() {
-                        "enabled"
-                    } else {
-                        "disabled"
-                    }
+                    break_point_id,
+                    format_addresses(&addresses),
+                    if is_enabled { "enabled" } else { "disabled" }
                 );
                 Ok(())
             }
-            BreakpointCommandCategory::Set => set_breakpoint(metadata, args, process, false),
-            BreakpointCommandCategory::SetHardware => set_breakpoint(metadata, args, process, true),
+            BreakpointCommandCategory::Set => set_breakpoint(metadata, args, target, false),
+            BreakpointCommandCategory::SetHardware => set_breakpoint(metadata, args, target, true),
             BreakpointCommandCategory::Remove => {
                 if args.is_empty() {
                     return Err(anyhow::Error::msg(format!(
@@ -283,18 +283,10 @@ impl BreakpointCommandCategory {
                     )));
                 }
                 let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
-                if !process
-                    .breakpoints
-                    .iter()
-                    .find(|bp| bp.id() == breakpoint_id)
-                    .is_some()
-                {
-                    return Err(anyhow::Error::msg(format!(
-                        "Breakpoint with ID {} not found.",
-                        breakpoint_id
-                    )));
-                }
-                process.remove_breakpoint_by_id(breakpoint_id)?;
+                target.remove_breakpoint(breakpoint_id).context(format!(
+                    "Failed to remove breakpoint with ID {}.",
+                    breakpoint_id
+                ))?;
                 println!("Breakpoint removed: ID {}", breakpoint_id);
                 Ok(())
             }
@@ -306,12 +298,10 @@ impl BreakpointCommandCategory {
                     )));
                 }
                 let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
-                process
-                    .enable_breakpoint_by_id(breakpoint_id)
-                    .context(format!(
-                        "Failed to enable breakpoint with ID {}.",
-                        breakpoint_id
-                    ))?;
+                target.enable_breakpoint(breakpoint_id).context(format!(
+                    "Failed to enable breakpoint with ID {}.",
+                    breakpoint_id
+                ))?;
                 println!("Breakpoint enabled: ID {}", breakpoint_id);
                 Ok(())
             }
@@ -323,12 +313,10 @@ impl BreakpointCommandCategory {
                     )));
                 }
                 let breakpoint_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
-                process
-                    .disable_breakpoint_by_id(breakpoint_id)
-                    .context(format!(
-                        "Failed to disable breakpoint with ID {}.",
-                        breakpoint_id
-                    ))?;
+                target.disable_breakpoint(breakpoint_id).context(format!(
+                    "Failed to disable breakpoint with ID {}.",
+                    breakpoint_id
+                ))?;
                 println!("Breakpoint disabled: ID {}", breakpoint_id);
                 Ok(())
             }

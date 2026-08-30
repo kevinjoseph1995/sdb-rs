@@ -135,7 +135,7 @@ pub struct Process {
     args: Option<String>,
     syscall_catch_policy: SyscallCatchPolicyMode,
     expecting_syscall_exit: bool,
-    pub breakpoints: Vec<BreakpointSite>,
+    pub breakpoint_sites: Vec<BreakpointSite>,
     pub watchpoints: Vec<Watchpoint>,
     pub target_state: Weak<TargetState>,
 }
@@ -161,7 +161,7 @@ impl Process {
             args: None,
             syscall_catch_policy: SyscallCatchPolicyMode::None,
             expecting_syscall_exit: false,
-            breakpoints: Vec::new(),
+            breakpoint_sites: Vec::new(),
             watchpoints: Vec::new(),
             target_state: Weak::default(),
         };
@@ -194,7 +194,7 @@ impl Process {
                     syscall_catch_policy: SyscallCatchPolicyMode::None,
                     args: args.clone(),
                     expecting_syscall_exit: false,
-                    breakpoints: Vec::new(),
+                    breakpoint_sites: Vec::new(),
                     watchpoints: Vec::new(),
                     target_state: Weak::default(),
                 };
@@ -350,7 +350,7 @@ impl Process {
                 return Ok(HardwareStopPointId::WatchpointId(watchpoint.id));
             }
         }
-        for breakpoint in self.breakpoints.iter() {
+        for breakpoint in self.breakpoint_sites.iter() {
             if breakpoint.virtual_address == address && breakpoint.is_hardware {
                 return Ok(HardwareStopPointId::HardwareStopPointId(breakpoint.id));
             }
@@ -525,7 +525,7 @@ impl Process {
             // When the process stops due to a SIGTRAP, it is likely due to a breakpoint or single-step.
             let instruction_begin = self.get_pc()? - VirtAddress::new(1usize);
             if self
-                .breakpoints
+                .breakpoint_sites
                 .iter()
                 .find(|bp| bp.virtual_address == instruction_begin && bp.is_enabled)
                 .is_some()
@@ -587,7 +587,7 @@ impl Process {
             .context("Failed to get program counter (PC) register")?;
         // If the breakpoint at PC is enabled, we need to disable it before resuming.
         if let Some(index) = self
-            .breakpoints
+            .breakpoint_sites
             .iter()
             .position(|bp| bp.virtual_address == pc && bp.is_enabled)
         {
@@ -621,11 +621,11 @@ impl Process {
         let mut breakpoint_to_reenable: Option<usize> = None;
         let program_counter = self.get_pc()?;
         if let Some(breakpoint_site_index) = self
-            .breakpoints
+            .breakpoint_sites
             .iter()
             .position(|bp| bp.virtual_address == program_counter)
         {
-            let breakpoint = &mut self.breakpoints[breakpoint_site_index];
+            let breakpoint = &mut self.breakpoint_sites[breakpoint_site_index];
             if breakpoint.is_enabled {
                 // If the breakpoint is enabled at the instruction address, we need to disable it before single stepping.
                 self.disable_breakpoint_at_index(breakpoint_site_index)?;
@@ -651,7 +651,7 @@ impl Process {
     /// honor a user breakpoint.
     pub fn run_until_address(&mut self, address: VirtAddress) -> Result<StopReason> {
         let breakpoint_to_remove = if self
-            .breakpoints
+            .breakpoint_sites
             .iter()
             .any(|bp| bp.virtual_address == address)
         {
@@ -804,7 +804,7 @@ impl Process {
         num_bytes: usize,
     ) -> Result<Vec<u8>> {
         let mut bytes = self.read_memory(start, num_bytes)?;
-        for breakpoint in self.breakpoints.iter() {
+        for breakpoint in self.breakpoint_sites.iter() {
             if breakpoint.is_hardware || !breakpoint.is_enabled {
                 continue; // Skip hardware breakpoints and disabled breakpoints
             }
@@ -970,7 +970,7 @@ impl Process {
         is_hardware: bool,
     ) -> Result<&'a mut BreakpointSite> {
         if self
-            .breakpoints
+            .breakpoint_sites
             .iter()
             .any(|bp| bp.virtual_address == address)
         {
@@ -979,16 +979,16 @@ impl Process {
                 address
             ));
         }
-        self.breakpoints
+        self.breakpoint_sites
             .push(BreakpointSite::new(address, false, is_hardware));
         if enable_after_creation {
-            let index = self.breakpoints.len() - 1;
+            let index = self.breakpoint_sites.len() - 1;
             if let Err(e) = self.enable_breakpoint_at_index(index) {
-                self.breakpoints.remove(index);
+                self.breakpoint_sites.remove(index);
                 return Err(e.context("Failed to enable breakpoint after creation"));
             }
         }
-        Ok(self.breakpoints.last_mut().unwrap())
+        Ok(self.breakpoint_sites.last_mut().unwrap())
     }
 
     fn find_free_stop_point_register(control: u64) -> Result<u8> {
@@ -1139,13 +1139,13 @@ impl Process {
 
     pub fn remove_breakpoint_by_id(&mut self, id: StopPointId) -> Result<()> {
         let position = self
-            .breakpoints
+            .breakpoint_sites
             .iter()
             .position(|site| site.id == id)
             .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
         self.disable_breakpoint_by_id(id)
             .context("Failed to disable breakpoint site before removing")?;
-        self.breakpoints.remove(position);
+        self.breakpoint_sites.remove(position);
         Ok(())
     }
 
@@ -1162,13 +1162,13 @@ impl Process {
     }
 
     fn enable_breakpoint_at_index(&mut self, index: usize) -> Result<()> {
-        if self.breakpoints[index].is_enabled {
+        if self.breakpoint_sites[index].is_enabled {
             return Ok(()); // Breakpoint is already enabled, no action needed
         }
         let hardware_index = {
-            if self.breakpoints[index].is_hardware {
+            if self.breakpoint_sites[index].is_hardware {
                 Some(self.set_hardware_breakpoint(
-                    self.breakpoints[index].virtual_address(),
+                    self.breakpoint_sites[index].virtual_address(),
                     1,
                     StopPointMode::Execute,
                 )?)
@@ -1176,7 +1176,7 @@ impl Process {
                 None
             }
         };
-        let breakpoint = &mut self.breakpoints[index];
+        let breakpoint = &mut self.breakpoint_sites[index];
         if let Some(hardware_index) = hardware_index {
             breakpoint.hardware_index = Some(hardware_index);
             breakpoint.is_enabled = true;
@@ -1202,18 +1202,18 @@ impl Process {
     }
 
     fn disable_breakpoint_at_index(&mut self, index: usize) -> Result<()> {
-        if !self.breakpoints[index].is_enabled {
+        if !self.breakpoint_sites[index].is_enabled {
             return Ok(()); // Breakpoint is already disabled, no action needed
         }
-        if let Some(hardware_index) = self.breakpoints[index].hardware_index {
+        if let Some(hardware_index) = self.breakpoint_sites[index].hardware_index {
             // If this is a hardware breakpoint, we need to clear it.
             self.clear_hardware_breakpoint(hardware_index)
                 .context("Failed to clear hardware stop point")?;
-            self.breakpoints[index].hardware_index = None;
-            self.breakpoints[index].is_enabled = false;
+            self.breakpoint_sites[index].hardware_index = None;
+            self.breakpoint_sites[index].is_enabled = false;
             return Ok(()); // Hardware breakpoint cleared, no need to write to memory
         }
-        let breakpoint = &mut self.breakpoints[index];
+        let breakpoint = &mut self.breakpoint_sites[index];
         let data = nix::sys::ptrace::read(self.pid, breakpoint.virtual_address.address as *mut _)
             .map_err(|e| anyhow::anyhow!("Failed to read memory: {}", e))?;
         // Read the saved data from the breakpoint site
@@ -1232,7 +1232,7 @@ impl Process {
 
     pub fn enable_breakpoint_by_id(&mut self, id: StopPointId) -> Result<()> {
         let index = self
-            .breakpoints
+            .breakpoint_sites
             .iter_mut()
             .position(|site| site.id == id)
             .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;
@@ -1243,7 +1243,7 @@ impl Process {
 
     pub fn disable_breakpoint_by_id(&mut self, id: StopPointId) -> Result<()> {
         let index = self
-            .breakpoints
+            .breakpoint_sites
             .iter_mut()
             .position(|site| site.id == id)
             .ok_or(anyhow!("Breakpoint site with ID {} not found", id))?;

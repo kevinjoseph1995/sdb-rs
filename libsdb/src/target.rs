@@ -3,16 +3,51 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::address::FileAddress;
+use crate::disassembler;
 use crate::dwarf::LineTableEntry;
-use crate::process::{StopReason, TrapType};
+use crate::process::{StopPointId, StopReason, TrapType};
 use crate::register_info::RegisterValue;
 use crate::stack::Stack;
 use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
-use crate::{disassembler, stack};
 use anyhow::{Context, Result, anyhow};
 use libc::AT_ENTRY;
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
+
+pub type BreakpointId = i32;
+
+fn get_next_breakpoint_id() -> BreakpointId {
+    static NEXT_ID: std::sync::Mutex<BreakpointId> = std::sync::Mutex::new(0);
+    let mut id = NEXT_ID.lock().unwrap();
+    let next_id = *id;
+    *id += 1;
+    next_id
+}
+
+/// A user-requested breakpoint, e.g. "stop at address X" or (in the future)
+/// "stop at line 5 of foo.cpp". A breakpoint is realized by one or more
+/// [`crate::process::BreakpointSite`]s, the actual trap-planted addresses in
+/// the inferior; today an address breakpoint always has exactly one.
+pub struct Breakpoint {
+    id: BreakpointId,
+    is_hardware: bool,
+    /// IDs of the breakpoint sites in `Process::breakpoint_sites` that implement this breakpoint.
+    site_ids: Vec<StopPointId>,
+}
+
+impl Breakpoint {
+    pub fn id(&self) -> BreakpointId {
+        self.id
+    }
+
+    pub fn is_hardware(&self) -> bool {
+        self.is_hardware
+    }
+
+    pub fn site_ids(&self) -> &[StopPointId] {
+        &self.site_ids
+    }
+}
 
 pub struct TargetState {
     pub elf: Rc<Elf>,
@@ -24,6 +59,7 @@ pub struct TargetState {
 pub struct Target {
     pub process: Process,
     pub state: Rc<TargetState>,
+    breakpoints: Vec<Breakpoint>,
 }
 
 /// Borrow-free identity of the line-table entry covering a PC, used to detect
@@ -57,7 +93,11 @@ impl Target {
             stack: Stack::new(),
         });
         process.target_state = Rc::downgrade(&state);
-        Ok(Target { process, state })
+        Ok(Target {
+            process,
+            state,
+            breakpoints: Vec::new(),
+        })
     }
 
     pub fn attach(pid: crate::Pid) -> Result<Self> {
@@ -72,7 +112,11 @@ impl Target {
             stack: Stack::new(),
         });
         process.target_state = Rc::downgrade(&state);
-        Ok(Target { process, state })
+        Ok(Target {
+            process,
+            state,
+            breakpoints: Vec::new(),
+        })
     }
 
     /// Loads the executable's ELF (with load bias applied) and its DWARF info, if any.
@@ -365,6 +409,104 @@ impl Target {
             return Ok(Some(entry));
         }
         return Ok(None);
+    }
+
+    pub fn breakpoints(&self) -> &[Breakpoint] {
+        &self.breakpoints
+    }
+
+    pub fn find_breakpoint(&self, id: BreakpointId) -> Option<&Breakpoint> {
+        self.breakpoints.iter().find(|bp| bp.id == id)
+    }
+
+    /// Sets a new breakpoint at `address`, planting a single breakpoint site
+    /// there, and returns the new breakpoint's ID.
+    pub fn set_breakpoint(
+        &mut self,
+        address: VirtAddress,
+        is_hardware: bool,
+    ) -> Result<BreakpointId> {
+        let site_id = self
+            .process
+            .create_breakpoint(address, true, is_hardware)?
+            .id();
+        let id = get_next_breakpoint_id();
+        self.breakpoints.push(Breakpoint {
+            id,
+            is_hardware,
+            site_ids: vec![site_id],
+        });
+        Ok(id)
+    }
+
+    pub fn remove_breakpoint(&mut self, id: BreakpointId) -> Result<()> {
+        let position = self
+            .breakpoints
+            .iter()
+            .position(|bp| bp.id == id)
+            .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
+        for site_id in self.breakpoints[position].site_ids.clone() {
+            self.process.remove_breakpoint_by_id(site_id)?;
+        }
+        self.breakpoints.remove(position);
+        Ok(())
+    }
+
+    pub fn enable_breakpoint(&mut self, id: BreakpointId) -> Result<()> {
+        let site_ids = self
+            .find_breakpoint(id)
+            .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?
+            .site_ids
+            .clone();
+        for site_id in site_ids {
+            self.process.enable_breakpoint_by_id(site_id)?;
+        }
+        Ok(())
+    }
+
+    pub fn disable_breakpoint(&mut self, id: BreakpointId) -> Result<()> {
+        let site_ids = self
+            .find_breakpoint(id)
+            .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?
+            .site_ids
+            .clone();
+        for site_id in site_ids {
+            self.process.disable_breakpoint_by_id(site_id)?;
+        }
+        Ok(())
+    }
+
+    /// Whether every site backing `id` is currently enabled.
+    pub fn is_breakpoint_enabled(&self, id: BreakpointId) -> Result<bool> {
+        let bp = self
+            .find_breakpoint(id)
+            .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
+        Ok(bp.site_ids.iter().all(|site_id| {
+            self.process
+                .breakpoint_sites
+                .iter()
+                .find(|s| s.id() == *site_id)
+                .map(|s| s.is_enabled())
+                .unwrap_or(false)
+        }))
+    }
+
+    /// The virtual address of each site backing `id`.
+    pub fn breakpoint_addresses(&self, id: BreakpointId) -> Result<Vec<VirtAddress>> {
+        let bp = self
+            .find_breakpoint(id)
+            .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
+        Ok(bp
+            .site_ids
+            .iter()
+            .filter_map(|site_id| {
+                self.process
+                    .breakpoint_sites
+                    .iter()
+                    .find(|s| s.id() == *site_id)
+                    .map(|s| s.virtual_address())
+            })
+            .collect())
     }
 }
 

@@ -320,11 +320,9 @@ impl Application {
                 command.args,
                 &mut self.target.process,
             ),
-            CommandCategory::Breakpoint(cmd) => cmd.handle_command(
-                &last_in_chain.metadata,
-                command.args,
-                &mut self.target.process,
-            ),
+            CommandCategory::Breakpoint(cmd) => {
+                cmd.handle_command(last_in_chain.metadata, command.args, &mut self.target)
+            }
             CommandCategory::StepIn => {
                 let stop_reason = self.target.step_in()?;
                 self.handle_stop_reason(stop_reason)?;
