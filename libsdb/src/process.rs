@@ -135,7 +135,7 @@ pub struct Process {
     args: Option<String>,
     syscall_catch_policy: SyscallCatchPolicyMode,
     expecting_syscall_exit: bool,
-    pub breakpoints: Vec<Breakpoint>,
+    pub breakpoints: Vec<BreakpointSite>,
     pub watchpoints: Vec<Watchpoint>,
     pub target_state: Weak<TargetState>,
 }
@@ -968,7 +968,7 @@ impl Process {
         address: VirtAddress,
         enable_after_creation: bool,
         is_hardware: bool,
-    ) -> Result<&'a mut Breakpoint> {
+    ) -> Result<&'a mut BreakpointSite> {
         if self
             .breakpoints
             .iter()
@@ -980,7 +980,7 @@ impl Process {
             ));
         }
         self.breakpoints
-            .push(Breakpoint::new(address, false, is_hardware));
+            .push(BreakpointSite::new(address, false, is_hardware));
         if enable_after_creation {
             let index = self.breakpoints.len() - 1;
             if let Err(e) = self.enable_breakpoint_at_index(index) {
@@ -1545,7 +1545,7 @@ impl Watchpoint {
 }
 
 #[derive(Debug)]
-pub struct Breakpoint {
+pub struct BreakpointSite {
     id: StopPointId,
     is_enabled: bool,
     virtual_address: VirtAddress,
@@ -1563,9 +1563,9 @@ fn get_next_stoppoint_id() -> StopPointId {
     next_id
 }
 
-impl Breakpoint {
+impl BreakpointSite {
     fn new(virtual_address: VirtAddress, is_internal: bool, is_hardware: bool) -> Self {
-        Breakpoint {
+        BreakpointSite {
             id: get_next_stoppoint_id(),
             is_enabled: false,
             virtual_address,
