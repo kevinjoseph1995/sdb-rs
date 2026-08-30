@@ -897,11 +897,15 @@ impl Process {
         self.watchpoints.push(Watchpoint::new(address, mode, size)?);
         let index = self.watchpoints.len() - 1;
         if enable_after_creation {
-            self.enable_watchpoint_at_index(index)
-                .context("Failed to enable watchpoint after creation")?;
+            if let Err(e) = self.enable_watchpoint_at_index(index) {
+                self.watchpoints.remove(index);
+                return Err(e.context("Failed to enable watchpoint after creation"));
+            }
         }
-        self.update_watchpoint_data(index)
-            .context("Failed to update watchpoint data after enabling")?;
+        if let Err(e) = self.update_watchpoint_data(index) {
+            self.watchpoints.remove(index);
+            return Err(e.context("Failed to update watchpoint data after enabling"));
+        }
         Ok(self.watchpoints.last_mut().unwrap())
     }
 
@@ -979,8 +983,10 @@ impl Process {
             .push(Breakpoint::new(address, false, is_hardware));
         if enable_after_creation {
             let index = self.breakpoints.len() - 1;
-            self.enable_breakpoint_at_index(index)
-                .context("Failed to enable breakpoint after creation")?;
+            if let Err(e) = self.enable_breakpoint_at_index(index) {
+                self.breakpoints.remove(index);
+                return Err(e.context("Failed to enable breakpoint after creation"));
+            }
         }
         Ok(self.breakpoints.last_mut().unwrap())
     }
