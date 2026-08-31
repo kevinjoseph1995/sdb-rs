@@ -66,6 +66,21 @@ fn test_process_attach_failure() {
     assert!(attached_process.is_err());
 }
 
+/// Polls `get_process_state` until it stops reporting `TracingStopped` or the
+/// timeout elapses. Reading /proc immediately after ptrace::cont/PTRACE_CONT
+/// races the kernel's own state transition, so a single point-in-time check
+/// right after resume is inherently flaky.
+fn wait_until_not_tracing_stopped(pid: Pid) -> ProcessState {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        let state = get_process_state(pid).expect("Failed to get process state");
+        if state != ProcessState::TracingStopped || std::time::Instant::now() >= deadline {
+            return state;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 #[test]
 fn test_process_resume() {
     let mut target_process =
@@ -79,7 +94,7 @@ fn test_process_resume() {
         .expect("Failed to resume process");
     // After resuming, the process runs normally and may be either Running or
     // Sleeping (blocked on its stdout pipe); both prove it left TracingStopped.
-    let state = get_process_state(target_process.pid).expect("Failed to get process state");
+    let state = wait_until_not_tracing_stopped(target_process.pid);
     assert!(
         state == ProcessState::Running || state == ProcessState::Sleeping,
         "unexpected state after resume: {:?}",
@@ -113,7 +128,7 @@ fn test_process_resume_not_attached() {
         .expect("Failed to resume process");
     // After resuming, the process runs normally again and may be either Running
     // or Sleeping (blocked on its stdout pipe); both prove it left TracingStopped.
-    let state = get_process_state(attached_handle.pid).unwrap();
+    let state = wait_until_not_tracing_stopped(attached_handle.pid);
     assert!(
         state == ProcessState::Running || state == ProcessState::Sleeping,
         "unexpected state after resume: {:?}",
