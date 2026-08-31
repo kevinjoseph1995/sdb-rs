@@ -1,4 +1,4 @@
-use libsdb::{dwarf::Dwarf, elf::Elf, target::Target};
+use libsdb::{dwarf::Dwarf, elf::Elf, register_info::RegisterId, target::Target};
 use std::{
     ffi::{CStr, CString},
     path::PathBuf,
@@ -121,17 +121,34 @@ fn step_out_still_works_without_dwarf() {
         .run_until_address(add_low_pc)
         .expect("failed to run to `add`");
 
-    // Land past `add`'s prologue (`push rbp; mov rbp, rsp` — two
-    // instructions) so `rbp` actually points at `add`'s frame rather than
-    // its caller's; step_out's frame-pointer walk depends on that.
-    target
-        .process
-        .step_instruction()
-        .expect("failed to step past `push rbp`");
-    target
-        .process
-        .step_instruction()
-        .expect("failed to step past `mov rbp, rsp`");
+    // Land past `add`'s prologue so `rbp` actually points at `add`'s frame
+    // rather than its caller's; step_out's frame-pointer walk depends on
+    // that. Rather than assuming a fixed instruction count (the prologue
+    // may be preceded by `endbr64` or other compiler-inserted instructions
+    // depending on the toolchain), step until `rsp == rbp`, which is exactly
+    // the condition `mov rbp, rsp` establishes.
+    for _ in 0..16 {
+        let registers = target.process.get_registers();
+        let rsp = registers
+            .get_register_value(RegisterId::rsp)
+            .expect("failed to read rsp");
+        let rbp = registers
+            .get_register_value(RegisterId::rbp)
+            .expect("failed to read rbp");
+        if rsp == rbp {
+            break;
+        }
+        target
+            .process
+            .step_instruction()
+            .expect("failed to step through `add`'s prologue");
+    }
+    let registers = target.process.get_registers();
+    assert_eq!(
+        registers.get_register_value(RegisterId::rsp).unwrap(),
+        registers.get_register_value(RegisterId::rbp).unwrap(),
+        "failed to land past `add`'s prologue: rsp never matched rbp"
+    );
 
     let reason = target.step_out().expect("step_out should succeed without DWARF");
     assert!(
