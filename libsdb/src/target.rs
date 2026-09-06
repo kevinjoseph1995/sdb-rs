@@ -451,25 +451,25 @@ impl Target {
     }
 
     pub fn enable_breakpoint(&mut self, id: BreakpointId) -> Result<()> {
-        let site_ids = self
-            .find_breakpoint(id)
-            .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?
-            .site_ids
-            .clone();
-        for site_id in site_ids {
-            self.process.enable_breakpoint_by_id(site_id)?;
+        let bp = self
+            .breakpoints
+            .iter()
+            .find(|bp| bp.id == id)
+            .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
+        for site_id in &bp.site_ids {
+            self.process.enable_breakpoint_by_id(*site_id)?;
         }
         Ok(())
     }
 
     pub fn disable_breakpoint(&mut self, id: BreakpointId) -> Result<()> {
-        let site_ids = self
-            .find_breakpoint(id)
-            .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?
-            .site_ids
-            .clone();
-        for site_id in site_ids {
-            self.process.disable_breakpoint_by_id(site_id)?;
+        let bp = self
+            .breakpoints
+            .iter()
+            .find(|bp| bp.id == id)
+            .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
+        for site_id in &bp.site_ids {
+            self.process.disable_breakpoint_by_id(*site_id)?;
         }
         Ok(())
     }
