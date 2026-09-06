@@ -22,6 +22,12 @@ fn get_next_breakpoint_id() -> BreakpointId {
     next_id
 }
 
+enum BreakpointMetadata {
+    Function { name: String },
+    Line { path: PathBuf, line: usize },
+    Address { address: VirtAddress },
+}
+
 /// A user-requested breakpoint, e.g. "stop at address X" or (in the future)
 /// "stop at line 5 of foo.cpp". A breakpoint is realized by one or more
 /// [`crate::process::BreakpointSite`]s, the actual trap-planted addresses in
@@ -31,6 +37,7 @@ pub struct Breakpoint {
     is_hardware: bool,
     /// IDs of the breakpoint sites in `Process::breakpoint_sites` that implement this breakpoint.
     site_ids: Vec<StopPointId>,
+    metadata: BreakpointMetadata,
 }
 
 impl Breakpoint {
@@ -433,6 +440,7 @@ impl Target {
             id,
             is_hardware,
             site_ids: vec![site_id],
+            metadata: BreakpointMetadata::Address { address },
         });
         Ok(id)
     }
