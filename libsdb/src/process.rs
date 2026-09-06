@@ -657,7 +657,7 @@ impl Process {
         {
             None
         } else {
-            Some(self.create_breakpoint(address, true, false)?.id)
+            Some(self.create_breakpoint_site(address, true, false, None)?.id)
         };
 
         self.resume_process()?;
@@ -963,11 +963,12 @@ impl Process {
 
     /// Creates a new breakpoint site at the specified address.
     /// If `enable_after_creation` is true, the breakpoint will be enabled immediately after creation.
-    pub fn create_breakpoint<'a>(
+    pub fn create_breakpoint_site<'a>(
         &'a mut self,
         address: VirtAddress,
         enable_after_creation: bool,
         is_hardware: bool,
+        parent_breakpoint_id: Option<BreakpointId>,
     ) -> Result<&'a mut BreakpointSite> {
         if self
             .breakpoint_sites
@@ -979,8 +980,12 @@ impl Process {
                 address
             ));
         }
-        self.breakpoint_sites
-            .push(BreakpointSite::new(address, false, is_hardware));
+        self.breakpoint_sites.push(BreakpointSite::new(
+            address,
+            false,
+            is_hardware,
+            parent_breakpoint_id,
+        ));
         if enable_after_creation {
             let index = self.breakpoint_sites.len() - 1;
             if let Err(e) = self.enable_breakpoint_at_index(index) {
@@ -1477,6 +1482,7 @@ impl Registers {
     }
 }
 
+pub type BreakpointId = i32;
 pub type StopPointId = i32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1553,6 +1559,7 @@ pub struct BreakpointSite {
     _is_internal: bool,
     is_hardware: bool,
     hardware_index: Option<u8>, // Only used for hardware breakpoints
+    parent_breakpoint_id: Option<BreakpointId>,
 }
 
 fn get_next_stoppoint_id() -> StopPointId {
@@ -1564,7 +1571,12 @@ fn get_next_stoppoint_id() -> StopPointId {
 }
 
 impl BreakpointSite {
-    fn new(virtual_address: VirtAddress, is_internal: bool, is_hardware: bool) -> Self {
+    fn new(
+        virtual_address: VirtAddress,
+        is_internal: bool,
+        is_hardware: bool,
+        parent_breakpoint_id: Option<BreakpointId>,
+    ) -> Self {
         BreakpointSite {
             id: get_next_stoppoint_id(),
             is_enabled: false,
@@ -1573,6 +1585,7 @@ impl BreakpointSite {
             _is_internal: is_internal,
             is_hardware,
             hardware_index: None,
+            parent_breakpoint_id: parent_breakpoint_id,
         }
     }
 

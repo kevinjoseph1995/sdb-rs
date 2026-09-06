@@ -5,7 +5,7 @@ use std::rc::Rc;
 use crate::address::FileAddress;
 use crate::disassembler;
 use crate::dwarf::LineTableEntry;
-use crate::process::{StopPointId, StopReason, TrapType};
+use crate::process::{BreakpointId, StopPointId, StopReason, TrapType};
 use crate::register_info::RegisterValue;
 use crate::stack::Stack;
 use crate::{address::VirtAddress, dwarf::Dwarf, elf::Elf, process::Process};
@@ -13,8 +13,6 @@ use anyhow::{Context, Result, anyhow};
 use libc::AT_ENTRY;
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
-
-pub type BreakpointId = i32;
 
 fn get_next_breakpoint_id() -> BreakpointId {
     static NEXT_ID: std::sync::Mutex<BreakpointId> = std::sync::Mutex::new(0);
@@ -426,11 +424,11 @@ impl Target {
         address: VirtAddress,
         is_hardware: bool,
     ) -> Result<BreakpointId> {
+        let id = get_next_breakpoint_id();
         let site_id = self
             .process
-            .create_breakpoint(address, true, is_hardware)?
+            .create_breakpoint_site(address, true, is_hardware, Some(id))?
             .id();
-        let id = get_next_breakpoint_id();
         self.breakpoints.push(Breakpoint {
             id,
             is_hardware,
