@@ -92,6 +92,34 @@ fn levenshtein_distance(a: &str, b: &str) -> usize {
     row[b.len()]
 }
 
+/// Resolves a bare executable name against `PATH`, mirroring the lookup rules
+/// `execvp(3)` (and gdb) use: a path containing a `/` is used as-is, otherwise
+/// each directory in `PATH` is searched for an executable file with that name.
+fn resolve_executable_path(path: &Path) -> Result<PathBuf> {
+    if path.to_string_lossy().contains('/') {
+        return Ok(path.to_path_buf());
+    }
+    // Like execvp(3), fall back to a default search path when PATH isn't set.
+    let path_var = std::env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into());
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(path);
+        if is_executable_file(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!(
+        "Could not find executable '{}' in PATH",
+        path.display()
+    ))
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
 fn get_next_breakpoint_id() -> BreakpointId {
     static NEXT_ID: std::sync::Mutex<BreakpointId> = std::sync::Mutex::new(0);
     let mut id = NEXT_ID.lock().unwrap();
@@ -107,6 +135,7 @@ impl Target {
         debug_process_being_launched: bool,
         stdout_replacement: Option<std::os::fd::OwnedFd>,
     ) -> Result<Self> {
+        let executable_path = &resolve_executable_path(executable_path)?;
         let mut process = Process::launch(
             executable_path,
             args,
