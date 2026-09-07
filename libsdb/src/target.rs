@@ -70,6 +70,28 @@ struct LineSnapshot {
     end_sequence: bool,
 }
 
+/// Case-sensitive Levenshtein (edit) distance between two strings, used to rank
+/// "did you mean" suggestions when a requested function name doesn't exist.
+/// Single-row DP over bytes (function names are effectively ASCII) to keep this
+/// to one allocation per call instead of the usual two-row/two-buffer version.
+fn levenshtein_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, &a_byte) in a.iter().enumerate() {
+        let mut diagonal = row[0]; // row[j] before this iteration overwrites it
+        row[0] = i + 1;
+        for (j, &b_byte) in b.iter().enumerate() {
+            let up_left = std::mem::replace(&mut diagonal, row[j + 1]);
+            row[j + 1] = if a_byte == b_byte {
+                up_left
+            } else {
+                1 + up_left.min(row[j]).min(row[j + 1])
+            };
+        }
+    }
+    row[b.len()]
+}
+
 fn get_next_breakpoint_id() -> BreakpointId {
     static NEXT_ID: std::sync::Mutex<BreakpointId> = std::sync::Mutex::new(0);
     let mut id = NEXT_ID.lock().unwrap();
@@ -446,14 +468,61 @@ impl Target {
         Ok(id)
     }
 
+    /// All known function names in the target binary, combining DWARF debug info
+    /// (unmangled by construction) and the ELF symbol table (both mangled and,
+    /// where demangling succeeded, demangled forms), deduplicated. Intended for
+    /// completion/suggestion purposes.
+    pub fn all_function_names(&self) -> Vec<String> {
+        let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        if let Some(dwarf) = &self.state.dwarf {
+            names.extend(dwarf.function_names().map(String::from));
+        }
+        names.extend(
+            self.state
+                .elf
+                .function_names()
+                .filter_map(|n| n.to_str().ok().map(String::from)),
+        );
+        names.into_iter().collect()
+    }
+
+    /// Ranks all known function names by edit distance to `query` and returns the
+    /// closest ones, for "did you mean" suggestions on a failed lookup. Names too
+    /// far from `query` to plausibly be a typo are excluded.
+    fn suggest_function_names(&self, query: &str, max_suggestions: usize) -> Vec<String> {
+        let max_distance = (query.chars().count() / 2).max(2);
+        // Score borrowed names directly (no `all_function_names()` dedup/copy) so
+        // only the handful actually returned get allocated as owned `String`s.
+        let dwarf_names = self.state.dwarf.iter().flat_map(|d| d.function_names());
+        let elf_names = self.state.elf.function_names().filter_map(|n| n.to_str().ok());
+        let mut scored: Vec<(usize, &str)> = dwarf_names
+            .chain(elf_names)
+            .map(|name| (levenshtein_distance(query, name), name))
+            .filter(|(distance, _)| *distance <= max_distance)
+            .collect();
+        scored.sort();
+        scored.dedup_by(|a, b| a.1 == b.1); // dwarf/elf can index the same name twice
+        scored
+            .into_iter()
+            .take(max_suggestions)
+            .map(|(_, name)| name.to_string())
+            .collect()
+    }
+
     pub fn set_function_breakpoint(&mut self, function_name: &str) -> Result<BreakpointId> {
         let is_hardware = false;
         let found = Self::find_functions(&self.state, function_name)?;
 
         if found.dwarf_functions.is_empty() && found.elf_functions.is_empty() {
-            return Err(anyhow!(
-                "No function named '{function_name}' found in DWARF or the ELF symbol table"
-            ));
+            let suggestions = self.suggest_function_names(function_name, 3);
+            return Err(if suggestions.is_empty() {
+                anyhow!("No function named '{function_name}' found in DWARF or the ELF symbol table")
+            } else {
+                anyhow!(
+                    "No function named '{function_name}' found in DWARF or the ELF symbol table. Did you mean: {}?",
+                    suggestions.join(", ")
+                )
+            });
         }
 
         let mut load_addresses = Vec::new();

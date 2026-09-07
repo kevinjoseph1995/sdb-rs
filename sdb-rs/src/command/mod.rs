@@ -656,6 +656,38 @@ pub fn get_completions(partial_command_string: &str) -> Vec<&'static str> {
     }
 }
 
+/// Like [`get_completions`], but additionally offers function-name completions
+/// (prefix-matched via `function_names`) when the in-progress word is the
+/// argument to `breakpoint set` / `breakpoint set_hardware`.
+pub fn get_completions_with_function_names(
+    partial_command_string: &str,
+    function_names: &ptrie::Trie<u8, String>,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = get_completions(partial_command_string)
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+    let (parse_nodes, remaining_tokens) = try_traverse_command_tree(partial_command_string);
+    if remaining_tokens.len() <= 1 {
+        if let Some(last_node) = parse_nodes.last() {
+            if matches!(
+                last_node.metadata.category,
+                Some(Breakpoint(Set)) | Some(Breakpoint(SetHardware))
+            ) {
+                let partial_word = remaining_tokens.last().map(String::as_str).unwrap_or("");
+                candidates.extend(
+                    function_names
+                        .find_postfixes(partial_word.bytes())
+                        .into_iter()
+                        .cloned(),
+                );
+            }
+        }
+    }
+    candidates
+}
+
 pub fn get_description_for_help(help_command: &Command) -> Result<String> {
     assert!(
         help_command
@@ -887,6 +919,51 @@ mod tests {
             assert!(completions.contains(&"read"));
             assert!(completions.contains(&"w"));
             assert!(completions.contains(&"write"));
+        }
+    }
+
+    fn function_name_trie() -> ptrie::Trie<u8, String> {
+        let mut trie = ptrie::Trie::new();
+        for name in [
+            "dj_parse",
+            "dj_encode",
+            "djb2_hash",
+            "main",
+            "dj::config::load", // stand-in for a demangled Rust path
+        ] {
+            trie.insert(name.bytes(), name.to_string());
+        }
+        trie
+    }
+
+    #[test]
+    fn test_get_completions_with_function_names() {
+        let trie = function_name_trie();
+        {
+            // Prefix match in the "breakpoint set" argument position.
+            let completions = get_completions_with_function_names("breakpoint set dj", &trie);
+            assert!(completions.contains(&"dj_parse".to_string()));
+            assert!(completions.contains(&"dj_encode".to_string()));
+            assert!(completions.contains(&"djb2_hash".to_string()));
+            assert!(completions.contains(&"dj::config::load".to_string()));
+            assert!(!completions.contains(&"main".to_string()));
+        }
+        {
+            // Same for the hardware-breakpoint variant.
+            let completions =
+                get_completions_with_function_names("breakpoint set_hardware dj", &trie);
+            assert!(completions.contains(&"dj_parse".to_string()));
+        }
+        {
+            // Empty partial word (trailing space) matches everything.
+            let completions = get_completions_with_function_names("breakpoint set ", &trie);
+            assert!(completions.contains(&"dj_parse".to_string()));
+            assert!(completions.contains(&"main".to_string()));
+        }
+        {
+            // Wrong category: no function-name candidates should be added.
+            let completions = get_completions_with_function_names("breakpoint list dj", &trie);
+            assert!(!completions.contains(&"dj_parse".to_string()));
         }
     }
 

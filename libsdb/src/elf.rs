@@ -511,6 +511,17 @@ impl Elf {
 
     // ==================== Symbol Accessors (public) ====================
 
+    /// All symbol names (mangled and, where demangling succeeded, demangled)
+    /// that resolve to at least one function symbol, for completion/suggestion purposes.
+    pub fn function_names(&self) -> impl Iterator<Item = &CStr> {
+        self.symbol_name_map.iter().filter_map(|(name, indices)| {
+            indices
+                .iter()
+                .any(|&index| self.symbol_table[index].st_info & 0x0F == elf::abi::STT_FUNC)
+                .then(|| name.as_c_str())
+        })
+    }
+
     pub fn get_symbols_with_name(&self, name: &CStr) -> Vec<&Elf64_Sym> {
         self.symbol_name_map
             .get(name)

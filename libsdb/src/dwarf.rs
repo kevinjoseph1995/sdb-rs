@@ -353,6 +353,12 @@ impl Dwarf {
         None
     }
 
+    /// All indexed function names (i.e. `DW_AT_name` of every `DW_TAG_subprogram`/
+    /// `DW_TAG_inlined_subroutine` DIE with a low PC/range), for completion/suggestion purposes.
+    pub fn function_names(&self) -> impl Iterator<Item = &str> {
+        self.function_index.keys().map(String::as_str)
+    }
+
     pub fn find_functions<'dw>(&'dw self, function_name: &str) -> Vec<Die<'dw>> {
         let entries: Vec<(usize, usize)> = match self.function_index.get(function_name) {
             Some(index_entries) => index_entries

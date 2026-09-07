@@ -379,3 +379,47 @@ fn duplicate_function_breakpoints_on_the_same_function_are_independently_functio
         "id2's breakpoint on entry_a should still fire even though id1 (at the same address) was disabled"
     );
 }
+
+#[test]
+fn function_breakpoint_error_suggests_close_matches_on_typo() {
+    let mut target = launch_fixture();
+
+    let err = target
+        .set_function_breakpoint("entri_a") // typo for `entry_a`
+        .expect_err("typo'd function name should still fail to resolve");
+
+    let message = err.to_string();
+    assert!(
+        message.contains("entry_a"),
+        "expected a suggestion mentioning `entry_a` in the error, got: {message}"
+    );
+}
+
+#[test]
+fn function_breakpoint_error_has_no_suggestions_for_nonsense_name() {
+    let mut target = launch_fixture();
+
+    let err = target
+        .set_function_breakpoint("this_function_does_not_exist_anywhere")
+        .expect_err("nonexistent function name should fail to resolve");
+
+    let message = err.to_string();
+    assert!(
+        !message.contains("Did you mean"),
+        "a name with no plausible match shouldn't suggest anything, got: {message}"
+    );
+}
+
+#[test]
+fn all_function_names_includes_dwarf_indexed_functions() {
+    let target = launch_fixture();
+
+    let names = target.all_function_names();
+
+    for expected in ["entry_a", "compute_a", "add_a", "entry_b", "sum_b"] {
+        assert!(
+            names.iter().any(|n| n == expected),
+            "expected `{expected}` in all_function_names(), got {names:?}"
+        );
+    }
+}

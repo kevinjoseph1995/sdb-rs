@@ -10,7 +10,9 @@ use rustyline::{
     history::DefaultHistory, validate::Validator,
 };
 /////////////////////////////////////////
-use crate::command::{self, Command, CommandCategory, get_completions, get_description_for_help};
+use crate::command::{
+    self, Command, CommandCategory, get_completions_with_function_names, get_description_for_help,
+};
 use libsdb::{
     Sysno,
     process::{HardwareStopPointId, StopReason},
@@ -25,7 +27,7 @@ pub struct Application {
 }
 
 struct CustomHelper {
-    // Custom helper fields can be added here
+    function_names: std::rc::Rc<ptrie::Trie<u8, String>>,
 }
 
 impl Validator for CustomHelper {}
@@ -109,10 +111,7 @@ impl Completer for CustomHelper {
         pos: usize,
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
-        let candidates = get_completions(line)
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        let candidates = get_completions_with_function_names(line, &self.function_names);
         let white_space_pos = line[..pos].rfind(char::is_whitespace);
         if let Some(white_space_pos) = white_space_pos {
             return Ok((white_space_pos + 1, candidates));
@@ -362,10 +361,16 @@ impl Application {
     }
 
     pub fn main_loop(&mut self) -> Result<()> {
+        let mut function_names = ptrie::Trie::new();
+        for name in self.target.all_function_names() {
+            function_names.insert(name.bytes(), name.clone());
+        }
+        let function_names = std::rc::Rc::new(function_names);
+
         let mut rl = rustyline::Editor::<CustomHelper, DefaultHistory>::with_config(
             Config::builder().build(),
         )?;
-        rl.set_helper(Some(CustomHelper {}));
+        rl.set_helper(Some(CustomHelper { function_names }));
         if rl.load_history(&self.history_file).is_ok() {
             println!("History loaded from: {}", self.history_file.display());
         } else {
