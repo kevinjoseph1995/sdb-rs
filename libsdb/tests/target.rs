@@ -431,3 +431,180 @@ fn all_function_names_includes_dwarf_indexed_functions() {
         );
     }
 }
+
+// --- Target::set_line_breakpoint ------------------------------------------
+//
+// Mirrors the `set_function_breakpoint` tests above: drive the real inferior
+// and check it actually traps where the breakpoint claims to live. Expected
+// ranges come from `function_range` (straight DWARF low_pc/high_pc), never
+// from `set_line_breakpoint` itself.
+//
+// `lib_b.c` (see `tools/dwarf_fixture/src/lib_b.c`):
+//   35: static long sum_b(struct node_b *n) {
+//   36:     if (!n) return 0;
+//   37:     return (long)n->value + sum_b(n->next);
+//   38: }
+//   40: long entry_b(void) {
+//   ...
+//   46:     return sink_b;
+//   47: }
+//
+// At -O0, gcc emits more than one line-table row for some of these lines
+// (e.g. lines 36/37/45 get split across several statement boundaries that
+// all still carry that line number), which would make an exact hit count
+// dependent on the compiler's statement-splitting rather than the program's
+// control flow. Lines 38 (sum_b's shared epilogue) and 46 (a single plain
+// statement) each map to exactly one row, so the tests below stick to those
+// where an exact count matters.
+
+#[test]
+fn line_breakpoint_on_function_declaration_line_skips_the_prologue() {
+    let mut target = launch_fixture();
+    let entry_b_range = function_range(&target, "entry_b");
+
+    let id = target
+        .set_line_breakpoint(&PathBuf::from("lib_b.c"), 40)
+        .expect("set_line_breakpoint should find entry_b's declaration line via DWARF");
+
+    let addresses = target
+        .breakpoint_addresses(id)
+        .expect("breakpoint should be registered");
+    assert_eq!(
+        addresses.len(),
+        1,
+        "entry_b's declaration line has a single line-table row, got {addresses:?}"
+    );
+    let planted = addresses[0];
+    assert!(
+        range_contains(entry_b_range, planted),
+        "breakpoint at {planted} lands outside entry_b's own address range {entry_b_range:?}"
+    );
+    assert_ne!(
+        planted, entry_b_range.0,
+        "a line breakpoint on a function's entry line should skip the prologue, not land on \
+         its very first instruction"
+    );
+
+    let pc = expect_breakpoint_hit(&mut target);
+    assert_eq!(
+        pc, planted,
+        "process should have stopped exactly at the address the line breakpoint planted"
+    );
+}
+
+#[test]
+fn line_breakpoint_on_ordinary_line_fires_once() {
+    let mut target = launch_fixture();
+    let entry_b_range = function_range(&target, "entry_b");
+
+    // Line 46 (`return sink_b;`) is a single plain statement, well past the
+    // prologue: no function starts here, and it maps to exactly one
+    // line-table row, so the site should sit exactly on it without any
+    // prologue-skip adjustment.
+    let id = target
+        .set_line_breakpoint(&PathBuf::from("lib_b.c"), 46)
+        .expect("set_line_breakpoint should find line 46 via DWARF");
+
+    let addresses = target
+        .breakpoint_addresses(id)
+        .expect("breakpoint should be registered");
+    assert_eq!(addresses.len(), 1, "got {addresses:?}");
+    let planted = addresses[0];
+    assert!(
+        range_contains(entry_b_range, planted),
+        "breakpoint at {planted} lands outside entry_b's own address range {entry_b_range:?}"
+    );
+
+    let pc = expect_breakpoint_hit(&mut target);
+    assert_eq!(pc, planted);
+
+    // entry_b is only called once at the top level, so this line should
+    // only ever be hit once; the process should then run to completion.
+    target
+        .process
+        .resume_process()
+        .expect("failed to resume process");
+    let reason = target
+        .process
+        .wait_on_signal(None)
+        .expect("failed to wait for process");
+    assert!(
+        matches!(reason.wait_status, WaitStatus::Exited(_, _)),
+        "expected the process to run to completion after the single hit on line 46, got {:?}",
+        reason.wait_status
+    );
+}
+
+#[test]
+fn line_breakpoint_inside_recursive_function_fires_once_per_call() {
+    let mut target = launch_fixture();
+    let sum_b_range = function_range(&target, "sum_b");
+
+    // Line 38 is sum_b's closing brace: at -O0 both the base-case `return 0;`
+    // and the recursive-case return converge on this single shared epilogue
+    // row, so — mirroring `function_breakpoint_fires_once_per_recursive_call`
+    // above — it's hit exactly once per invocation: 4 times (head, mid,
+    // tail, and the final NULL base case).
+    let id = target
+        .set_line_breakpoint(&PathBuf::from("lib_b.c"), 38)
+        .expect("set_line_breakpoint should find line 38 via DWARF");
+
+    let addresses = target
+        .breakpoint_addresses(id)
+        .expect("breakpoint should be registered");
+    assert_eq!(addresses.len(), 1, "got {addresses:?}");
+    let planted = addresses[0];
+    assert!(range_contains(sum_b_range, planted));
+
+    for call_number in 1..=4 {
+        let pc = expect_breakpoint_hit(&mut target);
+        assert_eq!(
+            pc, planted,
+            "call #{call_number}: breakpoint hit at an unexpected address"
+        );
+    }
+
+    target
+        .process
+        .resume_process()
+        .expect("failed to resume process");
+    let reason = target
+        .process
+        .wait_on_signal(None)
+        .expect("failed to wait for process");
+    assert!(
+        matches!(reason.wait_status, WaitStatus::Exited(_, _)),
+        "expected the process to run to completion after the 4th call, got {:?}",
+        reason.wait_status
+    );
+}
+
+#[test]
+fn line_breakpoint_on_unknown_location_does_not_silently_succeed() {
+    let mut target = launch_fixture();
+
+    let result = target.set_line_breakpoint(&PathBuf::from("lib_b.c"), 99999);
+
+    assert!(
+        result.is_err(),
+        "setting a breakpoint on a nonexistent line should return an error, got {result:?}"
+    );
+}
+
+#[test]
+fn line_breakpoint_description_reports_path_and_line() {
+    let mut target = launch_fixture();
+
+    let id = target
+        .set_line_breakpoint(&PathBuf::from("lib_b.c"), 45)
+        .expect("set_line_breakpoint should find line 45 via DWARF");
+
+    let bp = target
+        .find_breakpoint(id)
+        .expect("breakpoint should be registered");
+    let description = bp.description();
+    assert!(
+        description.contains("lib_b.c") && description.contains("45"),
+        "expected description to mention the file and line, got: {description}"
+    );
+}

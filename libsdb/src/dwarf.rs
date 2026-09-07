@@ -427,6 +427,20 @@ impl Dwarf {
         Some(self.line_tables[cu_index].as_ref()?.iter(&self.elf))
     }
 
+    /// All line-table rows, across every compile unit, that cover `line` of
+    /// `path`. Used to resolve a user-requested `file:line` breakpoint, which
+    /// may match several rows (e.g. a line reached from more than one inlined
+    /// call site).
+    pub fn get_entries_by_line(&self, path: &Path, line: usize) -> Result<Vec<LineTableEntry<'_>>> {
+        let mut entries = Vec::new();
+        for cu_index in 0..self.compile_units.len() {
+            if let Some(line_table) = &self.line_tables[cu_index] {
+                entries.extend(line_table.get_entries_by_line(path, line, &self.elf)?);
+            }
+        }
+        Ok(entries)
+    }
+
     /// Resolves a row's [`LineTableEntry::file_entry`] index to the file it
     /// names within `cu_index`'s line table. Returns `None` when the CU has no
     /// line program or the index is out of range.
@@ -1761,6 +1775,10 @@ impl LineTable {
         let rows = self.iter(elf).collect::<Result<Vec<_>>>()?;
         Ok(rows
             .into_iter()
+            // An end_sequence row carries no real source line — its `line`
+            // field is just whatever the line register last held — so it
+            // must never be treated as a match on its own account.
+            .filter(|entry| !entry.end_sequence)
             .filter(|entry| entry.line as usize == line)
             .filter(|entry| {
                 entry.file_entry.is_some_and(|index| {

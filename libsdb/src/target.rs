@@ -5,7 +5,7 @@ use std::rc::{Rc, Weak};
 use crate::address::FileAddress;
 use crate::disassembler;
 use crate::dwarf::{Die, LineTableEntry};
-use crate::dwarf_constants::DwTag;
+use crate::dwarf_constants::{DwAt, DwTag};
 use crate::elf::Elf64_Sym;
 use crate::process::{BreakpointId, StopPointId, StopReason, TrapType};
 use crate::register_info::RegisterValue;
@@ -643,12 +643,108 @@ impl Target {
         Ok((id, prologue_skipped))
     }
 
+    /// Sets a breakpoint on `filepath:line_number`, planting a site at every
+    /// line-table row matching that source location (there can be more than
+    /// one, e.g. a line reached from multiple inlined call sites).
+    ///
+    /// A row that starts a function (no surrounding inline stack, and its
+    /// address is exactly the function's `low_pc`) has its prologue skipped,
+    /// the same way [`Target::set_function_breakpoint`] does.
     pub fn set_line_breakpoint(
         &mut self,
         filepath: &Path,
         line_number: usize,
     ) -> Result<BreakpointId> {
-        todo!()
+        let is_hardware = false;
+        let dwarf = self
+            .state
+            .dwarf
+            .as_ref()
+            .ok_or(anyhow!("Failed to get dwarf handle"))?;
+
+        let entries = dwarf.get_entries_by_line(filepath, line_number)?;
+        if entries.is_empty() {
+            return Err(anyhow!(
+                "No line entries found for {}:{}",
+                filepath.display(),
+                line_number
+            ));
+        }
+
+        let mut load_addresses = Vec::new();
+        for entry in entries {
+            let inline_stack = dwarf.inline_stack_at_address(entry.address());
+            let no_inline_stack = inline_stack.len() == 1;
+            let should_skip_prologue = no_inline_stack
+                && (inline_stack[0].get_attr(DwAt::Ranges).is_some()
+                    || inline_stack[0].get_attr(DwAt::LowPc).is_some())
+                && inline_stack[0].low_pc()? == entry.address();
+
+            let file_address = if should_skip_prologue {
+                match dwarf.get_line_entry_at_address(entry.address())? {
+                    // The iterator is positioned just after the covering
+                    // entry, so its first item is the first post-prologue row.
+                    Some((_entry, mut after)) => match after.next() {
+                        Some(next) => next?.address(),
+                        None => entry.address(),
+                    },
+                    None => entry.address(),
+                }
+            } else {
+                entry.address()
+            };
+
+            if let Some(load_address) = file_address.to_virt_address() {
+                load_addresses.push(load_address);
+            }
+        }
+
+        if load_addresses.is_empty() {
+            return Err(anyhow!(
+                "Could not resolve a load address for {}:{}",
+                filepath.display(),
+                line_number
+            ));
+        }
+
+        let id = get_next_breakpoint_id();
+        let mut site_ids = Vec::new();
+        for load_address in load_addresses {
+            // Two entries (e.g. a line reached from two inlined call sites, or
+            // two line-table rows for the same line that both skip their
+            // prologue to the same post-prologue row) can resolve to the same
+            // address; a process-level site can only be planted once per
+            // address, so share the existing site rather than erroring out.
+            let site_id = match self
+                .process
+                .breakpoint_sites
+                .iter()
+                .find(|site| site.virtual_address() == load_address)
+            {
+                Some(existing) => existing.id(),
+                None => self
+                    .process
+                    .create_breakpoint_site(load_address, true, is_hardware, Some(id))?
+                    .id(),
+            };
+            // Only record each site once against this breakpoint, even if
+            // multiple entries resolved to it above.
+            if !site_ids.contains(&site_id) {
+                site_ids.push(site_id);
+            }
+        }
+
+        self.breakpoints.push(Breakpoint {
+            id,
+            is_hardware,
+            enabled: true,
+            site_ids,
+            metadata: BreakpointMetadata::Line {
+                path: filepath.to_path_buf(),
+                line: line_number,
+            },
+        });
+        Ok(id)
     }
 
     pub fn remove_breakpoint(&mut self, id: BreakpointId) -> Result<()> {
