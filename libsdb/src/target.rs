@@ -619,8 +619,15 @@ impl Target {
         let bp = self
             .find_breakpoint(id)
             .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
-        Ok(bp
-            .site_ids
+        Ok(self.addresses_of(bp))
+    }
+
+    /// The virtual address of each site backing `bp`. Prefer this over
+    /// [`Target::breakpoint_addresses`] when the caller already holds a
+    /// `&Breakpoint` (e.g. from iterating [`Target::breakpoints`]), to skip
+    /// re-scanning `self.breakpoints` for the ID.
+    pub fn addresses_of(&self, bp: &Breakpoint) -> Vec<VirtAddress> {
+        bp.site_ids
             .iter()
             .filter_map(|site_id| {
                 self.process
@@ -629,7 +636,7 @@ impl Target {
                     .find(|s| s.id() == *site_id)
                     .map(|s| s.virtual_address())
             })
-            .collect())
+            .collect()
     }
 
     /// Takes `&TargetState` rather than `&self` so that, at call sites, the
@@ -686,7 +693,21 @@ impl Breakpoint {
         self.is_hardware
     }
 
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
     pub fn site_ids(&self) -> &[StopPointId] {
         &self.site_ids
+    }
+
+    /// Human-readable description of what this breakpoint was set on, e.g.
+    /// `function 'main'`, `foo.cpp:10`, or `address 0x1234`.
+    pub fn description(&self) -> String {
+        match &self.metadata {
+            BreakpointMetadata::Function { name } => format!("function '{}'", name),
+            BreakpointMetadata::Line { path, line } => format!("{}:{}", path.display(), line),
+            BreakpointMetadata::Address { address } => format!("address {}", address),
+        }
     }
 }

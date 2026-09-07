@@ -246,20 +246,20 @@ impl BreakpointCommandCategory {
     ) -> Result<()> {
         match self {
             BreakpointCommandCategory::List => {
-                let ids: Vec<_> = target.breakpoints().iter().map(|bp| bp.id()).collect();
-                if ids.is_empty() {
+                if target.breakpoints().is_empty() {
                     println!("No breakpoints set.");
                     return Ok(());
                 }
                 println!("Breakpoints:");
-                for id in ids {
-                    let addresses = target.breakpoint_addresses(id)?;
-                    let is_enabled = target.is_breakpoint_enabled(id)?;
+                for bp in target.breakpoints() {
+                    let addresses = target.addresses_of(bp);
                     println!(
-                        "{}: address = {}, {}",
-                        id,
+                        "{}: {}, address = {}, {}, {}",
+                        bp.id(),
+                        bp.description(),
                         format_addresses(&addresses),
-                        if is_enabled { "enabled" } else { "disabled" }
+                        if bp.is_hardware() { "hardware" } else { "software" },
+                        if bp.is_enabled() { "enabled" } else { "disabled" }
                     );
                 }
                 Ok(())
