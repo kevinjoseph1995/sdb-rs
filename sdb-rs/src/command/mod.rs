@@ -158,10 +158,14 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
             ),
             cmd!(
                 ["set", "s"],
-                "Set a new breakpoint. Usage: 'breakpoint set <address>'",
+                "Set a new breakpoint. Usage: 'breakpoint set <address> | <function_name> | <file_path:line_number>'",
                 [],
                 Some(Breakpoint(Set)),
-                Some(&["<address in hex>"]),
+                Some(&[
+                    "<address in hex>",
+                    "<function_name>",
+                    "<file_path:line_number>"
+                ]),
                 []
             ),
             cmd!(

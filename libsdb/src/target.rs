@@ -1,10 +1,12 @@
 use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use crate::address::FileAddress;
 use crate::disassembler;
-use crate::dwarf::LineTableEntry;
+use crate::dwarf::{Die, LineTableEntry};
+use crate::dwarf_constants::DwTag;
+use crate::elf::Elf64_Sym;
 use crate::process::{BreakpointId, StopPointId, StopReason, TrapType};
 use crate::register_info::RegisterValue;
 use crate::stack::Stack;
@@ -14,12 +16,9 @@ use libc::AT_ENTRY;
 use nix::sys::signal::Signal;
 use nix::sys::wait::WaitStatus;
 
-fn get_next_breakpoint_id() -> BreakpointId {
-    static NEXT_ID: std::sync::Mutex<BreakpointId> = std::sync::Mutex::new(0);
-    let mut id = NEXT_ID.lock().unwrap();
-    let next_id = *id;
-    *id += 1;
-    next_id
+struct FunctionSearchResult<'dw> {
+    dwarf_functions: Vec<Die<'dw>>,
+    elf_functions: Vec<(Weak<Elf>, Elf64_Sym)>,
 }
 
 enum BreakpointMetadata {
@@ -35,23 +34,16 @@ enum BreakpointMetadata {
 pub struct Breakpoint {
     id: BreakpointId,
     is_hardware: bool,
+    /// Whether the user wants this breakpoint armed. Tracked independently of
+    /// the underlying sites' own enabled state because two `Breakpoint`s can
+    /// share a site (e.g. two function breakpoints resolving to the same
+    /// address) and must be independently enable/disable-able: a site stays
+    /// physically armed as long as *any* `Breakpoint` referencing it wants it
+    /// enabled.
+    enabled: bool,
     /// IDs of the breakpoint sites in `Process::breakpoint_sites` that implement this breakpoint.
     site_ids: Vec<StopPointId>,
     metadata: BreakpointMetadata,
-}
-
-impl Breakpoint {
-    pub fn id(&self) -> BreakpointId {
-        self.id
-    }
-
-    pub fn is_hardware(&self) -> bool {
-        self.is_hardware
-    }
-
-    pub fn site_ids(&self) -> &[StopPointId] {
-        &self.site_ids
-    }
 }
 
 pub struct TargetState {
@@ -76,6 +68,14 @@ struct LineSnapshot {
     line: (usize, u64, u64, u64, u64),
     /// Whether this row is an `end_sequence` marker (no real source line).
     end_sequence: bool,
+}
+
+fn get_next_breakpoint_id() -> BreakpointId {
+    static NEXT_ID: std::sync::Mutex<BreakpointId> = std::sync::Mutex::new(0);
+    let mut id = NEXT_ID.lock().unwrap();
+    let next_id = *id;
+    *id += 1;
+    next_id
 }
 
 impl Target {
@@ -426,7 +426,7 @@ impl Target {
 
     /// Sets a new breakpoint at `address`, planting a single breakpoint site
     /// there, and returns the new breakpoint's ID.
-    pub fn set_breakpoint(
+    pub fn set_address_breakpoint(
         &mut self,
         address: VirtAddress,
         is_hardware: bool,
@@ -439,10 +439,108 @@ impl Target {
         self.breakpoints.push(Breakpoint {
             id,
             is_hardware,
+            enabled: true,
             site_ids: vec![site_id],
             metadata: BreakpointMetadata::Address { address },
         });
         Ok(id)
+    }
+
+    pub fn set_function_breakpoint(&mut self, function_name: &str) -> Result<BreakpointId> {
+        let is_hardware = false;
+        let found = Self::find_functions(&self.state, function_name)?;
+
+        if found.dwarf_functions.is_empty() && found.elf_functions.is_empty() {
+            return Err(anyhow!(
+                "No function named '{function_name}' found in DWARF or the ELF symbol table"
+            ));
+        }
+
+        let mut load_addresses = Vec::new();
+        if !found.dwarf_functions.is_empty() {
+            let dwarf = self
+                .state
+                .dwarf
+                .as_ref()
+                .ok_or(anyhow!("Failed to get dwarf handle"))?;
+            for die in found.dwarf_functions {
+                let Ok(low_pc) = die.low_pc() else {
+                    continue;
+                };
+                // For an inlined subroutine, break at its start; otherwise skip
+                // the prologue by breaking at the first line-table row after it.
+                let file_address = if die.tag() == Some(DwTag::InlinedSubroutine) {
+                    low_pc
+                } else {
+                    match dwarf.get_line_entry_at_address(low_pc)? {
+                        Some((_entry, mut after)) => match after.next() {
+                            Some(next) => next?.address(),
+                            None => continue,
+                        },
+                        None => continue,
+                    }
+                };
+                if let Some(load_address) = file_address.to_virt_address() {
+                    load_addresses.push(load_address);
+                }
+            }
+        } else {
+            for (elf, sym) in found.elf_functions {
+                let elf = elf.upgrade().ok_or(anyhow!("Elf handle no longer alive"))?;
+                let file_address = FileAddress::new(&elf, sym.st_value as usize);
+                if let Some(load_address) = file_address.to_virt_address() {
+                    load_addresses.push(load_address);
+                }
+            }
+        }
+
+        let id = get_next_breakpoint_id();
+        let mut site_ids = Vec::new();
+        for load_address in load_addresses {
+            // Two breakpoints (e.g. two independent `set_function_breakpoint`
+            // calls on the same function) can resolve to the same address; a
+            // process-level site can only be planted once per address, so
+            // share the existing site rather than dropping this breakpoint's
+            // claim on it.
+            let site_id = match self
+                .process
+                .breakpoint_sites
+                .iter()
+                .find(|site| site.virtual_address() == load_address)
+            {
+                Some(existing) => existing.id(),
+                None => self
+                    .process
+                    .create_breakpoint_site(load_address, true, is_hardware, Some(id))?
+                    .id(),
+            };
+            site_ids.push(site_id);
+        }
+
+        if site_ids.is_empty() {
+            return Err(anyhow!(
+                "Could not resolve a load address for function '{function_name}'"
+            ));
+        }
+
+        self.breakpoints.push(Breakpoint {
+            id,
+            is_hardware,
+            enabled: true,
+            site_ids,
+            metadata: BreakpointMetadata::Function {
+                name: function_name.to_string(),
+            },
+        });
+        Ok(id)
+    }
+
+    pub fn set_line_breakpoint(
+        &mut self,
+        filepath: &Path,
+        line_number: usize,
+    ) -> Result<BreakpointId> {
+        todo!()
     }
 
     pub fn remove_breakpoint(&mut self, id: BreakpointId) -> Result<()> {
@@ -451,50 +549,69 @@ impl Target {
             .iter()
             .position(|bp| bp.id == id)
             .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
-        for site_id in self.breakpoints[position].site_ids.clone() {
-            self.process.remove_breakpoint_by_id(site_id)?;
-        }
+        let site_ids = self.breakpoints[position].site_ids.clone();
         self.breakpoints.remove(position);
+        for site_id in site_ids {
+            // A site can be shared with another breakpoint (e.g. two function
+            // breakpoints resolving to the same address); only tear it down
+            // once nothing else references it.
+            if !self.site_in_use(site_id) {
+                self.process.remove_breakpoint_by_id(site_id)?;
+            }
+        }
         Ok(())
     }
 
     pub fn enable_breakpoint(&mut self, id: BreakpointId) -> Result<()> {
-        let bp = self
+        let position = self
             .breakpoints
             .iter()
-            .find(|bp| bp.id == id)
+            .position(|bp| bp.id == id)
             .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
-        for site_id in &bp.site_ids {
-            self.process.enable_breakpoint_by_id(*site_id)?;
+        self.breakpoints[position].enabled = true;
+        for site_id in self.breakpoints[position].site_ids.clone() {
+            self.process.enable_breakpoint_by_id(site_id)?;
         }
         Ok(())
     }
 
     pub fn disable_breakpoint(&mut self, id: BreakpointId) -> Result<()> {
-        let bp = self
+        let position = self
             .breakpoints
             .iter()
-            .find(|bp| bp.id == id)
+            .position(|bp| bp.id == id)
             .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
-        for site_id in &bp.site_ids {
-            self.process.disable_breakpoint_by_id(*site_id)?;
+        self.breakpoints[position].enabled = false;
+        for site_id in self.breakpoints[position].site_ids.clone() {
+            // Leave the underlying site armed if some other, still-enabled
+            // breakpoint also depends on it.
+            if !self.site_wanted_enabled_by_other(site_id, id) {
+                self.process.disable_breakpoint_by_id(site_id)?;
+            }
         }
         Ok(())
     }
 
-    /// Whether every site backing `id` is currently enabled.
+    /// Whether the user has this breakpoint enabled. Tracked independently of
+    /// the underlying sites' state since a site can be shared with another,
+    /// independently enabled/disabled breakpoint.
     pub fn is_breakpoint_enabled(&self, id: BreakpointId) -> Result<bool> {
         let bp = self
             .find_breakpoint(id)
             .ok_or_else(|| anyhow!("Breakpoint with ID {} not found", id))?;
-        Ok(bp.site_ids.iter().all(|site_id| {
-            self.process
-                .breakpoint_sites
-                .iter()
-                .find(|s| s.id() == *site_id)
-                .map(|s| s.is_enabled())
-                .unwrap_or(false)
-        }))
+        Ok(bp.enabled)
+    }
+
+    fn site_in_use(&self, site_id: StopPointId) -> bool {
+        self.breakpoints
+            .iter()
+            .any(|bp| bp.site_ids.contains(&site_id))
+    }
+
+    fn site_wanted_enabled_by_other(&self, site_id: StopPointId, excluding: BreakpointId) -> bool {
+        self.breakpoints
+            .iter()
+            .any(|bp| bp.id != excluding && bp.enabled && bp.site_ids.contains(&site_id))
     }
 
     /// The virtual address of each site backing `id`.
@@ -514,6 +631,37 @@ impl Target {
             })
             .collect())
     }
+
+    /// Takes `&TargetState` rather than `&self` so that, at call sites, the
+    /// returned `Die`s (which borrow from `state.dwarf`) don't lock down the
+    /// whole `Target` — callers still need `&mut self.process` afterwards to
+    /// plant breakpoint sites at the addresses found here.
+    fn find_functions<'dw>(state: &'dw TargetState, name: &str) -> Result<FunctionSearchResult<'dw>> {
+        let dwarf_found = state
+            .dwarf
+            .as_ref()
+            .map(|dwarf| dwarf.find_functions(name))
+            .unwrap_or_default();
+
+        if dwarf_found.is_empty() {
+            let name = std::ffi::CString::new(name).context("Function name contains a nul byte")?;
+            let elf_functions = state
+                .elf
+                .get_symbols_with_name(&name)
+                .into_iter()
+                .map(|sym| (Rc::downgrade(&state.elf), *sym))
+                .collect();
+            Ok(FunctionSearchResult {
+                dwarf_functions: Vec::new(),
+                elf_functions,
+            })
+        } else {
+            Ok(FunctionSearchResult {
+                dwarf_functions: dwarf_found,
+                elf_functions: Vec::new(),
+            })
+        }
+    }
 }
 
 impl TargetState {
@@ -526,5 +674,19 @@ impl TargetState {
 
     pub fn notify_stop(&self, process: &Process, _reason: &StopReason) -> Result<()> {
         self.stack.reset_inline_height(self, process)
+    }
+}
+
+impl Breakpoint {
+    pub fn id(&self) -> BreakpointId {
+        self.id
+    }
+
+    pub fn is_hardware(&self) -> bool {
+        self.is_hardware
+    }
+
+    pub fn site_ids(&self) -> &[StopPointId] {
+        &self.site_ids
     }
 }

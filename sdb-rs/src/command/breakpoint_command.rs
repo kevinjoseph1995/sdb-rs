@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+use std::str::FromStr;
+
 /////////////////////////////////////////
 use anyhow::{Context, Ok, Result};
 /////////////////////////////////////////
@@ -40,23 +43,32 @@ fn set_breakpoint(
             metadata.description
         )));
     }
-    if !(args[0].starts_with("0x") || args[0].starts_with("0X")) {
-        return Err(anyhow::Error::msg(format!(
-            "Invalid address format: {}. Hex-address should start with 0x/0X.",
-            args[0]
-        )));
+    if args[0].starts_with("0x") || args[0].starts_with("0X") {
+        let address_str = &args[0][2..];
+        let address = usize::from_str_radix(address_str, 16).map_err(|err| {
+            anyhow::Error::msg(format!(
+                "{}: Invalid address format: {}. Hex-address should be a valid hex number.",
+                err, args[0]
+            ))
+        })?;
+        let address = VirtAddress::from(address);
+        let id = target.set_address_breakpoint(address, is_hardware)?;
+        println!("Address breakpoint set at address: {}, ID: {}", address, id);
+    } else if args[0].contains(':') {
+        let colon_position = args[0].find(':').expect("Pre-condition not met");
+        let filepath =
+            PathBuf::from_str(&args[0][0..colon_position]).context("Invalid path format")?;
+        let line_number = usize::from_str(&args[0][colon_position + 1..])
+            .context("Failed to parse line number")?;
+
+        let id = target.set_line_breakpoint(&filepath, line_number)?;
+        println!("Line breakpoint set with ID: {}", id);
+    } else {
+        let function_name = &args[0];
+        let id = target.set_function_breakpoint(function_name)?;
+        println!("Function breakpoint set with ID: {}", id);
     }
-    let address_str = &args[0][2..];
-    let address = usize::from_str_radix(address_str, 16).map_err(|err| {
-        anyhow::Error::msg(format!(
-            "{}: Invalid address format: {}. Hex-address should be a valid hex number.",
-            err, args[0]
-        ))
-    })?;
-    let address = VirtAddress::from(address);
-    let id = target.set_breakpoint(address, is_hardware)?;
-    println!("Breakpoint set at address: {}, ID: {}", address, id);
-    Ok(())
+    return Ok(());
 }
 
 fn format_addresses(addresses: &[VirtAddress]) -> String {
@@ -259,10 +271,7 @@ impl BreakpointCommandCategory {
                 }
                 let break_point_id: i32 = args[0].parse().context("Invalid breakpoint ID")?;
                 let addresses = target.breakpoint_addresses(break_point_id).map_err(|_| {
-                    anyhow::Error::msg(format!(
-                        "Breakpoint with ID {} not found.",
-                        break_point_id
-                    ))
+                    anyhow::Error::msg(format!("Breakpoint with ID {} not found.", break_point_id))
                 })?;
                 let is_enabled = target.is_breakpoint_enabled(break_point_id)?;
                 println!(

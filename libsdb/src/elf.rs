@@ -74,7 +74,7 @@ pub struct Elf64_Shdr {
 }
 
 /// Symbol table entry
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub struct Elf64_Sym {
     pub st_name: u32,
