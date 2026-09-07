@@ -65,8 +65,15 @@ fn set_breakpoint(
         println!("Line breakpoint set with ID: {}", id);
     } else {
         let function_name = &args[0];
-        let id = target.set_function_breakpoint(function_name)?;
+        let (id, prologue_skipped) = target.set_function_breakpoint(function_name)?;
         println!("Function breakpoint set with ID: {}", id);
+        if !prologue_skipped {
+            println!(
+                "Warning: no debug info for '{}', so the breakpoint sits at its very first \
+                 instruction, before the prologue runs. Argument/local values won't be set up yet.",
+                function_name
+            );
+        }
     }
     return Ok(());
 }

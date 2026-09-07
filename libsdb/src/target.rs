@@ -538,7 +538,16 @@ impl Target {
             .collect()
     }
 
-    pub fn set_function_breakpoint(&mut self, function_name: &str) -> Result<BreakpointId> {
+    /// Sets a breakpoint on `function_name`, returning the new breakpoint's ID
+    /// alongside whether its site skips the function's prologue.
+    ///
+    /// The prologue is skipped when DWARF line info is available to find the
+    /// first post-prologue line. Without DWARF, the site falls back to the
+    /// raw ELF symbol address (the function's very first instruction) — the
+    /// caller may want to warn that the breakpoint will trip before the
+    /// stack/argument setup code has run, unlike e.g. GDB, which analyzes the
+    /// prologue's instructions to skip it even without debug info.
+    pub fn set_function_breakpoint(&mut self, function_name: &str) -> Result<(BreakpointId, bool)> {
         let is_hardware = false;
         let found = Self::find_functions(&self.state, function_name)?;
 
@@ -554,6 +563,7 @@ impl Target {
             });
         }
 
+        let prologue_skipped = !found.dwarf_functions.is_empty();
         let mut load_addresses = Vec::new();
         if !found.dwarf_functions.is_empty() {
             let dwarf = self
@@ -630,7 +640,7 @@ impl Target {
                 name: function_name.to_string(),
             },
         });
-        Ok(id)
+        Ok((id, prologue_skipped))
     }
 
     pub fn set_line_breakpoint(

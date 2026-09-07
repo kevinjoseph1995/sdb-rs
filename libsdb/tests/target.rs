@@ -198,9 +198,13 @@ fn function_breakpoint_stops_past_the_prologue() {
     let mut target = launch_fixture();
     let entry_b_range = function_range(&target, "entry_b");
 
-    let id = target
+    let (id, prologue_skipped) = target
         .set_function_breakpoint("entry_b")
         .expect("set_function_breakpoint should find entry_b via DWARF");
+    assert!(
+        prologue_skipped,
+        "DWARF is present, so the prologue should be reported as skipped"
+    );
 
     let addresses = target
         .breakpoint_addresses(id)
@@ -238,7 +242,7 @@ fn function_breakpoint_fires_once_per_recursive_call_then_lets_the_process_finis
     let mut target = launch_fixture();
     let sum_b_range = function_range(&target, "sum_b");
 
-    let id = target
+    let (id, _) = target
         .set_function_breakpoint("sum_b")
         .expect("set_function_breakpoint should find sum_b via DWARF");
     let addresses = target
@@ -306,9 +310,13 @@ fn function_breakpoint_falls_back_to_elf_symbol_table_without_dwarf() {
         .to_virt_address()
         .expect("`add`'s file address should map into the running process");
 
-    let id = target
+    let (id, prologue_skipped) = target
         .set_function_breakpoint("add")
         .expect("set_function_breakpoint should fall back to the ELF symbol table without DWARF");
+    assert!(
+        !prologue_skipped,
+        "without DWARF there's no prologue to skip, so this should be reported as not skipped"
+    );
     let addresses = target
         .breakpoint_addresses(id)
         .expect("breakpoint should be registered");
@@ -343,10 +351,10 @@ fn function_breakpoint_on_unknown_name_does_not_silently_succeed() {
 fn duplicate_function_breakpoints_on_the_same_function_are_independently_functional() {
     let mut target = launch_fixture();
 
-    let id1 = target
+    let (id1, _) = target
         .set_function_breakpoint("entry_a")
         .expect("first set_function_breakpoint failed");
-    let id2 = target
+    let (id2, _) = target
         .set_function_breakpoint("entry_a")
         .expect("second set_function_breakpoint failed");
     assert_ne!(id1, id2, "each call should mint a distinct breakpoint ID");

@@ -137,7 +137,7 @@ const COMMAND_METADATA_LIST: &[CommandMetadata] = &[
         []
     ),
     cmd!(
-        ["breakpoint", "b"],
+        ["breakpoint", "b", "break"],
         "Breakpoint operations",
         [
             cmd!(
