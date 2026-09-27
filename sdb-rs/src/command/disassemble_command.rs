@@ -2,6 +2,7 @@ use crate::command::{CommandCategory, ParsedOption};
 
 use super::Command;
 use anyhow::{Ok, Result};
+use colored::Colorize;
 use libsdb::address::VirtAddress;
 use libsdb::process::Process;
 
@@ -12,7 +13,11 @@ pub fn print_disassembly(
 ) -> Result<()> {
     let instructions = libsdb::disassembler::disassemble(process, number_of_instructions, address)?;
     for instruction in instructions {
-        println!("{}: {}", instruction.address, instruction.text);
+        println!(
+            "{}: {}",
+            instruction.address.to_string().yellow(),
+            instruction.text
+        );
     }
     Ok(())
 }
