@@ -38,6 +38,12 @@ fn main() {
         .expect("failed to invoke the C compiler");
     assert!(status.success(), "stripped fixture compile failed");
 
-    println!("cargo::rustc-env=NO_DEBUG_FIXTURE_BIN={}", no_debug_out.display());
-    println!("cargo::rustc-env=STRIPPED_FIXTURE_BIN={}", stripped_out.display());
+    println!(
+        "cargo::rustc-env=NO_DEBUG_FIXTURE_BIN={}",
+        no_debug_out.display()
+    );
+    println!(
+        "cargo::rustc-env=STRIPPED_FIXTURE_BIN={}",
+        stripped_out.display()
+    );
 }

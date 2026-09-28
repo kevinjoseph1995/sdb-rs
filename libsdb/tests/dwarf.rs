@@ -175,7 +175,10 @@ fn test_dwarf_compile_units_identify_sources() {
                 let lang = root
                     .get_attr(DwAt::Language)
                     .expect("CU has DW_AT_language");
-                assert_eq!(lang.as_int().expect("language is an int"), DwLang::C99 as u64);
+                assert_eq!(
+                    lang.as_int().expect("language is an int"),
+                    DwLang::C99 as u64
+                );
                 // The CU name comes from .debug_str (DW_FORM_strp).
                 root.name().expect("CU has a DW_AT_name")
             })
@@ -263,7 +266,10 @@ fn test_dwarf_find_functions_locates_definitions() {
                     .high_pc()
                     .unwrap_or_else(|e| panic!("`{name}` high_pc: {e:?}"));
                 // DW_AT_high_pc is encoded as an offset from low_pc in this fixture.
-                assert!(low < high, "`{name}`: low_pc {low} should be < high_pc {high}");
+                assert!(
+                    low < high,
+                    "`{name}`: low_pc {low} should be < high_pc {high}"
+                );
                 assert_ne!(low.address, 0, "`{name}` low_pc should be nonzero");
             }
         }
@@ -458,9 +464,7 @@ fn test_dwarf_name_string_forms() {
 
         // DW_FORM_strp: the CU name is an offset into .debug_str.
         let root = dwarf.root_of(0).expect("CU root");
-        let strp = root
-            .get_attr(DwAt::Name)
-            .expect("CU has DW_AT_name");
+        let strp = root.get_attr(DwAt::Name).expect("CU has DW_AT_name");
         assert_eq!(strp.form(), DwForm::Strp as u64);
         assert!(
             strp.as_string()
@@ -487,8 +491,16 @@ fn test_dwarf_base_type_encodings() {
         for &(name, byte_size, encoding) in expected {
             let die = find_named(dwarf, DwTag::BaseType, name)
                 .unwrap_or_else(|| panic!("base type `{name}` present"));
-            assert_eq!(int_attr(&die, DwAt::ByteSize), byte_size, "{name} byte_size");
-            assert_eq!(int_attr(&die, DwAt::Encoding), encoding as u64, "{name} encoding");
+            assert_eq!(
+                int_attr(&die, DwAt::ByteSize),
+                byte_size,
+                "{name} byte_size"
+            );
+            assert_eq!(
+                int_attr(&die, DwAt::Encoding),
+                encoding as u64,
+                "{name} encoding"
+            );
         }
     });
 }
@@ -564,7 +576,10 @@ fn test_dwarf_enumeration_mode_b() {
 
         let mut values = HashMap::new();
         for e in children_of_tag(&mode_b, DwTag::Enumerator) {
-            values.insert(e.name().expect("enumerator name"), int_attr(&e, DwAt::ConstValue));
+            values.insert(
+                e.name().expect("enumerator name"),
+                int_attr(&e, DwAt::ConstValue),
+            );
         }
         assert_eq!(values["MODE_B_OFF"], 0);
         assert_eq!(values["MODE_B_ON"], 1);
@@ -675,7 +690,10 @@ fn test_dwarf_compile_unit_ranges() {
             let high = root
                 .high_pc()
                 .unwrap_or_else(|e| panic!("cu {cu_index} high_pc: {e:?}"));
-            assert!(low < high, "cu {cu_index}: low {low} should be < high {high}");
+            assert!(
+                low < high,
+                "cu {cu_index}: low {low} should be < high {high}"
+            );
         }
     });
 }
@@ -737,7 +755,10 @@ fn test_dwarf_line_table_main() {
             .expect("main.c has a line program")
             .collect::<anyhow::Result<Vec<_>>>()
             .expect("line program parses");
-        assert!(rows.len() >= 2, "line program has body rows plus an end row");
+        assert!(
+            rows.len() >= 2,
+            "line program has body rows plus an end row"
+        );
 
         // The first row is main's opening line (main.c:10), attributed to main.c.
         let first = &rows[0];
@@ -776,7 +797,9 @@ fn test_dwarf_line_table_one_sequence_per_function() {
                 .collect::<anyhow::Result<Vec<_>>>()
                 .expect("line program parses");
             assert!(
-                rows.last().expect("line program is non-empty").end_sequence(),
+                rows.last()
+                    .expect("line program is non-empty")
+                    .end_sequence(),
                 "{file}: line program must end on an end_sequence row"
             );
             assert_eq!(
@@ -804,13 +827,20 @@ fn test_dwarf_line_entry_at_function_opening_line() {
         ];
         for &(name, line, source) in opening_line {
             let dies = dwarf.find_functions(name);
-            let low = dies.first().expect("function defined").low_pc().expect("low_pc");
+            let low = dies
+                .first()
+                .expect("function defined")
+                .low_pc()
+                .expect("low_pc");
             let (entry, _rows) = dwarf
                 .get_line_entry_at_address(low)
                 .expect("line lookup succeeds")
                 .unwrap_or_else(|| panic!("{name} low_pc maps to a line entry"));
             assert_eq!(entry.line(), line, "{name} opens at line {line}");
-            assert!(!entry.end_sequence(), "{name}: entry row is not a sequence terminator");
+            assert!(
+                !entry.end_sequence(),
+                "{name}: entry row is not a sequence terminator"
+            );
 
             let cu_index = dwarf
                 .compile_unit_containing_address(low)
@@ -828,7 +858,11 @@ fn test_dwarf_line_table_rows_attributed_to_own_source() {
     get_test_fixture().with(|dwarf| {
         // Every non-terminal row in a CU names that CU's own .c file and lies
         // within the line span its function definitions occupy.
-        for (file, bounds) in [("lib_a.c", 56..=85), ("lib_b.c", 35..=47), ("main.c", 10..=14)] {
+        for (file, bounds) in [
+            ("lib_a.c", 56..=85),
+            ("lib_b.c", 35..=47),
+            ("main.c", 10..=14),
+        ] {
             let cu_index = line_table_cu(dwarf, file);
             for row in dwarf.lines(cu_index).expect("CU has a line program") {
                 let row = row.expect("row parses");
@@ -869,7 +903,10 @@ fn test_dwarf_line_table_contains_known_statement_lines() {
                 .map(|r| r.line())
                 .collect();
             for &line in lines {
-                assert!(present.contains(&line), "{file}: expected a row for line {line}");
+                assert!(
+                    present.contains(&line),
+                    "{file}: expected a row for line {line}"
+                );
             }
         }
     });

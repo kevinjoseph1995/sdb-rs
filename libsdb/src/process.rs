@@ -1559,6 +1559,7 @@ pub struct BreakpointSite {
     _is_internal: bool,
     is_hardware: bool,
     hardware_index: Option<u8>, // Only used for hardware breakpoints
+    #[allow(dead_code)]
     parent_breakpoint_id: Option<BreakpointId>,
 }
 

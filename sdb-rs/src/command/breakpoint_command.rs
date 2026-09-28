@@ -265,8 +265,16 @@ impl BreakpointCommandCategory {
                         bp.id(),
                         bp.description(),
                         format_addresses(&addresses),
-                        if bp.is_hardware() { "hardware" } else { "software" },
-                        if bp.is_enabled() { "enabled" } else { "disabled" }
+                        if bp.is_hardware() {
+                            "hardware"
+                        } else {
+                            "software"
+                        },
+                        if bp.is_enabled() {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        }
                     );
                 }
                 Ok(())

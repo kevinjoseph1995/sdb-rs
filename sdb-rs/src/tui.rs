@@ -1,5 +1,8 @@
 /////////////////////////////////////////
-use std::{borrow::Cow, path::PathBuf};
+use std::{
+    borrow::Cow,
+    path::{Path, PathBuf},
+};
 /////////////////////////////////////////
 use anyhow::{Context, Result};
 use colored::Colorize;
@@ -11,10 +14,13 @@ use rustyline::{
 };
 /////////////////////////////////////////
 use crate::command::{
-    self, Command, CommandCategory, get_completions_with_function_names, get_description_for_help,
+    self, Command, CommandCategory, disassemble_command::print_source,
+    get_completions_with_function_names, get_description_for_help,
 };
 use libsdb::{
     Sysno,
+    dwarf::Die,
+    dwarf_constants::DwTag,
     process::{HardwareStopPointId, StopReason},
     target::Target,
 };
@@ -266,13 +272,57 @@ impl Application {
             }
         }
         if self.target.process.get_state() == libsdb::process::ProcessHandleState::Stopped {
-            command::disassemble_command::print_disassembly(
-                &self.target.process,
-                1,
-                self.target.process.get_pc().ok(),
-            )?;
+            // Any failure to find the source falls back to disassembly, so the
+            // stop report itself never fails.
+            let location = match self.source_location_at_pc() {
+                Ok(location) => location,
+                Err(error) => {
+                    println!("Could not resolve source location: {error:#}");
+                    None
+                }
+            };
+            match location {
+                Some((path, line)) => print_source(path, line, 3)?,
+                None => command::disassemble_command::print_disassembly(
+                    &self.target.process,
+                    1,
+                    self.target.process.get_pc().ok(),
+                )?,
+            }
         }
         Ok(())
+    }
+
+    /// The source file and line to show for the current stop, or `None` when
+    /// the PC has no source line.
+    fn source_location_at_pc(&self) -> Result<Option<(&Path, usize)>> {
+        let state = &self.target.state;
+        let inline_height = state.stack.get_inline_height() as usize;
+        if inline_height > 0 {
+            let mut inline_stack = state
+                .stack
+                .inline_stack_at_pc(state, &self.target.process)?;
+            let frame = Die::NonNull(inline_stack.swap_remove(inline_stack.len() - inline_height));
+            // The inline height also counts the enclosing function when the PC
+            // is at its first instruction. Only an inlined frame has a call
+            // site to show; for the function itself the line table is right.
+            if frame.tag() == Some(DwTag::InlinedSubroutine) {
+                return Ok(Some((frame.file_entry()?.path(), frame.line()? as usize)));
+            }
+        }
+        let Some(entry) = self.target.line_entry_at_pc()? else {
+            return Ok(None);
+        };
+        // Line 0 marks compiler-generated code with no source line.
+        if entry.line() == 0 {
+            return Ok(None);
+        }
+        let file = state
+            .dwarf
+            .as_ref()
+            .and_then(|dwarf| dwarf.line_entry_file(&entry))
+            .context("Failed to resolve source file for line entry at PC")?;
+        Ok(Some((file.path(), entry.line() as usize)))
     }
 
     fn handle_command(&mut self, command: Command) -> Result<()> {

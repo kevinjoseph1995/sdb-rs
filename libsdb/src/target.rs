@@ -224,6 +224,24 @@ impl Target {
         }))
     }
 
+    /// Source-level stepping needs line information for the starting PC.
+    /// Checking before the first step means a failure leaves the inferior
+    /// where it was, instead of erroring after it has already moved.
+    fn origin_line_snapshot(&self) -> Result<Option<LineSnapshot>> {
+        if self.state.dwarf.is_none() {
+            return Err(anyhow!(
+                "Can't step by source line: the target has no debug info"
+            ));
+        }
+        self.process
+            .get_pc()?
+            .to_file_address(&self.state.elf)
+            .ok_or(anyhow!(
+                "Can't step by source line: the PC is outside the main executable"
+            ))?;
+        self.line_snapshot_at_pc()
+    }
+
     /// Step in:
     /// The basic idea behind the step in operation is to step through single machine instructions until
     /// the program counter lands on an instruction that belongs to a different line of source code from the
@@ -243,7 +261,7 @@ impl Target {
         // line covering the starting PC; we keep stepping while the PC stays on
         // that line or lands on an `end_sequence` row (which carries no real
         // line), and stop once it has no covering line at all.
-        let origin = self.line_snapshot_at_pc()?;
+        let origin = self.origin_line_snapshot()?;
         loop {
             // Unlike step-over, step-in descends into callees, so every
             // iteration is a plain single-instruction step — there is no target
@@ -343,7 +361,7 @@ impl Target {
     /// step-over and return that stop reason unchanged.
     pub fn step_over(&mut self) -> Result<StopReason> {
         // The line covering the starting PC; we keep stepping until we leave it.
-        let origin = self.line_snapshot_at_pc()?;
+        let origin = self.origin_line_snapshot()?;
         loop {
             let outcome = if self.state.stack.get_inline_height() > 0 {
                 // The PC sits at the start of an inlined function, so skip its
@@ -448,20 +466,17 @@ impl Target {
         }
     }
 
-    fn line_entry_at_pc(&self) -> Result<Option<LineTableEntry<'_>>> {
-        let pc = self
-            .process
-            .get_pc()?
-            .to_file_address(&self.state.elf)
-            .ok_or(anyhow!("Failed to get PC as file address"))?;
+    pub fn line_entry_at_pc(&self) -> Result<Option<LineTableEntry<'_>>> {
+        // No debug info, or a PC outside the main ELF (e.g. in a shared
+        // library), just means there is no line entry to report.
+        let Some(dwarf) = self.state.dwarf.as_ref() else {
+            return Ok(None);
+        };
+        let Some(pc) = self.process.get_pc()?.to_file_address(&self.state.elf) else {
+            return Ok(None);
+        };
 
-        if let Some((entry, _iterator)) = self
-            .state
-            .dwarf
-            .as_ref()
-            .ok_or(anyhow!("Failed to get dwarf handle"))?
-            .get_line_entry_at_address(pc)?
-        {
+        if let Some((entry, _iterator)) = dwarf.get_line_entry_at_address(pc)? {
             return Ok(Some(entry));
         }
         return Ok(None);
@@ -523,7 +538,11 @@ impl Target {
         // Score borrowed names directly (no `all_function_names()` dedup/copy) so
         // only the handful actually returned get allocated as owned `String`s.
         let dwarf_names = self.state.dwarf.iter().flat_map(|d| d.function_names());
-        let elf_names = self.state.elf.function_names().filter_map(|n| n.to_str().ok());
+        let elf_names = self
+            .state
+            .elf
+            .function_names()
+            .filter_map(|n| n.to_str().ok());
         let mut scored: Vec<(usize, &str)> = dwarf_names
             .chain(elf_names)
             .map(|name| (levenshtein_distance(query, name), name))
@@ -554,7 +573,9 @@ impl Target {
         if found.dwarf_functions.is_empty() && found.elf_functions.is_empty() {
             let suggestions = self.suggest_function_names(function_name, 3);
             return Err(if suggestions.is_empty() {
-                anyhow!("No function named '{function_name}' found in DWARF or the ELF symbol table")
+                anyhow!(
+                    "No function named '{function_name}' found in DWARF or the ELF symbol table"
+                )
             } else {
                 anyhow!(
                     "No function named '{function_name}' found in DWARF or the ELF symbol table. Did you mean: {}?",
@@ -847,7 +868,10 @@ impl Target {
     /// returned `Die`s (which borrow from `state.dwarf`) don't lock down the
     /// whole `Target` — callers still need `&mut self.process` afterwards to
     /// plant breakpoint sites at the addresses found here.
-    fn find_functions<'dw>(state: &'dw TargetState, name: &str) -> Result<FunctionSearchResult<'dw>> {
+    fn find_functions<'dw>(
+        state: &'dw TargetState,
+        name: &str,
+    ) -> Result<FunctionSearchResult<'dw>> {
         let dwarf_found = state
             .dwarf
             .as_ref()

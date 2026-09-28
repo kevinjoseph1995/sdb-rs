@@ -140,7 +140,9 @@ pub struct RangeListIterator<'elf> {
 
 pub struct SourceLocation {
     /// Index into LineTable::file_entries
+    #[allow(dead_code)]
     file_entry_index: usize,
+    #[allow(dead_code)]
     line: u64,
 }
 
@@ -449,6 +451,13 @@ impl Dwarf {
             .as_ref()?
             .file_entries
             .get(file_index)
+    }
+
+    /// Resolves a line-table row to the file it names, using the compile unit
+    /// that contains the row's address.
+    pub fn line_entry_file(&self, entry: &LineTableEntry<'_>) -> Option<&FileEntry> {
+        let cu_index = self.compile_unit_containing_address(entry.address())?;
+        self.line_table_file(cu_index, entry.file_entry()?)
     }
 
     fn build_function_index(&self) -> HashMap<String, Vec<IndexEntry>> {
@@ -987,19 +996,20 @@ impl<'dw> Die<'dw> {
         if matches!(self, Die::Null(_)) {
             return Err(anyhow!("Can't retrieve file index for null attr"));
         }
-        let one_based_index: u64 = {
-            if self.tag() == Some(DwTag::InlinedSubroutine) {
-                self.get_attr(DwAt::CallFile)
-                    .expect("Failed to get attr DwAt::CallFile")
-                    .as_int()
-                    .expect("Failed to interpret DwAt::CallFile attr as int")
-            } else {
-                self.get_attr(DwAt::DeclFile)
-                    .expect("Failed to get attr DwAt::DeclFile")
-                    .as_int()
-                    .expect("Failed to interpret DwAt::DeclFile attr as int")
-            }
+        // Out-of-class C++ methods (DW_AT_specification) and out-of-line
+        // copies of inline functions (DW_AT_abstract_origin) carry no
+        // DW_AT_decl_file of their own, so a missing attribute is an error,
+        // not a panic.
+        let attr = if self.tag() == Some(DwTag::InlinedSubroutine) {
+            DwAt::CallFile
+        } else {
+            DwAt::DeclFile
         };
+        let one_based_index = self
+            .get_attr(attr)
+            .ok_or_else(|| anyhow!("DIE has no {attr:?} attribute"))?
+            .as_int()
+            .with_context(|| format!("Failed to interpret {attr:?} attr as int"))?;
 
         // DWARF 4 file indices are 1-based; translate to a 0-based index into
         // `file_entries`. A stored index of 0 is invalid.
@@ -1012,19 +1022,28 @@ impl<'dw> Die<'dw> {
         if matches!(self, Die::Null(_)) {
             return Err(anyhow!("Can't retrieve file index for null attr"));
         }
-        if self.tag() == Some(DwTag::InlinedSubroutine) {
-            Ok(self
-                .get_attr(DwAt::CallLine)
-                .expect("Failed to get attr DwAt::CallLine")
-                .as_int()
-                .expect("Failed to interpret DwAt::CallLine attr as int"))
+        let attr = if self.tag() == Some(DwTag::InlinedSubroutine) {
+            DwAt::CallLine
         } else {
-            Ok(self
-                .get_attr(DwAt::DeclLine)
-                .expect("Failed to get attr DwAt::DeclLine")
-                .as_int()
-                .expect("Failed to interpret DwAt::DeclLine attr as int"))
-        }
+            DwAt::DeclLine
+        };
+        self.get_attr(attr)
+            .ok_or_else(|| anyhow!("DIE has no {attr:?} attribute"))?
+            .as_int()
+            .with_context(|| format!("Failed to interpret {attr:?} attr as int"))
+    }
+
+    /// Resolves [`Die::file`] to the file entry in this DIE's compile unit's
+    /// line table.
+    pub fn file_entry(&self) -> Result<&'dw FileEntry> {
+        let payload = match self {
+            Die::Null(_) => return Err(anyhow!("Can't retrieve file entry for null DIE")),
+            Die::NonNull(payload) => payload,
+        };
+        payload
+            .dwarf
+            .line_table_file(payload.cu_index, self.file()?)
+            .ok_or(anyhow!("DIE file index is out of range of its line table"))
     }
 }
 

@@ -71,8 +71,8 @@ fn target_launch_succeeds_with_no_dwarf() {
 #[test]
 fn step_in_fails_cleanly_without_dwarf() {
     let path = PathBuf::from(no_debug_fixture::no_debug_fixture_path());
-    let mut target = Target::launch(&path, None, true, None)
-        .expect("failed to launch no_debug fixture");
+    let mut target =
+        Target::launch(&path, None, true, None).expect("failed to launch no_debug fixture");
 
     let result = target.step_in();
     assert!(
@@ -84,8 +84,8 @@ fn step_in_fails_cleanly_without_dwarf() {
 #[test]
 fn step_over_fails_cleanly_without_dwarf() {
     let path = PathBuf::from(no_debug_fixture::no_debug_fixture_path());
-    let mut target = Target::launch(&path, None, true, None)
-        .expect("failed to launch no_debug fixture");
+    let mut target =
+        Target::launch(&path, None, true, None).expect("failed to launch no_debug fixture");
 
     let result = target.step_over();
     assert!(
@@ -112,9 +112,10 @@ fn step_out_still_works_without_dwarf() {
         .into_iter()
         .next()
         .expect("no_debug fixture's `.symtab` should still contain `add`");
-    let add_low_pc = libsdb::address::FileAddress::new(&target.state.elf, add_symbol.st_value as usize)
-        .to_virt_address()
-        .expect("`add`'s file address should map into the running process");
+    let add_low_pc =
+        libsdb::address::FileAddress::new(&target.state.elf, add_symbol.st_value as usize)
+            .to_virt_address()
+            .expect("`add`'s file address should map into the running process");
 
     target
         .process
@@ -150,10 +151,71 @@ fn step_out_still_works_without_dwarf() {
         "failed to land past `add`'s prologue: rsp never matched rbp"
     );
 
-    let reason = target.step_out().expect("step_out should succeed without DWARF");
+    let reason = target
+        .step_out()
+        .expect("step_out should succeed without DWARF");
     assert!(
         reason.is_step(),
         "step_out stopped for an unexpected reason: {:?}",
         reason.wait_status
+    );
+}
+
+/// Runs the no_debug fixture to `add`, a PC inside the main executable. The
+/// launch stop is in ld.so, which would hide a step that errors late.
+fn launch_stopped_in_add() -> Target {
+    let path = PathBuf::from(no_debug_fixture::no_debug_fixture_path());
+    let mut target =
+        Target::launch(&path, None, true, None).expect("failed to launch no_debug fixture");
+    let add_name = CString::new("add").unwrap();
+    let add_symbol = target
+        .state
+        .elf
+        .get_symbols_with_name(&add_name)
+        .into_iter()
+        .next()
+        .expect("no_debug fixture's `.symtab` should still contain `add`");
+    let add_low_pc =
+        libsdb::address::FileAddress::new(&target.state.elf, add_symbol.st_value as usize)
+            .to_virt_address()
+            .expect("`add`'s file address should map into the running process");
+    target
+        .process
+        .run_until_address(add_low_pc)
+        .expect("failed to run to `add`");
+    target
+}
+
+#[test]
+fn step_in_without_dwarf_fails_before_moving_the_pc() {
+    let mut target = launch_stopped_in_add();
+    let pc_before = target.process.get_pc().unwrap();
+
+    let result = target.step_in();
+    assert!(
+        result.is_err(),
+        "step_in should fail without DWARF: {result:?}"
+    );
+    assert_eq!(
+        target.process.get_pc().unwrap(),
+        pc_before,
+        "step_in should fail before executing any instruction"
+    );
+}
+
+#[test]
+fn step_over_without_dwarf_fails_before_moving_the_pc() {
+    let mut target = launch_stopped_in_add();
+    let pc_before = target.process.get_pc().unwrap();
+
+    let result = target.step_over();
+    assert!(
+        result.is_err(),
+        "step_over should fail without DWARF, not act like stepi: {result:?}"
+    );
+    assert_eq!(
+        target.process.get_pc().unwrap(),
+        pc_before,
+        "step_over should fail before executing any instruction"
     );
 }

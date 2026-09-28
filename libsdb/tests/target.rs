@@ -90,9 +90,7 @@ fn test_step_over_does_not_descend_into_callee() {
     // opposed to the raw low_pc used above) never lands exactly on it, and
     // stepping over from the bare low_pc is an untested edge case upstream
     // doesn't guard against either.
-    target
-        .step_in()
-        .expect("step_in past the prologue failed");
+    target.step_in().expect("step_in past the prologue failed");
 
     // Step line-by-line through entry_b until it returns. At no point should
     // the PC land inside sum_b's address range, even though entry_b's one
@@ -375,9 +373,7 @@ fn duplicate_function_breakpoints_on_the_same_function_are_independently_functio
         .disable_breakpoint(id1)
         .expect("failed to disable id1");
     assert!(
-        target
-            .is_breakpoint_enabled(id2)
-            .expect("id2 should exist"),
+        target.is_breakpoint_enabled(id2).expect("id2 should exist"),
         "id2 should still report itself enabled after only id1 was disabled"
     );
 

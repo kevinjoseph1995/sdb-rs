@@ -5,8 +5,8 @@ fn main() {
     println!("cargo::rerun-if-changed=src/lib_b.c");
     println!("cargo::rerun-if-changed=src/main.c");
 
-    let out = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set"))
-        .join("dwarf_fixture");
+    let out =
+        PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR not set")).join("dwarf_fixture");
 
     // In a build script the cc crate has TARGET/OPT_LEVEL/HOST available, so it
     // resolves the right compiler and flags. `.compile()` would only produce a
