@@ -1,5 +1,6 @@
 use crate::dwarf_constants::{DwAt, DwForm, DwLne, DwLns, DwTag};
 use crate::elf::Elf;
+use crate::language::SourceLanguage;
 use crate::{address::FileAddress, cursor::Cursor};
 use anyhow::{Context, Result, anyhow};
 use nix::NixPath;
@@ -318,6 +319,19 @@ impl Dwarf {
                 .expect("Failed to extract root DIE from compile unit")
                 .contains(address)
         })
+    }
+
+    /// The source language of the compile unit containing `address`, from its
+    /// root DIE's `DW_AT_language`.
+    pub fn language_at_address(&self, address: FileAddress<'_>) -> Option<SourceLanguage> {
+        let cu_index = self.compile_unit_containing_address(address)?;
+        let code = self
+            .root_of(cu_index)
+            .ok()?
+            .get_attr(DwAt::Language)?
+            .as_int()
+            .ok()?;
+        Some(SourceLanguage::from_dw_lang(code))
     }
 
     pub fn function_containing_address<'dw>(

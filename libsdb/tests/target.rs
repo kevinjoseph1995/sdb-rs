@@ -3,7 +3,9 @@ use std::{ffi::CString, path::PathBuf};
 /////////////////////////////////////////
 use nix::sys::{signal::Signal, wait::WaitStatus};
 /////////////////////////////////////////
-use libsdb::{address::FileAddress, address::VirtAddress, target::Target};
+use libsdb::{
+    address::FileAddress, address::VirtAddress, language::SourceLanguage, target::Target,
+};
 /////////////////////////////////////////
 
 // These tests drive `Target::step_in` / `step_over` / `step_out` against the
@@ -602,5 +604,29 @@ fn line_breakpoint_description_reports_path_and_line() {
     assert!(
         description.contains("lib_b.c") && description.contains("45"),
         "expected description to mention the file and line, got: {description}"
+    );
+}
+
+// --- Target::language_at / function_signature_at ---------------------------------
+
+#[test]
+fn language_at_reports_c_for_the_c_fixture() {
+    let target = launch_fixture();
+    let (low, _) = function_range(&target, "entry_b");
+    assert_eq!(target.language_at(low), Some(SourceLanguage::C));
+}
+
+#[test]
+fn function_signature_demangles_rust_symbols_without_the_hash() {
+    let path = PathBuf::from(
+        test_binary::build_test_binary("hello_sdb", &PathBuf::from_iter(["..", "tools"]))
+            .expect("failed to build hello_sdb"),
+    );
+    let target = Target::launch(&path, None, true, None).expect("failed to launch hello_sdb");
+    let (low, _) = function_range(&target, "main");
+    assert_eq!(target.language_at(low), Some(SourceLanguage::Rust));
+    assert_eq!(
+        target.function_signature_at(low).as_deref(),
+        Some("hello_sdb::main")
     );
 }

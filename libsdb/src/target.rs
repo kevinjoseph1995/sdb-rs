@@ -7,6 +7,7 @@ use crate::disassembler;
 use crate::dwarf::{Die, LineTableEntry};
 use crate::dwarf_constants::{DwAt, DwTag};
 use crate::elf::Elf64_Sym;
+use crate::language::SourceLanguage;
 use crate::process::{BreakpointId, StopPointId, StopReason, TrapType};
 use crate::register_info::RegisterValue;
 use crate::stack::Stack;
@@ -118,6 +119,17 @@ fn is_executable_file(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
+}
+
+/// `#` formatting drops the trailing `::h<hash>` from legacy Rust symbols.
+fn demangle_rust(name: &str) -> Option<String> {
+    rustc_demangle::try_demangle(name)
+        .ok()
+        .map(|demangled| format!("{demangled:#}"))
+}
+
+fn demangle_cpp(name: &str) -> Option<String> {
+    cpp_demangle::Symbol::new(name).ok()?.demangle().ok()
 }
 
 fn get_next_breakpoint_id() -> BreakpointId {
@@ -864,6 +876,34 @@ impl Target {
             .collect()
     }
 
+    /// The source language of the code at `address`, per the DWARF compile unit
+    /// containing it. `None` without DWARF, or if no compile unit covers it.
+    pub fn language_at(&self, address: VirtAddress) -> Option<SourceLanguage> {
+        let file_address = address.to_file_address(&self.state.elf)?;
+        self.state.dwarf.as_ref()?.language_at_address(file_address)
+    }
+
+    /// The demangled name of the function symbol containing `address`, e.g.
+    /// `print_type(int)` for a C++ overload, or `None` if no symbol covers it.
+    /// Demangling follows the source language at `address`; other languages
+    /// (and code without DWARF) keep the raw symbol name.
+    pub fn function_signature_at(&self, address: VirtAddress) -> Option<String> {
+        let file_address = address.to_file_address(&self.state.elf)?;
+        let symbol = self.state.elf.get_symbol_containing_address(file_address)?;
+        let name = self
+            .state
+            .elf
+            .get_string(symbol.st_name as usize)?
+            .to_str()
+            .ok()?;
+        let demangled = match self.language_at(address) {
+            Some(SourceLanguage::Cpp) => demangle_cpp(name),
+            Some(SourceLanguage::Rust) => demangle_rust(name),
+            _ => None,
+        };
+        Some(demangled.unwrap_or_else(|| name.to_string()))
+    }
+
     /// Takes `&TargetState` rather than `&self` so that, at call sites, the
     /// returned `Die`s (which borrow from `state.dwarf`) don't lock down the
     /// whole `Target` — callers still need `&mut self.process` afterwards to
@@ -915,6 +955,10 @@ impl TargetState {
 impl Breakpoint {
     pub fn id(&self) -> BreakpointId {
         self.id
+    }
+
+    pub fn is_function_breakpoint(&self) -> bool {
+        matches!(self.metadata, BreakpointMetadata::Function { .. })
     }
 
     pub fn is_hardware(&self) -> bool {

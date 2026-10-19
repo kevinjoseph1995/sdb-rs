@@ -86,6 +86,18 @@ fn format_addresses(addresses: &[VirtAddress]) -> String {
         .join(", ")
 }
 
+/// The address of each site of a function breakpoint paired with the signature
+/// of the function it lands in, sorted by address. This is what tells C++
+/// overloads apart. Sites with no covering symbol are left out.
+fn function_sites(target: &Target, addresses: &[VirtAddress]) -> Vec<(VirtAddress, String)> {
+    let mut sites: Vec<_> = addresses
+        .iter()
+        .filter_map(|address| Some((*address, target.function_signature_at(*address)?)))
+        .collect();
+    sites.sort();
+    sites
+}
+
 impl WatchpointCommandCategory {
     pub fn handle_command(
         &self,
@@ -260,11 +272,21 @@ impl BreakpointCommandCategory {
                 println!("Breakpoints:");
                 for bp in target.breakpoints() {
                     let addresses = target.addresses_of(bp);
+                    let sites = if bp.is_function_breakpoint() {
+                        function_sites(target, &addresses)
+                    } else {
+                        Vec::new()
+                    };
+                    let location = if sites.is_empty() {
+                        format!(", address = {}", format_addresses(&addresses))
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "{}: {}, address = {}, {}, {}",
+                        "{}: {}{}, {}, {}",
                         bp.id(),
                         bp.description(),
-                        format_addresses(&addresses),
+                        location,
                         if bp.is_hardware() {
                             "hardware"
                         } else {
@@ -276,6 +298,9 @@ impl BreakpointCommandCategory {
                             "disabled"
                         }
                     );
+                    for (address, signature) in sites {
+                        println!("     {address}  {signature}");
+                    }
                 }
                 Ok(())
             }

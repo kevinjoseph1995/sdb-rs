@@ -3,7 +3,7 @@ use std::path::PathBuf;
 /////////////////////////////////////////
 use nix::sys::{signal::Signal, wait::WaitStatus};
 /////////////////////////////////////////
-use libsdb::{address::VirtAddress, target::Target};
+use libsdb::{address::VirtAddress, language::SourceLanguage, target::Target};
 /////////////////////////////////////////
 
 // These tests check source-level breakpoints against the C++ `overload_fixture`
@@ -112,5 +112,14 @@ fn function_breakpoint_on_overloaded_name_fires_once_per_overload() {
     );
     for hit in &hits {
         assert!(addresses.contains(hit), "{hit:?} is not a planted site");
+    }
+}
+
+#[test]
+fn language_at_reports_cpp_for_the_overloads() {
+    let target = launch_fixture();
+    for range in function_ranges(&target, "print_type") {
+        let language = target.language_at(range.0).expect("no language for CU");
+        assert_eq!(language, SourceLanguage::Cpp);
     }
 }

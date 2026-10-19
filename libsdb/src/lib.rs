@@ -4,6 +4,7 @@ pub mod disassembler;
 pub mod dwarf;
 pub mod dwarf_constants;
 pub mod elf;
+pub mod language;
 pub mod pipe_channel;
 pub mod process;
 pub mod register_info;
