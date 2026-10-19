@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crate::elf::Elf;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Ord)]
 pub struct VirtAddress {
     pub address: usize,
 }
