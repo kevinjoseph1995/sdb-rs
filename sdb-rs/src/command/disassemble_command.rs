@@ -29,9 +29,10 @@ pub fn print_disassembly(
     Ok(())
 }
 
-/// Prints `line` of the source file at `path` with `context_number_of_lines`
-/// lines on either side, marking `line` with `>`. The source is read from
-/// disk, so a missing file prints a note instead of failing the stop.
+/// Prints a `path:line` header, then `line` of the source file at `path` with
+/// `context_number_of_lines` lines on either side, marking `line` with `>`.
+/// The source is read from disk, so a missing file prints a note instead of
+/// failing the stop.
 pub fn print_source(path: &Path, line: usize, context_number_of_lines: usize) -> Result<()> {
     let source = match std::fs::read_to_string(path) {
         std::result::Result::Ok(source) => source,
@@ -50,6 +51,7 @@ pub fn print_source(path: &Path, line: usize, context_number_of_lines: usize) ->
         );
         return Ok(());
     }
+    println!("{}", format!("{}:{line}", path.display()).cyan());
     let start_line = line.saturating_sub(context_number_of_lines).max(1);
     let end_line = line + context_number_of_lines;
     let line_number_width = end_line.to_string().len();
