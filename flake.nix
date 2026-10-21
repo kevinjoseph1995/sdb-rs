@@ -28,6 +28,7 @@
             rustc
             rustfmt
             gdb
+            clang-tools
             rust-analyzer
             clippy
             git
