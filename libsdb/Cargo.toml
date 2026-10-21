@@ -23,4 +23,5 @@ procfs = "0.17.0"
 object = "0.36"
 dwarf_fixture = { path = "../tools/dwarf_fixture" }
 overload_fixture = { path = "../tools/overload_fixture" }
+step_test_fixture = { path = "../tools/step_test_fixture" }
 no_debug_fixture = { path = "../tools/no_debug_fixture" }
