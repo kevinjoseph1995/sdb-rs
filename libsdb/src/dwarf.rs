@@ -842,7 +842,7 @@ fn parse_compile_units(debug_info: &[u8]) -> Result<Vec<CompileUnit>> {
 
 fn parse_compile_unit(cursor: &mut Cursor<'_>) -> Result<CompileUnit> {
     let start = cursor.position();
-    let mut size: u32 = cursor
+    let size: u32 = cursor
         .read_u32()
         .context("Failed to read size when trying to parse compile unit")?;
     let version: u16 = cursor
@@ -864,8 +864,11 @@ fn parse_compile_unit(cursor: &mut Cursor<'_>) -> Result<CompileUnit> {
         return Err(anyhow!("Invalid address size for DWARF"));
     }
     // "because the reported size in the compile unit header doesn't include the size field itself"
-    size += std::mem::size_of::<u32>() as u32;
-    let end = start + size as usize;
+    // Widen before adding so a huge size can't overflow u32.
+    let end = start
+        .checked_add(size as usize + std::mem::size_of::<u32>())
+        .filter(|&end| end >= cursor.position() && end <= cursor.len())
+        .ok_or_else(|| anyhow!("Compile unit size {:#x} is out of bounds", size))?;
     // `data_range` covers the DIE stream only — the CU header has already been
     // consumed by the reads above, so we start at `cursor.position()` (which sits
     // just past the header). This keeps all downstream offsets header-free.
@@ -2129,6 +2132,29 @@ mod tests {
         assert_eq!(cu.data_range.len(), die_bytes.len());
         // The cursor is left just past the whole CU.
         assert_eq!(cursor.position(), bytes.len());
+    }
+
+    #[test]
+    fn parse_compile_unit_rejects_oversized_unit_length() {
+        // Found by the dwarf_compile_units fuzzer: size + 4 overflowed u32.
+        let bytes = cu_bytes_raw(0xffff_fffc, 4, 0, 8, &[]);
+        let mut cursor = Cursor::new(&bytes);
+        assert!(parse_compile_unit(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_compile_unit_rejects_length_past_end_of_section() {
+        let bytes = cu_bytes_raw(100, 4, 0, 8, &[0u8; 2]);
+        let mut cursor = Cursor::new(&bytes);
+        assert!(parse_compile_unit(&mut cursor).is_err());
+    }
+
+    #[test]
+    fn parse_compile_unit_rejects_length_shorter_than_header() {
+        // end would land before the cursor, underflowing `end - position`.
+        let bytes = cu_bytes_raw(0, 4, 0, 8, &[]);
+        let mut cursor = Cursor::new(&bytes);
+        assert!(parse_compile_unit(&mut cursor).is_err());
     }
 
     #[test]

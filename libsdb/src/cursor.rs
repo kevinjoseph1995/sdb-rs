@@ -24,6 +24,10 @@ impl<'a> Cursor<'a> {
         self.position += n;
     }
 
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
     pub fn is_at_end(&self) -> bool {
         return self.position >= self.bytes.len();
     }
