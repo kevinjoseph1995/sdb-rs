@@ -1246,6 +1246,15 @@ impl<'dw> Iterator for DieChildrenIter<'dw> {
                 } else {
                     payload.next
                 };
+                // A sibling reference pointing backwards (or at this DIE) would make the
+                // iterator loop forever.
+                if next_sibling_offset <= self.current_offset {
+                    self.done = true;
+                    return Some(Err(anyhow!(
+                        "DIE sibling offset {next_sibling_offset} does not advance past {}",
+                        self.current_offset
+                    )));
+                }
                 self.current_offset = next_sibling_offset;
                 Some(Ok(Die::NonNull(payload)))
             }
