@@ -413,8 +413,10 @@ impl Elf {
             None => return Ok(Vec::new()), // No symbol table found, so we return an empty vector.
         };
 
-        if symbol_table_section_header.sh_offset + symbol_table_section_header.sh_size
-            > mmaped_file.len() as u64
+        if symbol_table_section_header
+            .sh_offset
+            .checked_add(symbol_table_section_header.sh_size)
+            .map_or(true, |end| end > mmaped_file.len() as u64)
         {
             anyhow::bail!(
                 "Symbol table section exceeds file size (offset: {}, size: {})",
@@ -423,12 +425,13 @@ impl Elf {
             );
         }
         const SYMBOL_TABLE_ENTRY_SIZE: usize = std::mem::size_of::<Elf64_Sym>();
-        assert!(
-            symbol_table_section_header.sh_entsize as usize == SYMBOL_TABLE_ENTRY_SIZE,
-            "Expected symbol table entry size to be {}, but got {}",
-            SYMBOL_TABLE_ENTRY_SIZE,
-            symbol_table_section_header.sh_entsize
-        );
+        if symbol_table_section_header.sh_entsize as usize != SYMBOL_TABLE_ENTRY_SIZE {
+            anyhow::bail!(
+                "Expected symbol table entry size to be {}, but got {}",
+                SYMBOL_TABLE_ENTRY_SIZE,
+                symbol_table_section_header.sh_entsize
+            );
+        }
 
         let number_of_entries = symbol_table_section_header
             .sh_size
