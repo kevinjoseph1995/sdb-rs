@@ -691,7 +691,11 @@ impl Dwarf {
                         include_directories,
                     )?);
                 }
-                cursor.increment_cursor_by(payload_start + length - cursor.position());
+                let payload_end = payload_start
+                    .checked_add(length)
+                    .filter(|&end| end >= cursor.position())
+                    .ok_or_else(|| anyhow!("Extended opcode length is shorter than its payload"))?;
+                cursor.increment_cursor_by(payload_end - cursor.position());
             } else if opcode < opcode_base {
                 // Standard opcode: skip its operands by type, mirroring the
                 // abstract machine's consumption in `execute_instruction`.
@@ -734,7 +738,12 @@ impl Dwarf {
                 if dir_index == 0 {
                     compilation_dir.join(file_path)
                 } else {
-                    include_directories[dir_index - 1].join(file_path)
+                    include_directories
+                        .get(dir_index - 1)
+                        .ok_or_else(|| {
+                            anyhow!("File entry directory index {dir_index} is out of range")
+                        })?
+                        .join(file_path)
                 }
             } else {
                 file_path
@@ -975,26 +984,21 @@ impl<'dw> Die<'dw> {
         }
 
         if let Some(attr) = self.get_attr(DwAt::Name) {
-            return Some(
-                attr.as_string()
-                    .expect("Failed to get string attribute")
-                    .to_str()
-                    .expect("CStr -> str conversion failed")
-                    .to_string(),
-            );
+            // A malformed name is treated as absent rather than a panic.
+            if let Some(name) = attr.as_string().ok().and_then(|name| name.to_str().ok()) {
+                return Some(name.to_string());
+            }
         }
         if let Some(attr) = self.get_attr(DwAt::Specification) {
-            let referenced_die: Die<'dw> = attr
-                .as_reference()
-                .expect("Failed to get referenced DIE with DwAt::Specification");
-            return referenced_die.name();
+            if let Ok(referenced_die) = attr.as_reference() {
+                return referenced_die.name();
+            }
         }
 
         if let Some(attr) = self.get_attr(DwAt::AbstractOrigin) {
-            let referenced_die: Die<'dw> = attr
-                .as_reference()
-                .expect("Failed to get referenced DIE with DwAt::AbstractOrigin");
-            return referenced_die.name();
+            if let Ok(referenced_die) = attr.as_reference() {
+                return referenced_die.name();
+            }
         }
         return None;
     }
@@ -1455,7 +1459,11 @@ impl<'dw> Attr<'dw> {
                     .elf
                     .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_str\0")?)
                     .ok_or(anyhow!("Failed to find .debug_str section"))?;
-                let mut cursor = Cursor::new(&string_table[offset..]);
+                let mut cursor = Cursor::new(
+                    string_table
+                        .get(offset..)
+                        .ok_or_else(|| anyhow!("DW_FORM_strp offset is past .debug_str"))?,
+                );
                 return cursor.read_string();
             }
             other => {
@@ -1866,7 +1874,10 @@ impl<'l, 'elf> LineTableIterator<'l, 'elf> {
         let debug_line = debug_line_section(self.elf)?;
         // Cursor over this table's remaining opcode bytes: from the current
         // position up to the end of the table's slice of the section.
-        let mut cursor = Cursor::new(&debug_line[self.position..self.line_table.data_range.end]);
+        let remaining = debug_line
+            .get(self.position..self.line_table.data_range.end)
+            .ok_or_else(|| anyhow!("Line-number program runs past the .debug_line section"))?;
+        let mut cursor = Cursor::new(remaining);
         let opcode = cursor.read_u8()?;
         let mut emitted = false;
         if opcode > 0 && opcode < self.line_table.opcode_base {
