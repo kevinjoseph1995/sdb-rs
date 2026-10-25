@@ -42,6 +42,23 @@
           env.RUST_SRC_PATH = "${pkgs.rust.packages.stable.rustPlatform.rustLibSrc}";
         };
 
+        # Dedicated shell for cargo-fuzz, which needs a nightly toolchain.
+        # Enter with: nix develop .#fuzz
+        fuzz = pkgs.mkShell {
+          buildInputs = [
+            miriToolchain
+            pkgs.cargo-fuzz
+            pkgs.cmake
+            pkgs.pkg-config
+            pkgs.libdwarf
+          ];
+          # zydis links libstdc++, which the fuzz binaries need at runtime.
+          env.LD_LIBRARY_PATH = "${pkgs.stdenv.cc.cc.lib}/lib";
+          shellHook = ''
+            echo "sdb-rs fuzz shell: cargo fuzz run <target>"
+          '';
+        };
+
         # Dedicated shell for running Miri on the computational unsafe code.
         # Enter with: nix develop .#miri
         miri = pkgs.mkShell {

@@ -1,2 +1,6 @@
 target
 .vscode
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
+fuzz/Cargo.lock

@@ -1,0 +1,51 @@
+[package]
+name = "sdb-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = { version = "1", features = ["derive"] }
+libfuzzer-sys = "0.4"
+libsdb = { path = "../libsdb", features = ["fuzzing"] }
+
+# Keep out of the root workspace so a plain `cargo build` ignores this crate.
+[workspace]
+
+[[bin]]
+name = "dwarf_compile_units"
+path = "fuzz_targets/dwarf_compile_units.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dwarf_abbrev"
+path = "fuzz_targets/dwarf_abbrev.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf_parse"
+path = "fuzz_targets/elf_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "register_value_parse"
+path = "fuzz_targets/register_value_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "cursor_ops"
+path = "fuzz_targets/cursor_ops.rs"
+test = false
+doc = false
+bench = false

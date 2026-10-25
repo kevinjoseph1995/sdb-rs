@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[features]
+# Exposes private parsers to the harnesses in `fuzz/`. Not for normal builds.
+fuzzing = []
+
 [dependencies]
 anyhow = "1.0.98"
 cpp_demangle = "0.5.1"

@@ -2012,6 +2012,21 @@ impl<'l, 'elf> Iterator for LineTableIterator<'l, 'elf> {
     }
 }
 
+/// Entry points for the harnesses in `fuzz/`. They return only a count so
+/// the private parser types stay private.
+#[cfg(feature = "fuzzing")]
+pub mod fuzz_api {
+    use anyhow::Result;
+
+    pub fn parse_compile_units(debug_info: &[u8]) -> Result<usize> {
+        super::parse_compile_units(debug_info).map(|units| units.len())
+    }
+
+    pub fn parse_abbrev_table(section: &[u8], offset: usize) -> Result<usize> {
+        super::parse_abbrev_table_from_section(section, offset).map(|table| table.len())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
