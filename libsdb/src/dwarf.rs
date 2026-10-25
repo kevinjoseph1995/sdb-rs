@@ -269,7 +269,7 @@ impl Dwarf {
         // Build the function index eagerly. The walk only reads `compile_units`
         // and the abbrev cache, so the (empty) `function_index` is never observed
         // before it is assigned.
-        dwarf.function_index = dwarf.build_function_index();
+        dwarf.function_index = dwarf.build_function_index()?;
         Ok(Some(dwarf))
     }
 
@@ -474,15 +474,13 @@ impl Dwarf {
         self.line_table_file(cu_index, entry.file_entry()?)
     }
 
-    fn build_function_index(&self) -> HashMap<String, Vec<IndexEntry>> {
+    fn build_function_index(&self) -> Result<HashMap<String, Vec<IndexEntry>>> {
         let mut index = HashMap::new();
         for cu_index in 0..self.compile_units.len() {
-            let die = self
-                .root_of(cu_index)
-                .expect("Failed to get root of compile unit");
-            Self::index_die(die, &mut index);
+            let die = self.root_of(cu_index)?;
+            Self::index_die(die, &mut index)?;
         }
-        index
+        Ok(index)
     }
 
     /// Parses the compile units from the `.debug_info` section.
@@ -750,7 +748,7 @@ impl Dwarf {
         })
     }
 
-    fn index_die(die: Die<'_>, index: &mut HashMap<String, Vec<IndexEntry>>) {
+    fn index_die(die: Die<'_>, index: &mut HashMap<String, Vec<IndexEntry>>) -> Result<()> {
         let has_range: bool = match die.get_attr(DwAt::LowPc) {
             Some(_) => true,
             None => false,
@@ -781,11 +779,11 @@ impl Dwarf {
 
         for child in match die.children() {
             Some(iterator) => iterator,
-            None => return,
+            None => return Ok(()),
         } {
-            let child = child.expect("Failed to parse children of DIE");
-            Self::index_die(child, index);
+            Self::index_die(child?, index)?;
         }
+        Ok(())
     }
 
     pub fn inline_stack_at_address(&self, address: FileAddress<'_>) -> Vec<DiePayload<'_>> {
@@ -1647,9 +1645,10 @@ impl<'elf> Iterator for RangeListIterator<'elf> {
 
     fn next(&mut self) -> Option<Self::Item> {
         let debug_ranges = debug_ranges_section(self.elf).expect("Failed to find .debug_ranges");
-        let data = &debug_ranges[self.offset..];
-        let entry = next_raw_range_entry(data, self.position, self.base_address.address as u64)
-            .expect("Failed to read range-list entry")?;
+        // The offset comes from the file, so it may point past the section; end the list.
+        let data = debug_ranges.get(self.offset..)?;
+        let entry =
+            next_raw_range_entry(data, self.position, self.base_address.address as u64).ok()??;
         self.base_address = FileAddress {
             elf_handle: self.elf,
             address: entry.base as usize,

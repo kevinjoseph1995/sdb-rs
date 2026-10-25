@@ -572,31 +572,12 @@ impl Elf {
         {
             let string_table_offset = section_header.sh_offset as usize;
             let string_table_size = section_header.sh_size as usize;
-            let table_end = string_table_offset
-                .checked_add(string_table_size)
-                .expect("String table size overflows");
-            if table_end > self.mmap.len() {
-                panic!(
-                    "String table exceeds file size (offset: {}, size: {})",
-                    string_table_offset, string_table_size
-                );
-            }
-            if string_offset >= string_table_size {
-                panic!(
-                    "String offset {} is out of bounds for string table of size {}",
-                    string_offset, string_table_size
-                );
-            }
-            let table = &self.mmap[string_table_offset..table_end];
-            let null_pos = table[string_offset..]
-                .iter()
-                .position(|&byte| byte == 0)
-                .expect("String is not null-terminated");
-            let cstr = std::ffi::CStr::from_bytes_with_nul(
-                &table[string_offset..string_offset + null_pos + 1],
-            )
-            .expect("Invalid string bytes");
-            Some(cstr)
+            // Offsets and sizes come from the file, so bad values mean "no string".
+            let table_end = string_table_offset.checked_add(string_table_size)?;
+            let table = self.mmap.get(string_table_offset..table_end)?;
+            let tail = table.get(string_offset..)?;
+            let null_pos = tail.iter().position(|&byte| byte == 0)?;
+            std::ffi::CStr::from_bytes_with_nul(&tail[..null_pos + 1]).ok()
         } else {
             // No string table found, so we can't resolve the string.
             return None;
