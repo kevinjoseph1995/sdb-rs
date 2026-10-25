@@ -49,3 +49,10 @@ path = "fuzz_targets/cursor_ops.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "dwarf_full"
+path = "fuzz_targets/dwarf_full.rs"
+test = false
+doc = false
+bench = false

@@ -2028,6 +2028,66 @@ pub mod fuzz_api {
     pub fn parse_abbrev_table(section: &[u8], offset: usize) -> Result<usize> {
         super::parse_abbrev_table_from_section(section, offset).map(|table| table.len())
     }
+
+    /// Loads `path` as an ELF and walks everything the parser exposes: every
+    /// DIE, its common attributes, the function index and the line tables.
+    pub fn walk_dwarf(path: &std::path::Path) -> Result<usize> {
+        use super::{Die, DwAt, Dwarf};
+        use std::rc::Rc;
+
+        const ATTRS: [DwAt; 9] = [
+            DwAt::Name,
+            DwAt::LowPc,
+            DwAt::HighPc,
+            DwAt::Ranges,
+            DwAt::StmtList,
+            DwAt::Type,
+            DwAt::Location,
+            DwAt::DeclFile,
+            DwAt::DeclLine,
+        ];
+
+        let elf = Rc::new(crate::elf::Elf::new(path)?);
+        let Some(dwarf) = Dwarf::new(elf)? else {
+            return Ok(0);
+        };
+        let mut visited = 0;
+        for cu_index in 0..dwarf.compile_units().len() {
+            // An explicit stack keeps deeply nested input from overflowing ours.
+            let mut stack = vec![vec![dwarf.root_of(cu_index)?].into_iter()];
+            while let Some(level) = stack.last_mut() {
+                let Some(die) = level.next() else {
+                    stack.pop();
+                    continue;
+                };
+                visited += 1;
+                for attr in ATTRS {
+                    if let Some(attr) = die.get_attr(attr) {
+                        let _ = attr.as_address();
+                        let _ = attr.as_section_offset();
+                        let _ = attr.as_int();
+                        let _ = attr.as_block();
+                        let _ = attr.as_reference();
+                        let _ = attr.as_string();
+                        if let Ok(ranges) = attr.as_range_list() {
+                            ranges.iter().take(64).for_each(drop);
+                        }
+                    }
+                }
+                if let Some(children) = die.children()
+                    && stack.len() < 64
+                {
+                    let kids: Vec<Die<'_>> = children.map_while(Result::ok).collect();
+                    stack.push(kids.into_iter());
+                }
+            }
+            if let Some(rows) = dwarf.lines(cu_index) {
+                rows.take(4096).for_each(drop);
+            }
+        }
+        visited += dwarf.function_names().count();
+        Ok(visited)
+    }
 }
 
 #[cfg(test)]
