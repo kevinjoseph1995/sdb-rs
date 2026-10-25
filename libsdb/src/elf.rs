@@ -228,7 +228,7 @@ impl Elf {
         let section_headers_ptr =
             unsafe { mmaped_file.as_ptr().add(section_headers_offset) as *const Elf64_Shdr };
 
-        let mut section_headers = Vec::with_capacity(num_of_sections);
+        let mut section_headers: Vec<Elf64_Shdr> = Vec::with_capacity(num_of_sections);
         unsafe {
             // SAFETY: The mmap is validated to cover the entire section header table,
             // and Elf64_Shdr is a plain data structure, so a byte-wise copy is OK.
@@ -238,6 +238,21 @@ impl Elf {
                 section_headers_size,
             );
             section_headers.set_len(num_of_sections);
+        }
+        // Every section that occupies file space must lie inside the file, so content
+        // accessors can rely on it. SHT_NOBITS sections (e.g. .bss) have no file content.
+        const SHT_NOBITS: u32 = 8;
+        for (index, section_header) in section_headers.iter().enumerate() {
+            if section_header.sh_type == SHT_NOBITS {
+                continue;
+            }
+            if section_header
+                .sh_offset
+                .checked_add(section_header.sh_size)
+                .map_or(true, |end| end > file_len as u64)
+            {
+                anyhow::bail!("Section {index} content exceeds file size");
+            }
         }
         Ok(section_headers)
     }
@@ -332,18 +347,9 @@ impl Elf {
         if let Some(section_header) = self.get_section_header_by_name(section_name) {
             let offset = section_header.sh_offset as usize;
             let size = section_header.sh_size as usize;
-            if offset
-                .checked_add(size)
-                .map_or(true, |end| end > self.mmap.len())
-            {
-                panic!(
-                    "Section '{}' content exceeds file size (offset: {}, size: {})",
-                    section_name.to_string_lossy(),
-                    offset,
-                    size
-                );
-            }
-            Some(&self.mmap[offset..offset + size])
+            // Header values come from the file; a section that doesn't fit in it has
+            // no readable content.
+            self.mmap.get(offset..offset.checked_add(size)?)
         } else {
             // Section not found.
             None
