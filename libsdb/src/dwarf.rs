@@ -478,7 +478,7 @@ impl Dwarf {
         let mut index = HashMap::new();
         for cu_index in 0..self.compile_units.len() {
             let die = self.root_of(cu_index)?;
-            Self::index_die(die, &mut index)?;
+            Self::index_die(die, &mut index, 0)?;
         }
         Ok(index)
     }
@@ -757,7 +757,17 @@ impl Dwarf {
         })
     }
 
-    fn index_die(die: Die<'_>, index: &mut HashMap<String, Vec<IndexEntry>>) -> Result<()> {
+    fn index_die(
+        die: Die<'_>,
+        index: &mut HashMap<String, Vec<IndexEntry>>,
+        depth: usize,
+    ) -> Result<()> {
+        // Real DWARF nests a few dozen levels at most; the cap keeps hostile input
+        // from overflowing the stack.
+        const MAX_DIE_DEPTH: usize = 256;
+        if depth > MAX_DIE_DEPTH {
+            return Err(anyhow!("DIE nesting exceeds {MAX_DIE_DEPTH} levels"));
+        }
         let has_range: bool = match die.get_attr(DwAt::LowPc) {
             Some(_) => true,
             None => false,
@@ -790,7 +800,7 @@ impl Dwarf {
             Some(iterator) => iterator,
             None => return Ok(()),
         } {
-            Self::index_die(child?, index)?;
+            Self::index_die(child?, index, depth + 1)?;
         }
         Ok(())
     }
