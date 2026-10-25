@@ -1373,7 +1373,6 @@ fn setup_child_process(
         traceme().context("Failed to enable tracing in child process")?;
     }
     execvp(&executable_path_cstring, &args_cstrings).context("Failed to launch executable")?;
-    Ok(())
 }
 
 pub fn process_with_pid_exists(pid: Pid) -> bool {
