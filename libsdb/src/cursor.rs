@@ -1,5 +1,5 @@
 use crate::dwarf_constants::DwForm;
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use std::ffi::CStr;
 
 pub struct Cursor<'a> {
@@ -68,8 +68,11 @@ impl<'a> Cursor<'a> {
     /// Unsigned Little Endian Base 128
     pub fn uleb128(&mut self) -> Result<u64> {
         let mut result: u64 = 0;
-        let mut shift = 0;
+        let mut shift = 0u32;
         loop {
+            if shift >= u64::BITS {
+                bail!("LEB128 value is too large for 64 bits");
+            }
             let byte = self.read_u8()?;
             let value_bits = byte & 0b0111_1111;
             result |= (value_bits as u64) << shift;
@@ -84,9 +87,12 @@ impl<'a> Cursor<'a> {
     /// Little Endian Base 128
     pub fn sleb128(&mut self) -> Result<i64> {
         let mut result: u64 = 0;
-        let mut shift = 0;
+        let mut shift = 0u32;
         let mut byte: u8;
         loop {
+            if shift >= u64::BITS {
+                bail!("LEB128 value is too large for 64 bits");
+            }
             byte = self.read_u8()?;
             let value_bits = byte & 0b0111_1111;
             result |= (value_bits as u64) << shift;
@@ -96,7 +102,7 @@ impl<'a> Cursor<'a> {
                 break;
             }
         }
-        if shift < std::mem::size_of_val(&result) * 8 && byte & 0b0100_0000 > 0 {
+        if shift < u64::BITS && byte & 0b0100_0000 > 0 {
             result |= !0u64 << shift;
         }
         Ok(result as i64)
@@ -182,6 +188,19 @@ mod tests {
     use super::*;
 
     // uleb128 tests
+    #[test]
+    fn uleb128_rejects_overlong_encoding() {
+        // Eleven continuation bytes would shift past 64 bits.
+        let mut cursor = Cursor::new(&[0xF3; 12]);
+        assert!(cursor.uleb128().is_err());
+    }
+
+    #[test]
+    fn sleb128_rejects_overlong_encoding() {
+        let mut cursor = Cursor::new(&[0xF3; 12]);
+        assert!(cursor.sleb128().is_err());
+    }
+
     #[test]
     fn uleb128_zero() {
         let mut cursor = Cursor::new(&[0x00]);
