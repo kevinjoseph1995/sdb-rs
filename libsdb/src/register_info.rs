@@ -685,7 +685,10 @@ impl RegisterValue {
                             anyhow::bail!("Invalid length for 64-bit vector: {}", input.len());
                         }
                         for (i, byte) in input.as_bytes().chunks(2).enumerate() {
-                            bytes[i] = u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16)
+                            // Chunking by byte can split a multi-byte character.
+                            let digits = std::str::from_utf8(byte)
+                                .context("Vector register value must be ASCII hex")?;
+                            bytes[i] = u8::from_str_radix(digits, 16)
                                 .context("Failed to parse hex string")?;
                         }
                         return Ok(RegisterValue::Byte64(bytes));
@@ -697,7 +700,9 @@ impl RegisterValue {
                             anyhow::bail!("Invalid length for 128-bit vector: {}", input.len());
                         }
                         for (i, byte) in input.as_bytes().chunks(2).enumerate() {
-                            bytes[i] = u8::from_str_radix(std::str::from_utf8(byte).unwrap(), 16)
+                            let digits = std::str::from_utf8(byte)
+                                .context("Vector register value must be ASCII hex")?;
+                            bytes[i] = u8::from_str_radix(digits, 16)
                                 .context("Failed to parse hex string")?;
                         }
                         return Ok(RegisterValue::Byte128(bytes));
@@ -871,6 +876,18 @@ mod tests {
 
     // Test the dr_offset macro for the x86_64 architecture.
     const _: () = assert!(dr_offset!(0) == offset_of!(libc::user, u_debugreg));
+
+    #[test]
+    fn test_vector_parse_rejects_split_multibyte_char() {
+        // Found by the register_value_parse fuzzer: 16 bytes long, but the
+        // 2-byte chunking splits the Cyrillic character.
+        let mm0 = get_register_info(RegisterId::mm(0)).expect("mm0 info");
+        assert!(RegisterValue::parse("0X6666021666666з+", &mm0).is_err());
+        let xmm0 = get_register_info(RegisterId::xmm(0)).expect("xmm0 info");
+        let input = format!("0x{}з+", "6".repeat(29));
+        assert_eq!(input.len() - 2, 32);
+        assert!(RegisterValue::parse(&input, &xmm0).is_err());
+    }
 
     #[test]
     fn test_register_value_parsing() {
