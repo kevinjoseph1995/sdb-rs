@@ -1372,7 +1372,11 @@ fn setup_child_process(
     if attach_for_debugging {
         traceme().context("Failed to enable tracing in child process")?;
     }
-    execvp(&executable_path_cstring, &args_cstrings).context("Failed to launch executable")?;
+    // execvp only returns on failure, so the Ok type is Infallible.
+    match execvp(&executable_path_cstring, &args_cstrings) {
+        Ok(infallible) => match infallible {},
+        Err(err) => Err(err).context("Failed to launch executable"),
+    }
 }
 
 pub fn process_with_pid_exists(pid: Pid) -> bool {
