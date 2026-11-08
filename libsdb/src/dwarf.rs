@@ -1,4 +1,5 @@
-use crate::dwarf_constants::{DwAt, DwForm, DwLne, DwLns, DwTag};
+use crate::address::FileOffset;
+use crate::dwarf_constants::{DwAt, DwEhPe, DwForm, DwLne, DwLns, DwTag};
 use crate::elf::Elf;
 use crate::language::SourceLanguage;
 use crate::{address::FileAddress, cursor::Cursor};
@@ -240,6 +241,24 @@ struct LineTableIterator<'l, 'elf> {
     registers: LineTableEntry<'elf>,
     /// A byte position inside the .debug_line section pointing to the data to parse next
     position: usize,
+}
+
+struct CallFrameInformation<'dw, 'elf> {
+    dwarf: &'dw Dwarf,
+    cie_map: RefCell<HashMap<usize, CommonInformationEntry<'elf>>>,
+}
+
+#[derive(Clone, Copy)]
+struct CommonInformationEntry<'elf> {
+    /// The byte size of this CIE, not including the length field itself.
+    length: u32,
+    /// Tunes the behavior of certain CFI instructions.
+    code_alignment_factor: u64,
+    /// Tunes the behavior of certain CFI instructions.
+    data_alignment_factor: u64,
+    fde_has_augmentation: bool,
+    fde_pointer_encoding: u8,
+    instruction_bytes: &'elf [u8],
 }
 
 // ===================================================================
@@ -2041,6 +2060,144 @@ impl<'l, 'elf> Iterator for LineTableIterator<'l, 'elf> {
         // the row unattributed rather than underflowing.
         next.file_entry = self.current.file_index.checked_sub(1).map(|i| i as usize);
         Some(Ok(next))
+    }
+}
+
+fn parse_cie<'elf>(cursor: &mut Cursor<'elf>) -> Result<CommonInformationEntry<'elf>> {
+    let length = cursor.read_u32()? + 4u32;
+    let id = cursor.read_u32()?;
+    let version = cursor.read_u8()?;
+    match version {
+        1 | 3 | 4 => {}
+        _ => return Err(anyhow!("Invalid CIE version")),
+    }
+    let augmentation = cursor.read_string()?;
+    if !augmentation.is_empty() && augmentation.to_bytes().first() != Some(&b'z') {
+        return Err(anyhow!("Invalid CIE augmentation"));
+    }
+    if version == 4 {
+        let address_size = cursor.read_u8()?;
+        let segment_size = cursor.read_u8()?;
+        if address_size != 8 {
+            return Err(anyhow!("Invalid address size"));
+        }
+        if segment_size != 0 {
+            return Err(anyhow!("Invalid segment size"));
+        }
+    }
+    let code_alignment_factor = cursor.uleb128()?;
+    let data_alignment_factor = cursor.sleb128()? as u64;
+    let return_address_register = if version == 1 {
+        cursor.read_u8()? as u64
+    } else {
+        cursor.uleb128()?
+    };
+    let mut fde_pointer_encoding: u8 = DwEhPe::Udata8 as u8 | DwEhPe::Absptr as u8;
+    for char in augmentation.to_bytes() {
+        match char {
+            b'z' => {
+                // Indicates that there is a ULEB128 specifying the size of the augmentation data
+                // (not including the ULEB128 itself).
+                // If there is augmentation data,this must be the first entry in it.
+                cursor.uleb128()?;
+            }
+            b'R' => {
+                // Indicates that there is a byte specifying the encoding of FDE code pointers for linked FDEs.
+                fde_pointer_encoding = cursor.read_u8()?;
+            }
+            b'L' => {
+                cursor.read_u8()?;
+            }
+            b'P' => {
+                /*
+                Indicates that there is a byte specifying the encoding of a pointer,
+                followed by the encoded pointer itself, which indicates a personality
+                function used to handle language-specific tasks by exception handling
+                routines.
+                */
+                let encoding = cursor.read_u8()?;
+                parse_eh_frame_pointer_with_base(cursor, encoding, 0)?;
+            }
+            _ => {
+                return Err(anyhow!("Invalid CIE augmentation"));
+            }
+        }
+    }
+    // The instructions span from the end of the augmentation data to the end of the CIE.
+    let instruction_bytes = &cursor.bytes[cursor.position()..(length as usize)];
+    let fde_has_augmentation = !augmentation.is_empty();
+    return Ok(CommonInformationEntry {
+        length,
+        code_alignment_factor,
+        data_alignment_factor,
+        fde_has_augmentation,
+        fde_pointer_encoding,
+        instruction_bytes,
+    });
+}
+
+fn parse_eh_frame_pointer_with_base(
+    cursor: &mut Cursor<'_>,
+    encoding: u8,
+    base: u64,
+) -> Result<u64> {
+    Ok(base
+        // The least significant 4 bits of the encoding byte tell us how to interpret the pointer
+        + match DwEhPe::try_from(encoding & 0x0f)? {
+            DwEhPe::Absptr => cursor.read_u64()?,
+            DwEhPe::Uleb128 => cursor.uleb128()?,
+            DwEhPe::Udata2 => cursor.read_u16()? as u64,
+            DwEhPe::Udata4 => cursor.read_u32()? as u64,
+            DwEhPe::Udata8 => cursor.read_u64()? as u64,
+            DwEhPe::Sleb128 => cursor.sleb128()? as u64,
+            DwEhPe::Sdata2 => cursor.read_i16()? as u64,
+            DwEhPe::Sdata4 => cursor.read_i32()? as u64,
+            DwEhPe::Sdata8 => cursor.read_i64()? as u64,
+            _ => return Err(anyhow!("Unknown eh_frame pointer encoding")),
+        })
+}
+
+fn parse_eh_frame_pointer(
+    elf: &Elf,
+    cursor: &mut Cursor<'_>,
+    encoding: u8,
+    pc: u64,
+    text_section_start: u64,
+    data_section_start: u64,
+    function_start: u64,
+) -> Result<u64> {
+    // Most significant 4 bits of the encoding byte, which tell us what address the pointer is relative to.
+    let base = match DwEhPe::try_from(encoding & 0x70)? {
+        DwEhPe::Absptr => 0,
+        DwEhPe::Pcrel => pc,
+        DwEhPe::Textrel => text_section_start,
+        DwEhPe::Datarel => data_section_start,
+        DwEhPe::Funcrel => function_start,
+        _ => {
+            return Err(anyhow!("Unknown eh_frame pointer encoding"));
+        }
+    };
+    return parse_eh_frame_pointer_with_base(cursor, encoding, base);
+}
+
+impl<'dw, 'elf> CallFrameInformation<'dw, 'elf> {
+    fn get_cie(&self, at: FileOffset<'elf>) -> Result<CommonInformationEntry<'elf>> {
+        let offset = at.offset;
+        if let Some((_offset, cie)) = self.cie_map.borrow().get_key_value(&offset) {
+            return Ok(cie.clone());
+        }
+        let section = at
+            .elf_handle
+            .get_section_content_by_name(CStr::from_bytes_until_nul(b".eh_frame\0").unwrap())
+            .ok_or(anyhow!("Failed to get eh_frame section"))?;
+
+        let mut cursor = Cursor::new(&section[offset..]);
+        Ok(self
+            .cie_map
+            .borrow_mut()
+            .entry(offset)
+            .or_insert(parse_cie(&mut cursor)?)
+            .clone())
     }
 }
 
