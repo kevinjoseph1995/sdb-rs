@@ -261,6 +261,14 @@ struct CommonInformationEntry<'elf> {
     instruction_bytes: &'elf [u8],
 }
 
+struct FrameDescriptionEntry<'elf> {
+    length: u32,
+    cie: CommonInformationEntry<'elf>,
+    initial_location: FileAddress<'elf>,
+    address_range: u64,
+    instruction_bytes: &'elf [u8],
+}
+
 // ===================================================================
 
 // --- Dwarf ---
@@ -2199,6 +2207,76 @@ impl<'dw, 'elf> CallFrameInformation<'dw, 'elf> {
             .or_insert(parse_cie(&mut cursor)?)
             .clone())
     }
+}
+
+/// Parses an FDE from `.eh_frame`. The cursor must span the whole `.eh_frame`
+/// section and be positioned at the start of the FDE.
+/// Future me: Go read https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way. You will be confused.
+fn parse_fde<'dw: 'elf, 'elf>(
+    cfi: &CallFrameInformation<'dw, 'elf>,
+    cursor: &mut Cursor<'elf>,
+) -> Result<FrameDescriptionEntry<'elf>> {
+    let elf = cfi.dwarf.elf();
+    let eh_frame_sh_offset = elf
+        .get_section_header_by_name(CStr::from_bytes_with_nul(b".eh_frame\0")?)
+        .ok_or_else(|| anyhow!("Failed to find .eh_frame section header"))?
+        .sh_offset as usize;
+
+    let start = cursor.position();
+    // Because the length field doesn’t include its own size
+    let length = cursor.read_u32()? as usize + 4;
+
+    // The CIE pointer is a 32-bit offset from this field's position back to
+    // the CIE within .eh_frame.
+    let cie_pointer_section_offset = cursor.position();
+    let cie_pointer_value = cursor.read_i32()? as usize;
+    let cie_section_offset = cie_pointer_section_offset - cie_pointer_value;
+    let cie = cfi.get_cie(FileOffset {
+        elf_handle: elf,
+        offset: cie_section_offset,
+    })?;
+
+    // Parse is initial_location
+    // "initial_location" is the start address of the PC range that this FDE covers — the first machine instruction the FDE's unwinding rules apply to.
+    let current_file_offset = (eh_frame_sh_offset + cursor.position()) as u64;
+    let text_section_start = elf
+        .get_section_start_address(CStr::from_bytes_with_nul(b".text\0")?)
+        .map(|a| a.address as u64)
+        .unwrap_or(0);
+    let initial_location_addr = parse_eh_frame_pointer(
+        elf,
+        cursor,
+        cie.fde_pointer_encoding,
+        current_file_offset,
+        text_section_start,
+        0,
+        0,
+    )?;
+    let initial_location = FileAddress {
+        elf_handle: elf,
+        address: initial_location_addr as usize,
+    };
+
+    let address_range = parse_eh_frame_pointer_with_base(cursor, cie.fde_pointer_encoding, 0)?;
+
+    if cie.fde_has_augmentation {
+        // we’ll just read the length of the data and skip past it.
+        let augmentation_length = cursor.uleb128()? as usize;
+        cursor.increment_cursor_by(augmentation_length);
+    }
+
+    let instruction_bytes = cursor
+        .bytes
+        .get(cursor.position()..start + length)
+        .ok_or_else(|| anyhow!("FDE instructions extend past .eh_frame"))?;
+
+    Ok(FrameDescriptionEntry {
+        length: length as u32,
+        cie,
+        initial_location,
+        address_range,
+        instruction_bytes,
+    })
 }
 
 /// Entry points for the harnesses in `fuzz/`. They return only a count so
