@@ -1,12 +1,13 @@
-use crate::address::FileOffset;
 use crate::dwarf_constants::{DwAt, DwEhPe, DwForm, DwLne, DwLns, DwTag};
 use crate::elf::Elf;
 use crate::language::SourceLanguage;
 use crate::{address::FileAddress, cursor::Cursor};
 use anyhow::{Context, Result, anyhow};
 use nix::NixPath;
+use num_enum::TryFromPrimitive;
 use std::cell::RefCell;
 use std::iter::Peekable;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::{collections::HashMap, ffi::CStr};
@@ -32,6 +33,8 @@ pub struct Dwarf {
     line_tables: Vec<Option<LineTable>>,
     function_index: HashMap<String, Vec<IndexEntry>>,
     abbrev_table_cache: RefCell<HashMap<usize, Rc<AbbrevTable>>>,
+    /// Call frame information from `.eh_frame_hdr` / `.eh_frame`.
+    cfi: CallFrameInformation,
 }
 
 pub struct CompileUnit {
@@ -243,14 +246,28 @@ struct LineTableIterator<'l, 'elf> {
     position: usize,
 }
 
-struct CallFrameInformation<'dw, 'elf> {
-    dwarf: &'dw Dwarf,
-    cie_map: RefCell<HashMap<usize, CommonInformationEntry<'elf>>>,
+/// The parsed header of `.eh_frame_hdr`. Like `CompileUnit` and `LineTable`,
+/// it stores offsets only; the section bytes are fetched from the `Elf` when needed.
+#[derive(Clone, Copy)]
+struct EhHdr {
+    /// Offset of the binary search table within `.eh_frame_hdr`.
+    search_table_offset: usize,
+    /// Number of rows in the search table.
+    count: usize,
+    /// Pointer encoding used by every value in the search table.
+    encoding: u8,
 }
 
-#[derive(Clone, Copy)]
-struct CommonInformationEntry<'elf> {
-    /// The byte size of this CIE, not including the length field itself.
+/// Call frame information, stored owned inside `Dwarf`. Methods take the
+/// `&Elf` (or section bytes) they need as a parameter.
+struct CallFrameInformation {
+    eh_hdr: EhHdr,
+    /// Parsed CIEs keyed by their offset within `.eh_frame`.
+    cie_cache: RefCell<HashMap<usize, Rc<CommonInformationEntry>>>,
+}
+
+struct CommonInformationEntry {
+    /// The byte size of this CIE, including the length field itself.
     length: u32,
     /// Tunes the behavior of certain CFI instructions.
     code_alignment_factor: u64,
@@ -258,15 +275,18 @@ struct CommonInformationEntry<'elf> {
     data_alignment_factor: u64,
     fde_has_augmentation: bool,
     fde_pointer_encoding: u8,
-    instruction_bytes: &'elf [u8],
+    /// Range of the initial instructions within the `.eh_frame` section.
+    instructions: Range<usize>,
 }
 
-struct FrameDescriptionEntry<'elf> {
+/// A view of one FDE. It borrows from the ELF and is built on demand, never stored.
+struct FrameDescriptionEntry<'e> {
+    /// The byte size of this FDE, including the length field itself.
     length: u32,
-    cie: CommonInformationEntry<'elf>,
-    initial_location: FileAddress<'elf>,
+    cie: Rc<CommonInformationEntry>,
+    initial_location: FileAddress<'e>,
     address_range: u64,
-    instruction_bytes: &'elf [u8],
+    instruction_bytes: &'e [u8],
 }
 
 // ===================================================================
@@ -280,16 +300,21 @@ impl Dwarf {
     /// binary, or one built without debug info), and `Err` only when the section
     /// is present but cannot be parsed.
     pub fn new(elf: Rc<Elf>) -> Result<Option<Dwarf>> {
+        let Some(compile_units) = Self::build_compile_units(&elf)? else {
+            return Ok(None);
+        };
+        // Built after the `.debug_info` check so a stripped binary still
+        // returns `Ok(None)`. A missing `.eh_frame_hdr` is an error, as in the
+        // book. There is no linear-scan fallback over `.eh_frame`, so a binary
+        // linked without `--eh-frame-hdr` fails to load here.
+        let cfi = CallFrameInformation::new(&elf)?;
         let mut dwarf = Dwarf {
-            elf: Rc::clone(&elf),
-            compile_units: Vec::new(),
+            elf,
+            compile_units,
             line_tables: Vec::new(),
             function_index: HashMap::new(),
             abbrev_table_cache: RefCell::new(HashMap::new()),
-        };
-        dwarf.compile_units = match dwarf.build_compile_units()? {
-            Some(compile_units) => compile_units,
-            None => return Ok(None),
+            cfi,
         };
 
         dwarf.line_tables = dwarf.build_line_tables()?;
@@ -321,6 +346,31 @@ impl Dwarf {
     fn cu_data(&self, cu_index: usize) -> &[u8] {
         let range = self.compile_units[cu_index].data_range.clone();
         &self.debug_info()[range]
+    }
+
+    /// Parses the FDE whose PC range contains `pc`. Returns `Ok(None)` when no
+    /// FDE covers `pc`.
+    ///
+    /// The lookup always uses the `.eh_frame_hdr` binary search table. It never
+    /// scans `.eh_frame` linearly. `Dwarf::new` fails when the header is
+    /// missing, so a `Dwarf` always has one. `Err` means malformed CFI data or a
+    /// missing `.eh_frame` section.
+    fn fde_at(&self, pc: FileAddress<'_>) -> Result<Option<FrameDescriptionEntry<'_>>> {
+        let elf = self.elf();
+        let Some(fde_offset) = self.cfi.eh_hdr.fde_offset_for_pc(elf, pc)? else {
+            return Ok(None);
+        };
+        let mut cursor = Cursor::new(eh_frame_section(elf)?);
+        cursor.increment_cursor_by(fde_offset);
+        let fde = parse_fde(&self.cfi, elf, &mut cursor)?;
+        // The search table finds the last FDE starting at or before `pc`.
+        // `pc` can still fall in a gap after that FDE's range ends.
+        let start = fde.initial_location.address as u64;
+        if (pc.address as u64) < start.saturating_add(fde.address_range) {
+            Ok(Some(fde))
+        } else {
+            Ok(None)
+        }
     }
 
     fn get_abbrev_table(&self, offset: usize) -> Result<Rc<AbbrevTable>> {
@@ -513,14 +563,12 @@ impl Dwarf {
     /// Parses the compile units from the `.debug_info` section.
     ///
     /// Returns `Ok(None)` when the ELF has no `.debug_info` section.
-    fn build_compile_units(&self) -> Result<Option<Vec<CompileUnit>>> {
-        let debug_info_bytes = match self
-            .elf
-            .get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_info\0")?)
-        {
-            Some(debug_info_bytes) => debug_info_bytes,
-            None => return Ok(None),
-        };
+    fn build_compile_units(elf: &Elf) -> Result<Option<Vec<CompileUnit>>> {
+        let debug_info_bytes =
+            match elf.get_section_content_by_name(CStr::from_bytes_with_nul(b".debug_info\0")?) {
+                Some(debug_info_bytes) => debug_info_bytes,
+                None => return Ok(None),
+            };
         Ok(Some(parse_compile_units(debug_info_bytes)?))
     }
 
@@ -2071,7 +2119,11 @@ impl<'l, 'elf> Iterator for LineTableIterator<'l, 'elf> {
     }
 }
 
-fn parse_cie<'elf>(cursor: &mut Cursor<'elf>) -> Result<CommonInformationEntry<'elf>> {
+/// Parses a CIE from `.eh_frame`. The cursor must span the whole `.eh_frame`
+/// section and be positioned at the start of the CIE, so the stored
+/// instruction range is an offset into the section.
+fn parse_cie(cursor: &mut Cursor<'_>) -> Result<CommonInformationEntry> {
+    let start = cursor.position();
     let length = cursor.read_u32()? + 4u32;
     let id = cursor.read_u32()?;
     let version = cursor.read_u8()?;
@@ -2132,7 +2184,10 @@ fn parse_cie<'elf>(cursor: &mut Cursor<'elf>) -> Result<CommonInformationEntry<'
         }
     }
     // The instructions span from the end of the augmentation data to the end of the CIE.
-    let instruction_bytes = &cursor.bytes[cursor.position()..(length as usize)];
+    let instructions = cursor.position()..start + length as usize;
+    if instructions.start > instructions.end || instructions.end > cursor.len() {
+        return Err(anyhow!("CIE instructions extend past .eh_frame"));
+    }
     let fde_has_augmentation = !augmentation.is_empty();
     return Ok(CommonInformationEntry {
         length,
@@ -2140,8 +2195,27 @@ fn parse_cie<'elf>(cursor: &mut Cursor<'elf>) -> Result<CommonInformationEntry<'
         data_alignment_factor,
         fde_has_augmentation,
         fde_pointer_encoding,
-        instruction_bytes,
+        instructions,
     });
+}
+
+impl CommonInformationEntry {
+    /// Resolves the initial instructions within the `.eh_frame` section bytes.
+    fn instructions<'e>(&self, eh_frame: &'e [u8]) -> &'e [u8] {
+        &eh_frame[self.instructions.clone()]
+    }
+}
+
+fn eh_frame_section(elf: &Elf) -> Result<&[u8]> {
+    elf.get_section_content_by_name(CStr::from_bytes_with_nul(b".eh_frame\0")?)
+        .context(".eh_frame section missing")
+}
+
+fn text_section_start(elf: &Elf) -> Result<u64> {
+    Ok(elf
+        .get_section_start_address(CStr::from_bytes_with_nul(b".text\0")?)
+        .map(|a| a.address as u64)
+        .unwrap_or(0))
 }
 
 fn parse_eh_frame_pointer_with_base(
@@ -2151,7 +2225,7 @@ fn parse_eh_frame_pointer_with_base(
 ) -> Result<u64> {
     Ok(base
         // The least significant 4 bits of the encoding byte tell us how to interpret the pointer
-        + match DwEhPe::try_from(encoding & 0x0f)? {
+        .wrapping_add(match DwEhPe::try_from(encoding & 0x0f)? {
             DwEhPe::Absptr => cursor.read_u64()?,
             DwEhPe::Uleb128 => cursor.uleb128()?,
             DwEhPe::Udata2 => cursor.read_u16()? as u64,
@@ -2162,7 +2236,7 @@ fn parse_eh_frame_pointer_with_base(
             DwEhPe::Sdata4 => cursor.read_i32()? as u64,
             DwEhPe::Sdata8 => cursor.read_i64()? as u64,
             _ => return Err(anyhow!("Unknown eh_frame pointer encoding")),
-        })
+        }))
 }
 
 fn parse_eh_frame_pointer(
@@ -2188,39 +2262,39 @@ fn parse_eh_frame_pointer(
     return parse_eh_frame_pointer_with_base(cursor, encoding, base);
 }
 
-impl<'dw, 'elf> CallFrameInformation<'dw, 'elf> {
-    fn get_cie(&self, at: FileOffset<'elf>) -> Result<CommonInformationEntry<'elf>> {
-        let offset = at.offset;
-        if let Some((_offset, cie)) = self.cie_map.borrow().get_key_value(&offset) {
-            return Ok(cie.clone());
-        }
-        let section = at
-            .elf_handle
-            .get_section_content_by_name(CStr::from_bytes_until_nul(b".eh_frame\0").unwrap())
-            .ok_or(anyhow!("Failed to get eh_frame section"))?;
+impl CallFrameInformation {
+    fn new(elf: &Elf) -> Result<Self> {
+        Ok(Self {
+            eh_hdr: parse_eh_hdr(elf)?,
+            cie_cache: RefCell::new(HashMap::new()),
+        })
+    }
 
-        let mut cursor = Cursor::new(&section[offset..]);
-        Ok(self
-            .cie_map
-            .borrow_mut()
-            .entry(offset)
-            .or_insert(parse_cie(&mut cursor)?)
-            .clone())
+    /// Returns the CIE at `offset` within `eh_frame`, parsing and caching it on first use.
+    fn get_cie(&self, eh_frame: &[u8], offset: usize) -> Result<Rc<CommonInformationEntry>> {
+        if let Some(cie) = self.cie_cache.borrow().get(&offset) {
+            return Ok(Rc::clone(cie));
+        }
+        let mut cursor = Cursor::new(eh_frame);
+        cursor.increment_cursor_by(offset);
+        let cie = Rc::new(parse_cie(&mut cursor)?);
+        self.cie_cache.borrow_mut().insert(offset, Rc::clone(&cie));
+        Ok(cie)
     }
 }
 
 /// Parses an FDE from `.eh_frame`. The cursor must span the whole `.eh_frame`
 /// section and be positioned at the start of the FDE.
 /// Future me: Go read https://lesenechal.fr/en/linux/unwinding-the-stack-the-hard-way. You will be confused.
-fn parse_fde<'dw: 'elf, 'elf>(
-    cfi: &CallFrameInformation<'dw, 'elf>,
-    cursor: &mut Cursor<'elf>,
-) -> Result<FrameDescriptionEntry<'elf>> {
-    let elf = cfi.dwarf.elf();
+fn parse_fde<'e>(
+    cfi: &CallFrameInformation,
+    elf: &'e Elf,
+    cursor: &mut Cursor<'e>,
+) -> Result<FrameDescriptionEntry<'e>> {
     let eh_frame_sh_offset = elf
         .get_section_header_by_name(CStr::from_bytes_with_nul(b".eh_frame\0")?)
         .ok_or_else(|| anyhow!("Failed to find .eh_frame section header"))?
-        .sh_offset as usize;
+        .sh_addr as usize;
 
     let start = cursor.position();
     // Because the length field doesn’t include its own size
@@ -2229,26 +2303,21 @@ fn parse_fde<'dw: 'elf, 'elf>(
     // The CIE pointer is a 32-bit offset from this field's position back to
     // the CIE within .eh_frame.
     let cie_pointer_section_offset = cursor.position();
-    let cie_pointer_value = cursor.read_i32()? as usize;
-    let cie_section_offset = cie_pointer_section_offset - cie_pointer_value;
-    let cie = cfi.get_cie(FileOffset {
-        elf_handle: elf,
-        offset: cie_section_offset,
-    })?;
+    let cie_pointer_value = cursor.read_u32()? as usize;
+    let cie_section_offset = cie_pointer_section_offset
+        .checked_sub(cie_pointer_value)
+        .ok_or_else(|| anyhow!("FDE CIE pointer points before .eh_frame"))?;
+    let cie = cfi.get_cie(cursor.bytes, cie_section_offset)?;
 
     // Parse is initial_location
     // "initial_location" is the start address of the PC range that this FDE covers — the first machine instruction the FDE's unwinding rules apply to.
     let current_file_offset = (eh_frame_sh_offset + cursor.position()) as u64;
-    let text_section_start = elf
-        .get_section_start_address(CStr::from_bytes_with_nul(b".text\0")?)
-        .map(|a| a.address as u64)
-        .unwrap_or(0);
     let initial_location_addr = parse_eh_frame_pointer(
         elf,
         cursor,
         cie.fde_pointer_encoding,
         current_file_offset,
-        text_section_start,
+        text_section_start(elf)?,
         0,
         0,
     )?;
@@ -2277,6 +2346,113 @@ fn parse_fde<'dw: 'elf, 'elf>(
         address_range,
         instruction_bytes,
     })
+}
+
+fn eh_frame_hdr_section(elf: &Elf) -> Result<&[u8]> {
+    elf.get_section_content_by_name(CStr::from_bytes_with_nul(b".eh_frame_hdr\0")?)
+        .context(".eh_frame_hdr section missing")
+}
+
+fn parse_eh_hdr(elf: &Elf) -> Result<EhHdr> {
+    let mut cursor = Cursor::new(eh_frame_hdr_section(elf)?);
+    let version = cursor.read_u8()?;
+    let eh_frame_ptr_enc = cursor.read_u8()?;
+    let fde_count_enc = cursor.read_u8()?;
+    let table_enc = cursor.read_u8()?;
+    // Discard the .eh_frame pointer; we retrieve it from sdb::elf directly
+    let _ = parse_eh_frame_pointer_with_base(&mut cursor, eh_frame_ptr_enc, 0)?;
+    let fde_count = parse_eh_frame_pointer_with_base(&mut cursor, fde_count_enc, 0)?;
+    Ok(EhHdr {
+        search_table_offset: cursor.position(),
+        count: fde_count as usize,
+        encoding: table_enc,
+    })
+}
+
+impl EhHdr {
+    /// Binary-searches the `.eh_frame_hdr` table for the last FDE whose
+    /// initial location is at or before `pc`, and returns that FDE's offset
+    /// within the `.eh_frame` section. `elf` must be the ELF this header was
+    /// parsed from.
+    fn fde_offset_for_pc(&self, elf: &Elf, pc: FileAddress<'_>) -> Result<Option<usize>> {
+        let section_data = eh_frame_hdr_section(elf)?;
+        let text_section_start = text_section_start(elf)?;
+        let eh_hdr_sh_offset = elf
+            .get_section_header_by_name(CStr::from_bytes_with_nul(b".eh_frame_hdr\0")?)
+            .context(".eh_frame_hdr section missing")?
+            .sh_addr as usize;
+        let encoding_size = eh_frame_pointer_encoding_size(self.encoding)?;
+        // Each row of the table stores two values, so the row size is twice the size of the pointer encoding.
+        let row_size = 2 * encoding_size;
+        let table_start = self.search_table_offset;
+        let eh_hdr_file_offset = eh_hdr_sh_offset as u64;
+        // Bound every read by the table's end, and reject a `count` that runs
+        // past the section instead of panicking on the slice.
+        let table = self
+            .count
+            .checked_mul(row_size)
+            .and_then(|table_len| table_start.checked_add(table_len))
+            .and_then(|table_end| section_data.get(..table_end))
+            .ok_or_else(|| anyhow!(".eh_frame_hdr search table extends past the section"))?;
+        let mut low: usize = 0;
+        let mut high: usize = self.count;
+        while low < high {
+            let mid = low + (high - low) / 2;
+            let mut cursor = Cursor::new(&table[table_start + mid * row_size..]);
+            let current_file_offset = (eh_hdr_sh_offset + table_start + mid * row_size) as u64;
+            let entry_address = parse_eh_frame_pointer(
+                elf,
+                &mut cursor,
+                self.encoding,
+                current_file_offset,
+                text_section_start,
+                eh_hdr_file_offset,
+                0,
+            )?;
+            if entry_address <= pc.address as u64 {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
+        }
+        if low == 0 {
+            return Ok(None);
+        }
+        let result_index = low - 1;
+        // Skip past the initial_location (first column) to the FDE pointer.
+        let fde_ptr_start = table_start + result_index * row_size + encoding_size;
+        let mut cursor = Cursor::new(&table[fde_ptr_start..]);
+        let fde_ptr_file_offset = (eh_hdr_sh_offset + fde_ptr_start) as u64;
+        let fde_file_offset = parse_eh_frame_pointer(
+            elf,
+            &mut cursor,
+            self.encoding,
+            fde_ptr_file_offset,
+            text_section_start,
+            eh_hdr_file_offset,
+            0,
+        )?;
+        let eh_frame_sh_offset = elf
+            .get_section_header_by_name(CStr::from_bytes_with_nul(b".eh_frame\0")?)
+            .context(".eh_frame section missing")?
+            .sh_addr;
+        let fde_section_offset = fde_file_offset
+            .checked_sub(eh_frame_sh_offset)
+            .map(|offset| offset as usize)
+            .filter(|&offset| offset < eh_frame_section(elf).map_or(0, <[u8]>::len))
+            .ok_or_else(|| anyhow!(".eh_frame_hdr FDE pointer is outside .eh_frame"))?;
+        Ok(Some(fde_section_offset))
+    }
+}
+
+fn eh_frame_pointer_encoding_size(encoding: u8) -> Result<usize> {
+    match DwEhPe::try_from_primitive(encoding & 0x7)? {
+        DwEhPe::Absptr => Ok(8),
+        DwEhPe::Udata2 => Ok(2),
+        DwEhPe::Udata4 => Ok(4),
+        DwEhPe::Udata8 => Ok(8),
+        _ => Err(anyhow!("Invalid pointer encoding")),
+    }
 }
 
 /// Entry points for the harnesses in `fuzz/`. They return only a count so
@@ -2801,5 +2977,113 @@ mod tests {
         let files = collect_defined_files(&program);
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].path, Path::new("/comp/baz.c"));
+    }
+
+    // --- Call frame information (.eh_frame_hdr / .eh_frame) --------------------
+
+    fn load_cfi_fixture() -> (Rc<Elf>, Dwarf) {
+        let path = PathBuf::from(dwarf_fixture::fixture_path());
+        let elf = Rc::new(Elf::new(&path).expect("failed to parse fixture ELF"));
+        let dwarf = Dwarf::new(Rc::clone(&elf))
+            .expect("failed to parse DWARF")
+            .expect("fixture should contain debug info");
+        (elf, dwarf)
+    }
+
+    fn main_address(elf: &Elf) -> usize {
+        let main_syms = elf.get_symbols_with_name(CStr::from_bytes_with_nul(b"main\0").unwrap());
+        main_syms
+            .first()
+            .expect("fixture should have a 'main' symbol")
+            .st_value as usize
+    }
+
+    #[test]
+    fn fde_offset_for_pc_finds_entry_for_known_function() {
+        let (elf, dwarf) = load_cfi_fixture();
+        let pc = FileAddress::new(&elf, main_address(&elf));
+
+        let fde_offset = dwarf
+            .cfi
+            .eh_hdr
+            .fde_offset_for_pc(&elf, pc)
+            .expect("fde_offset_for_pc failed")
+            .expect("should find an FDE for main");
+
+        let eh_frame = eh_frame_section(&elf).expect(".eh_frame should exist");
+        let fde = eh_frame
+            .get(fde_offset..fde_offset + 8)
+            .expect("FDE header should fit inside .eh_frame");
+        // The entry starts with a non-zero length, followed by a non-zero CIE
+        // pointer. A CIE pointer of 0 would mean this entry is a CIE, not an FDE.
+        let length = u32::from_le_bytes(fde[..4].try_into().unwrap());
+        let cie_pointer = u32::from_le_bytes(fde[4..8].try_into().unwrap());
+        assert!(length > 0);
+        assert_ne!(cie_pointer, 0);
+    }
+
+    #[test]
+    fn fde_offset_for_pc_returns_none_before_first_entry() {
+        let (elf, dwarf) = load_cfi_fixture();
+        let pc = FileAddress::new(&elf, 0);
+        let result = dwarf
+            .cfi
+            .eh_hdr
+            .fde_offset_for_pc(&elf, pc)
+            .expect("fde_offset_for_pc failed");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn fde_at_main_covers_main() {
+        let (elf, dwarf) = load_cfi_fixture();
+        let main = main_address(&elf) as u64;
+        let fde = dwarf
+            .fde_at(FileAddress::new(&elf, main as usize))
+            .expect("fde_at failed")
+            .expect("should find an FDE for main");
+
+        let start = fde.initial_location.address as u64;
+        assert!(
+            start <= main,
+            "FDE starts at {start:#x}, after main at {main:#x}"
+        );
+        assert!(
+            main < start + fde.address_range,
+            "main at {main:#x} is past the FDE range {start:#x}+{:#x}",
+            fde.address_range
+        );
+
+        let eh_frame = eh_frame_section(&elf).expect(".eh_frame should exist");
+        assert!(fde.cie.instructions.end <= eh_frame.len());
+        assert!(!fde.cie.instructions(eh_frame).is_empty());
+        assert!(fde.length > 0);
+    }
+
+    #[test]
+    fn fde_at_returns_none_before_first_entry() {
+        let (elf, dwarf) = load_cfi_fixture();
+        let fde = dwarf
+            .fde_at(FileAddress::new(&elf, 0))
+            .expect("fde_at failed");
+        assert!(fde.is_none());
+    }
+
+    #[test]
+    fn get_cie_reuses_cached_entry() {
+        let (elf, dwarf) = load_cfi_fixture();
+        let main = main_address(&elf);
+        let fde = dwarf
+            .fde_at(FileAddress::new(&elf, main))
+            .expect("fde_at failed")
+            .expect("should find an FDE for main");
+        // Parsing the same FDE again resolves its CIE from the cache, so both
+        // handles point to the same allocation.
+        let again = dwarf
+            .fde_at(FileAddress::new(&elf, main))
+            .expect("fde_at failed")
+            .expect("should find an FDE for main");
+        assert!(Rc::ptr_eq(&fde.cie, &again.cie));
+        assert_eq!(dwarf.cfi.cie_cache.borrow().len(), 1);
     }
 }
